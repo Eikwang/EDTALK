@@ -12,7 +12,7 @@ from tqdm import tqdm
 from torchvision import transforms
 import torch.nn.functional as F
 from networks.utils import check_package_installed
-from moviepy.editor import *
+from moviepy import VideoFileClip, AudioFileClip
 import time
 
 def load_image(filename, size):
@@ -111,11 +111,11 @@ class Demo(nn.Module):
 
         print('==> loading model')
         self.audio2lip = Audio2Lip().cuda()
-        weight = torch.load('ckpts/Audio2Lip.pt', map_location=lambda storage, loc: storage)['audio2lip']
+        weight = torch.load('ckpts/Audio2Lip.pt', map_location=lambda storage, loc: storage, weights_only=False)['audio2lip']
         self.audio2lip.load_state_dict(weight)
         self.audio2lip.eval()
         self.gen = Generator().cuda()
-        weight = torch.load('ckpts/EDTalk_lip_pose.pt', map_location=lambda storage, loc: storage)['gen']
+        weight = torch.load('ckpts/EDTalk_lip_pose.pt', map_location=lambda storage, loc: storage, weights_only=False)['gen']
         self.gen.load_state_dict(weight)
         self.gen.eval()
 
@@ -221,7 +221,7 @@ class Demo(nn.Module):
                 # Merge audio and video
                 video_clip = VideoFileClip(temp_512_path + '.tmp.mp4')
                 audio_clip = AudioFileClip(self.save_path)
-                final_clip = video_clip.set_audio(audio_clip)
+                final_clip = video_clip.with_audio(audio_clip)
                 final_clip.write_videofile(temp_512_path, codec='libx264', audio_codec='aac')
                 
                 os.remove(temp_512_path + '.tmp.mp4')

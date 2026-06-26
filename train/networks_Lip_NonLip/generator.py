@@ -14,7 +14,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         if Q.dtype != torch.float32:
             Q = torch.tensor(Q, dtype=torch.float32)
         if input is None:
@@ -31,7 +31,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -60,7 +60,7 @@ class Pose_Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         if Q.dtype != torch.float32:
             Q = torch.tensor(Q, dtype=torch.float32)
         if input is None:
@@ -77,7 +77,7 @@ class Pose_Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -106,7 +106,7 @@ class Lip_Direction(nn.Module):
         # input: (bs*t) x 512
         weight = torch.cat([self.weight, pose_weight], -1)
         weight = weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         if Q.dtype != torch.float32:
             Q = torch.tensor(Q, dtype=torch.float32)
         if input is None:
@@ -121,7 +121,7 @@ class Lip_Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q

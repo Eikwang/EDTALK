@@ -14,22 +14,22 @@ def requires_grad(net, flag=True):
 
 
 class Trainer(nn.Module):
-    def __init__(self, args, device, rank):
+    def __init__(self, args, device, rank=0):
         super(Trainer, self).__init__()
 
         self.args = args
         self.batch_size = args.batch_size
+        self.rank = rank
 
-        self.gen = Generator().to(
-            device)
+        self.gen = Generator().to(device)
         self.dis = Discriminator().to(device)
 
         # distributed computing
-        self.gen = DDP(self.gen, device_ids=[rank], find_unused_parameters=True)
-        self.dis = DDP(self.dis, device_ids=[rank], find_unused_parameters=True)
-
-        self.gen = self.gen.module
-        self.dis = self.dis.module
+        if args.distributed:
+            self.gen = DDP(self.gen, device_ids=[rank], find_unused_parameters=True)
+            self.dis = DDP(self.dis, device_ids=[rank], find_unused_parameters=True)
+            self.gen = self.gen.module
+            self.dis = self.dis.module
 
         g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
         d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
@@ -59,7 +59,7 @@ class Trainer(nn.Module):
             betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio)
         )
 
-        self.criterion_vgg = VGGLoss().to(rank)
+        self.criterion_vgg = VGGLoss().to(device)
 
     def g_nonsaturating_loss(self, fake_pred):
         return F.softplus(-fake_pred).mean()
@@ -84,12 +84,20 @@ class Trainer(nn.Module):
         l1_loss = F.l1_loss(img_target_recon, img_target)
         gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
 
-        g_loss = vgg_loss + l1_loss + gan_g_loss
+        # 身份保持损失：惩罚与 source 图像的差异，防止背景/头发/衣服变形
+        # 权重较低（默认 0.05），只在嘴部区域外施加 soft constraint
+        id_weight = getattr(self.args, 'id_weight', 0.05)
+        if id_weight > 0:
+            id_loss = F.l1_loss(img_target_recon, img_source) * id_weight
+        else:
+            id_loss = 0.0
+
+        g_loss = vgg_loss + l1_loss + gan_g_loss + id_loss
 
         g_loss.backward()
         self.g_optim.step()
 
-        return vgg_loss, l1_loss, gan_g_loss, img_target_recon
+        return vgg_loss, l1_loss, gan_g_loss, id_loss, img_target_recon
 
     def dis_update(self, img_real, img_recon):
         self.dis.zero_grad()
@@ -116,7 +124,7 @@ class Trainer(nn.Module):
 
     def resume(self, resume_ckpt):
         print("load model:", resume_ckpt)
-        ckpt = torch.load(resume_ckpt)
+        ckpt = torch.load(resume_ckpt, map_location=lambda storage, loc: storage, weights_only=False)
         ckpt_name = os.path.basename(resume_ckpt)
         try:
             start_iter = int(os.path.splitext(ckpt_name)[0])

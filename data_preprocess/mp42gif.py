@@ -1,4 +1,4 @@
-from moviepy.editor import VideoFileClip
+from moviepy import VideoFileClip
 
 def mp4_to_gif(mp4_path, gif_path):
     # Load the video file

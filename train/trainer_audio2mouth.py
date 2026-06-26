@@ -1,3 +1,14 @@
+import os
+import sys
+
+# 解决 Windows OpenMP 冲突（libomp.dll / libiomp5md.dll）
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# 确保项目根目录在 sys.path 中
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import torch
 
 import torch.nn.functional as F
@@ -23,6 +34,7 @@ class Trainer(nn.Module):
         super(Trainer, self).__init__()
 
         self.args = args
+        self.device = device  # 保存 device 供后续使用（如 get_sync_loss）
         self.batch_size = args.batch_size
         self.dis_weight = args.dis_weight
         self.audio2lip = Audio2Lip().to(device)
@@ -76,15 +88,31 @@ class Trainer(nn.Module):
                 self.gen = self.gen.module
                 # self.dis = self.dis.module
 
-
-        net_parameters = filter(lambda p: p.requires_grad, self.audio2lip.parameters())
-        train_parameters = list(net_parameters)
+        # 参数分组学习率：audio2lip 使用更低 lr，避免破坏预训练权重
+        # audio_encoder 已冻结，这里只包含 audio2lip 的可训练参数
+        audio2lip_params = list(filter(lambda p: p.requires_grad, self.audio2lip.parameters()))
+        
+        # 为不同模块设置不同学习率倍数
+        # audio2lip: 0.1x (微调预训练权重，需要更保守)
+        # gen (generator): 1.0x (正常训练)
+        param_groups = [
+            {
+                'params': audio2lip_params,
+                'lr': args.lr * g_reg_ratio * 0.1,
+                'name': 'audio2lip'
+            }
+        ]
+        
         if self.train_generator:
-            net_parameters2 = filter(lambda p: p.requires_grad, self.gen.parameters())
-            train_parameters += list(net_parameters2)
+            gen_params = list(filter(lambda p: p.requires_grad, self.gen.parameters()))
+            param_groups.append({
+                'params': gen_params,
+                'lr': args.lr * g_reg_ratio,
+                'name': 'generator'
+            })
+        
         self.g_optim = optim.Adam(
-            train_parameters,
-            lr=args.lr * g_reg_ratio,
+            param_groups,
             betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio)
         )
 
@@ -98,21 +126,78 @@ class Trainer(nn.Module):
 
         # self.criterion_vgg = VGGLoss().to('cuda')
 
-        self.criterion_vgg = VGGLoss().to('cuda')
+        self.criterion_vgg = VGGLoss(device='cuda')
 
         self.sync_weight = args.sync_weight
-        
+
         if self.sync_weight != 0:
             self.syncnet = SyncNet()
-            syncnet_state = torch.load('ckpt/checkpoint.pth', map_location='cpu')
-            s = syncnet_state["state_dict"]
-            self.syncnet.load_state_dict(s)
-            for p in self.syncnet.parameters():
-                p.requires_grad = False
-            if torch.cuda.is_available():
-                self.syncnet = self.syncnet.cuda()
-                self.syncnet.eval()
-            self.logloss = nn.BCELoss()
+            # SyncNet 预训练权重路径（可选，缺失时跳过 sync loss）
+            syncnet_ckpt = getattr(args, 'syncnet_ckpt', None) or 'ckpts/EDTalk.pt'
+            if os.path.exists(syncnet_ckpt):
+                try:
+                    syncnet_state = torch.load(syncnet_ckpt, map_location='cpu', weights_only=False)
+
+                    # 尝试多种键名格式加载 SyncNet
+                    loaded = False
+
+                    # ==== 支持 Wav2Lip.pt (TorchScript 格式) ====
+                    if isinstance(syncnet_state, torch.jit.RecursiveScriptModule):
+                        print('[INFO] Detected TorchScript format (Wav2Lip), extracting SyncNet weights...')
+                        try:
+                            sd = syncnet_state.state_dict()
+                            mapped_state = {}
+                            for k, v in sd.items():
+                                # face_encoder 映射
+                                if k.startswith('face_encoder_blocks'):
+                                    new_k = k.replace('face_encoder_blocks', 'face_encoder')
+                                    mapped_state[new_k] = v
+                                # audio_encoder: Wav2Lip 和 SyncNet 结构不同，
+                                # 仅加载形状匹配的层，跳过不匹配的层
+                                elif k.startswith('audio_encoder'):
+                                    # 检查当前 SyncNet 中是否存在且形状匹配的键
+                                    if k in self.syncnet.state_dict():
+                                        if v.shape == self.syncnet.state_dict()[k].shape:
+                                            mapped_state[k] = v
+                                        else:
+                                            print(f'[WARN] Shape mismatch for {k}: checkpoint {v.shape} vs model {self.syncnet.state_dict()[k].shape}, skipping')
+                            self.syncnet.load_state_dict(mapped_state, strict=False)
+                            matched = len(mapped_state)
+                            total = len(self.syncnet.state_dict())
+                            print(f'[INFO] Loaded {matched}/{total} SyncNet keys from Wav2Lip.pt')
+                            loaded = True
+                        except Exception as e:
+                            print(f'[WARN] Failed to load from Wav2Lip.pt: {e}')
+                    # ==== 结束新增 ====
+
+                    if not loaded:
+                        for key in ['state_dict', 'syncnet', 'gen', 'netG']:
+                            if key in syncnet_state:
+                                s = syncnet_state[key]
+                                try:
+                                    self.syncnet.load_state_dict(s)
+                                    print(f'[INFO] Loaded SyncNet from {syncnet_ckpt}[{key}]')
+                                    loaded = True
+                                    break
+                                except:
+                                    pass
+
+                    if not loaded:
+                        print(f'[WARN] {syncnet_ckpt} does not contain valid SyncNet weights, skipping')
+                        
+                except Exception as e:
+                    print(f'[WARN] Failed to load SyncNet from {syncnet_ckpt}: {e}')
+            else:
+                print(f'[WARN] SyncNet checkpoint not found: {syncnet_ckpt}, sync loss disabled')
+                self.sync_weight = 0
+
+            if self.sync_weight != 0:
+                for p in self.syncnet.parameters():
+                    p.requires_grad = False
+                if torch.cuda.is_available():
+                    self.syncnet = self.syncnet.to(device)
+                    self.syncnet.eval()
+                self.logloss = nn.BCELoss()
 
         self.start_iter = 0
     def g_nonsaturating_loss(self, fake_pred):
@@ -124,12 +209,16 @@ class Trainer(nn.Module):
 
         return real_loss.mean() + fake_loss.mean()
 
-    def gen_update(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox = None): # torch.Size([64, 5, 80, 16])
+    def gen_update(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox = None, accumulation_steps=1, step_optimizer=True): # torch.Size([64, 5, 80, 16])
         
         self.audio2lip.train()
         self.gen.train()
-        self.gen.zero_grad()
-        self.audio2lip.zero_grad()
+        
+        # 只在梯度累积第一步时清零梯度
+        if step_optimizer:
+            self.gen.zero_grad()
+            self.audio2lip.zero_grad()
+        
         G_losses = {}
         # requires_grad(self.audio2lip, True)
         # requires_grad(self.gen.enc, False)
@@ -179,14 +268,22 @@ class Trainer(nn.Module):
 
             G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
             pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-            value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, 'cuda').mean() # torch.Size([4, 3, 5, 96, 96])
+            value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, device).mean() # torch.Size([4, 3, 5, 96, 96])
             G_losses['sync'] = self.sync_weight * value
             
         G_losses_values = [val.mean() for val in G_losses.values()]
         g_loss = sum(G_losses_values)
 
+        # 梯度累积时缩放损失
+        if accumulation_steps > 1:
+            g_loss = g_loss / accumulation_steps
+        
         g_loss.backward()
-        self.g_optim.step()
+        
+        # 只在累积完成时执行优化器步进
+        if step_optimizer:
+            self.g_optim.step()
+        
         recon = recon.reshape(batch_size, T, 3,256,256)
         return G_losses, recon[:,-1], g_loss
 
@@ -265,7 +362,7 @@ class Trainer(nn.Module):
 
                 G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
                 pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-                value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, 'cuda').mean() # torch.Size([4, 3, 5, 96, 96])
+                value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, device).mean() # torch.Size([4, 3, 5, 96, 96])
                 G_losses['sync'] = self.sync_weight * value
                 
             G_losses_values = [val.mean() for val in G_losses.values()]
@@ -303,7 +400,7 @@ class Trainer(nn.Module):
 
     def resume(self, resume_ckpt, audio2lip_ckpt):
         print("load model:", resume_ckpt)
-        ckpt = torch.load(resume_ckpt)
+        ckpt = torch.load(resume_ckpt, weights_only=False, map_location='cpu')
         ckpt_name = os.path.basename(resume_ckpt)
         # try:
         #     self.start_iter = ckpt["start_iter"] #int(os.path.splitext(ckpt_name)[0])
@@ -332,7 +429,7 @@ class Trainer(nn.Module):
         #         name = key.split('enc.')[1]
         #         new_state_dict[name] = value
         # self.gen.enc.load_state_dict(new_state_dict)
-        audio_encoder_ckpt = torch.load(audio2lip_ckpt)
+        audio_encoder_ckpt = torch.load(audio2lip_ckpt, weights_only=False, map_location='cpu')
         self.audio2lip.load_state_dict(audio_encoder_ckpt['audio2lip'])
         # new_state_dict = OrderedDict()
         # for key, value in checkpoint.items():
@@ -344,10 +441,35 @@ class Trainer(nn.Module):
         # self.gen.dec.load_state_dict(new_state_dict)
         if self.dis_weight !=0:
             self.dis.load_state_dict(ckpt["dis"])
+        
+        # 修复 g_optim 加载：过滤掉不匹配的键，只加载匹配的参数
         try:
-            self.g_optim.load_state_dict(ckpt["g_optim"])
-        except:
-            print('cannot load pretrained g_optim')
+            g_optim_state = ckpt["g_optim"]
+            current_state = self.g_optim.state_dict()
+            
+            # 过滤状态字典：只保留当前优化器存在的键
+            filtered_state = {}
+            missing_keys = []
+            for key in current_state:
+                if key in g_optim_state:
+                    # 额外检查形状是否匹配
+                    if g_optim_state[key].shape == current_state[key].shape:
+                        filtered_state[key] = g_optim_state[key]
+                    else:
+                        missing_keys.append(f"{key} (shape mismatch)")
+                else:
+                    missing_keys.append(key)
+            
+            if missing_keys:
+                print(f"[WARN] g_optim missing/shape-mismatch keys ({len(missing_keys)}): {missing_keys[:5]}...")
+            
+            current_state.update(filtered_state)
+            self.g_optim.load_state_dict(current_state)
+            print(f"[INFO] Loaded g_optim: {len(filtered_state)}/{len(current_state)} keys matched")
+        except Exception as e:
+            print(f"[WARN] Cannot load pretrained g_optim: {e}")
+            print("[INFO] Training will continue with fresh optimizer state (may need lower lr)")
+        
         # self.d_optim.load_state_dict(ckpt["d_optim"])
 
         return start_iter

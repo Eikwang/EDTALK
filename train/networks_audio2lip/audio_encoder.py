@@ -1,4 +1,6 @@
 import torch
+import os
+import gc
 import torch.nn.functional as F
 from torch import nn
 
@@ -46,18 +48,56 @@ class Audio2Lip(nn.Module):
             Conv2d(512, 512, kernel_size=1, stride=1, padding=0),
             )
 
-        #### load the pre-trained audio_encoder 
-        #self.audio_encoder = self.audio_encoder.to(device)  
-        # '''
-        wav2lip_state_dict = torch.load('wav2lip.pth')['state_dict']
-        state_dict = self.audio_encoder.state_dict()
+        #### load the pre-trained audio_encoder
+        # 自动查找 Wav2Lip 权重文件
+        _wav2lip_paths = [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'ckpts', 'Wav2Lip.pt'),
+            'Wav2Lip.pt',
+            'wav2lip.pt',
+        ]
+        _wav2lip_ckpt = None
+        for p in _wav2lip_paths:
+            if os.path.exists(p):
+                _wav2lip_ckpt = p
+                break
 
-        for k,v in wav2lip_state_dict.items():
-            if 'audio_encoder' in k:
-                # print('init:', k)
-                state_dict[k.replace('module.audio_encoder.', '')] = v
-        self.audio_encoder.load_state_dict(state_dict)
-        # '''
+        if _wav2lip_ckpt is not None:
+            try:
+                # 尝试加载权重
+                wav2lip_ckpt = torch.load(_wav2lip_ckpt, weights_only=False, map_location='cpu')
+
+                # 检测格式: 标准 checkpoint vs TorchScript
+                if hasattr(wav2lip_ckpt, 'state_dict'):
+                    # TorchScript 格式 (Wav2Lip 官方预训练模型)
+                    wav2lip_state_dict = wav2lip_ckpt.state_dict()
+                else:
+                    # 标准 checkpoint 格式 {'state_dict': ...}
+                    wav2lip_state_dict = wav2lip_ckpt.get('state_dict', wav2lip_ckpt)
+
+                state_dict = self.audio_encoder.state_dict()
+                loaded_keys = []
+                for k, v in wav2lip_state_dict.items():
+                    # 移除 "module.audio_encoder." 或 "audio_encoder." 前缀
+                    clean_k = k.replace('module.', '').replace('audio_encoder.', '')
+                    if clean_k in state_dict:
+                        state_dict[clean_k] = v
+                        loaded_keys.append(clean_k)
+                    # 也尝试直接匹配（某些权重的键可能不带前缀）
+                    elif k in state_dict:
+                        state_dict[k] = v
+                        loaded_keys.append(k)
+                self.audio_encoder.load_state_dict(state_dict)
+                print(f'[INFO] Loaded {len(loaded_keys)} audio_encoder layers from Wav2Lip')
+
+                # 清理 TorchScript 对象，释放内存
+                del wav2lip_ckpt
+                del wav2lip_state_dict
+                del state_dict
+                gc.collect()
+            except Exception as e:
+                print(f'[WARN] Failed to load Wav2Lip weights: {e}, using random init')
+        else:
+            print('[WARN] Wav2Lip 权重未找到，Audio2Lip 将使用随机初始化')
 
         self.mapping = nn.Linear(512, 20)
         nn.init.constant_(self.mapping.bias, 0.)
@@ -96,7 +136,7 @@ class Audio2Lip_nobank(nn.Module):
         #### load the pre-trained audio_encoder 
         #self.audio_encoder = self.audio_encoder.to(device)  
         # '''
-        wav2lip_state_dict = torch.load('wav2lip.pth')['state_dict']
+        wav2lip_state_dict = torch.load('wav2lip.pth', weights_only=False)['state_dict']
         state_dict = self.audio_encoder.state_dict()
 
         for k,v in wav2lip_state_dict.items():

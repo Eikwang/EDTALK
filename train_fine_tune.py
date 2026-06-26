@@ -52,9 +52,9 @@ def ddp_setup(args, rank, world_size):
 
 
 def main(rank, world_size, args):
-    # init distributed computing
-    ddp_setup(args, rank, world_size)
-    torch.cuda.set_device(rank)
+    if args.distributed:
+        ddp_setup(args, rank, world_size)
+        torch.cuda.set_device(rank)
     device = torch.device("cuda")
 
     # make logging folder
@@ -72,25 +72,46 @@ def main(rank, world_size, args):
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))]
     )
 
-    dataset = Finetune256('/data/ts/datasets/person_specific_dataset/AD-NeRF/video_crop_frame/Obama', True, transform = transform)
-    dataset_test = Finetune256('/data/ts/datasets/person_specific_dataset/AD-NeRF/video_crop_frame/Obama', False, transform = transform)
-    loader = data.DataLoader(
-        dataset,
-        num_workers=8,
-        batch_size=args.batch_size // world_size,
-        sampler=data.distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True),
-        pin_memory=True,
-        drop_last=False,
-    )
+    dataset = Finetune256(args.datapath, True, transform=transform)
+    dataset_test = Finetune256(args.datapath, False, transform=transform)
 
-    loader_test = data.DataLoader(
-        dataset_test,
-        num_workers=8,
-        batch_size=4,
-        sampler=data.distributed.DistributedSampler(dataset_test, num_replicas=world_size, rank=rank, shuffle=False),
-        pin_memory=True,
-        drop_last=False,
-    )
+    if args.distributed:
+        loader = data.DataLoader(
+            dataset,
+            num_workers=2,
+            batch_size=args.batch_size // world_size,
+            sampler=data.distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True),
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=True,
+        )
+        loader_test = data.DataLoader(
+            dataset_test,
+            num_workers=2,
+            batch_size=4,
+            sampler=data.distributed.DistributedSampler(dataset_test, num_replicas=world_size, rank=rank, shuffle=False),
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=True,
+        )
+    else:
+        loader = data.DataLoader(
+            dataset,
+            num_workers=2,
+            batch_size=args.batch_size,
+            shuffle=True,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=True,
+        )
+        loader_test = data.DataLoader(
+            dataset_test,
+            num_workers=2,
+            batch_size=4,
+            shuffle=False,
+            drop_last=False,
+            persistent_workers=True,
+        )
 
     loader = sample_data(loader)
     loader_test = sample_data(loader_test)
@@ -109,51 +130,46 @@ def main(rank, world_size, args):
     for idx in pbar:
         i = idx + args.start_iter
 
-        # laoding data
+        # loading data
         img_source, img_target = next(loader)
-        img_source = img_source.to(rank, non_blocking=True)
-        img_target = img_target.to(rank, non_blocking=True)
+        img_source = img_source.to(device, non_blocking=True)
+        img_target = img_target.to(device, non_blocking=True)
 
         # update generator
-        vgg_loss, l1_loss, gan_g_loss, img_recon = trainer.gen_update(img_source, img_target)
+        vgg_loss, l1_loss, gan_g_loss, id_loss, img_recon = trainer.gen_update(img_source, img_target)
 
         # update discriminator
         gan_d_loss = trainer.dis_update(img_target, img_recon)
 
-        if rank == 0:
-            # write to log
+        # write to log (single GPU always logs; multi GPU only rank 0)
+        if not args.distributed or rank == 0:
             write_loss(idx, vgg_loss, l1_loss, gan_g_loss, gan_d_loss, writer)
+            if isinstance(id_loss, torch.Tensor):
+                writer.add_scalar('id_loss', id_loss.item(), idx)
 
         # display
-        if i % args.display_freq == 0 and rank == 0:
-            print("[Iter %d/%d] [vgg loss: %f] [l1 loss: %f] [g loss: %f] [d loss: %f]"
-                  % (i, args.iter, vgg_loss.item(), l1_loss.item(), gan_g_loss.item(), gan_d_loss.item()))
+        if i % args.display_freq == 0 and (not args.distributed or rank == 0):
+            id_loss_val = id_loss.item() if isinstance(id_loss, torch.Tensor) else 0.0
+            print("[Iter %d/%d] [vgg loss: %f] [l1 loss: %f] [g loss: %f] [d loss: %f] [id loss: %f]"
+                  % (i, args.iter, vgg_loss.item(), l1_loss.item(), gan_g_loss.item(), gan_d_loss.item(), id_loss_val))
 
-            if rank == 0:
-                img_test_source, img_test_target = next(loader_test)
-                img_test_source = img_test_source.to(rank, non_blocking=True)
-                img_test_target = img_test_target.to(rank, non_blocking=True)
+            img_test_source, img_test_target = next(loader_test)
+            img_test_source = img_test_source.to(device, non_blocking=True)
+            img_test_target = img_test_target.to(device, non_blocking=True)
 
-                img_recon = trainer.sample(img_test_source, img_test_target)
-                
-                sample = F.interpolate(torch.cat((img_test_source.detach(),img_test_target.detach(), img_recon.detach()), dim=0), 256)
-                # sample = torch.flip(sample, [1])
-                utils.save_image(
-                    sample,
-                    os.path.join(checkpoint_path, "step_%05d.jpg"%(i)),
-                    nrow=4,
-                    normalize=True,
-                    range=(-1, 1),
-                )
+            img_recon = trainer.sample(img_test_source, img_test_target)
 
-                # display_img(i, img_test_source, 'source', writer)
-                # display_img(i, img_test_target, 'target', writer)
-                # display_img(i, img_recon, 'recon', writer)
-                # display_img(i, img_source_ref, 'source_ref', writer)
-                # writer.flush()
+            sample = F.interpolate(torch.cat((img_test_source.detach(), img_test_target.detach(), img_recon.detach()), dim=0), 256)
+            utils.save_image(
+                sample,
+                os.path.join(checkpoint_path, "step_%05d.jpg" % (i)),
+                nrow=4,
+                normalize=True,
+                value_range=(-1, 1),
+            )
 
         # save model
-        if i % args.save_freq == 0 and rank == 0:
+        if i % args.save_freq == 0 and (not args.distributed or rank == 0):
             trainer.save(i, checkpoint_path)
 
     return
@@ -172,17 +188,25 @@ if __name__ == "__main__":
     parser.add_argument("--datapath", type=str, default='/data/ts/datasets/person_specific_dataset/AD-NeRF/video_crop_frame/Obama')
     parser.add_argument("--lr", type=float, default=0.002)
     parser.add_argument("--start_iter", type=int, default=0)
-    parser.add_argument("--display_freq", type=int, default=20)
+    parser.add_argument("--display_freq", type=int, default=500)
     parser.add_argument("--save_freq", type=int, default=10000)
     parser.add_argument("--exp_path", type=str, default='/data/ts/checkpoints/EDTalk/fine_tune/')
     parser.add_argument("--exp_name", type=str, default='Obama')
     parser.add_argument("--addr", type=str, default='localhost')
     parser.add_argument("--port", type=str, default='12345')
+    parser.add_argument("--id_weight", type=float, default=0.05, help='身份保持损失权重（0=禁用），用于减少背景/头发变形')
     opts = parser.parse_args()
 
     n_gpus = torch.cuda.device_count()
-    assert n_gpus >= 2
 
-    world_size = n_gpus
-    print('==> training on %d gpus' % n_gpus)
-    mp.spawn(main, args=(world_size, opts,), nprocs=world_size, join=True)
+    if n_gpus >= 2:
+        opts.distributed = True
+        world_size = n_gpus
+        print('==> training on %d gpus (distributed)' % n_gpus)
+        mp.spawn(main, args=(world_size, opts,), nprocs=world_size, join=True)
+    elif n_gpus == 1:
+        opts.distributed = False
+        print('==> training on 1 gpu (single)')
+        main(0, 1, opts)
+    else:
+        raise RuntimeError("No GPU available")

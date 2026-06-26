@@ -11,7 +11,7 @@ from tqdm import tqdm
 from torchvision import transforms
 import torch.nn.functional as F
 from networks.utils import check_package_installed
-from moviepy.editor import *
+from moviepy import VideoFileClip, AudioFileClip
 
 def load_image(filename, size):
     img = Image.open(filename).convert('RGB')
@@ -60,7 +60,7 @@ class Demo(nn.Module):
         model_path = args.model_path
         print('==> loading model')
         self.gen = Generator(args.size, args.latent_dim_style, args.latent_dim_lip, args.latent_dim_pose, args.latent_dim_exp, args.channel_multiplier).cuda()
-        weight = torch.load(model_path, map_location=lambda storage, loc: storage)['gen']
+        weight = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)['gen']
         self.gen.load_state_dict(weight)
         self.gen.eval()
         print('==> loading data')
@@ -134,7 +134,7 @@ class Demo(nn.Module):
                 # Merge audio and video
                 video_clip = VideoFileClip(temp_512_path + '.tmp.mp4')
                 audio_clip = AudioFileClip(self.save_path)
-                final_clip = video_clip.set_audio(audio_clip)
+                final_clip = video_clip.with_audio(audio_clip)
                 final_clip.write_videofile(temp_512_path, codec='libx264', audio_codec='aac')
                 
                 os.remove(temp_512_path + '.tmp.mp4')

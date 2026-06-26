@@ -14,7 +14,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -28,7 +28,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -58,7 +58,7 @@ class Direction_exp(nn.Module):
         # input: (bs*t) x 512
         weight = torch.cat([lipnonlip_weight, self.weight], -1)
         weight = weight + 1e-8 # torch.Size([512, 36])
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -73,7 +73,7 @@ class Direction_exp(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -88,7 +88,7 @@ class Direction_exp(nn.Module):
         # input: (bs*t) x 512
         weight = torch.cat([lipnonlip_weight, self.weight], -1)
         weight = weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -225,6 +225,20 @@ class Generator(nn.Module):
         a = self.direction_exp.get_shared_out(alpha_D, self.direction_lipnonlip.weight)
         e = self.direction_exp.get_exp_latent(a)
         directions_D = self.direction_exp(alpha_D, self.direction_lipnonlip.weight) # torch.Size([1, 512])
+        latent_poseD = wa + directions_D
+        img_recon = self.dec(latent_poseD, feats, e)
+        return img_recon
+
+    def test_EDTalk_A_use_exp_weight_with_pose(self, img_source, lip_img_drive, alpha_D_pose, alpha_D_exp, h_start=None):
+        """支持传入预计算的姿态系数，用于姿态平滑"""
+        wa, _, feats, _ = self.enc(img_source, None, h_start)  # 只提取风格特征
+        alpha_D_lip = lip_img_drive
+
+        # 使用传入的预计算姿态系数
+        alpha_D = torch.cat([alpha_D_lip, alpha_D_pose, alpha_D_exp], dim=-1)
+        a = self.direction_exp.get_shared_out(alpha_D, self.direction_lipnonlip.weight)
+        e = self.direction_exp.get_exp_latent(a)
+        directions_D = self.direction_exp(alpha_D, self.direction_lipnonlip.weight)
         latent_poseD = wa + directions_D
         img_recon = self.dec(latent_poseD, feats, e)
         return img_recon

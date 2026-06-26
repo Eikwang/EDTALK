@@ -127,7 +127,7 @@ def crop_bbox(feats, bbox, HH, WW=None, backend='cudnn'):
         return bilinear_sample(feats, X, Y)
     elif backend == 'cudnn':
         grid = torch.stack([X, Y], dim=3)
-        return F.grid_sample(feats, grid)
+        return F.grid_sample(feats, grid, align_corners=False)
 
 
 def uncrop_bbox(feats, bbox, H, W=None, fill_value=0):

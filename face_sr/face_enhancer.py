@@ -39,10 +39,17 @@ def enhancer_generator_with_len(images, method='gfpgan', bg_upsampler='realesrga
     gen_with_len = GeneratorWithLen(gen, len(images))
     return gen_with_len
 
+def _get_gfpgan_model_dir():
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(project_root, 'ckpts', 'GFPGAN')
+
 def enhancer_generator_no_len(images, method='gfpgan', bg_upsampler='realesrgan'):
     """ Provide a generator function so that all of the enhanced images don't need
     to be stored in memory at the same time. This can save tons of RAM compared to
     the enhancer function. """
+
+    GFPGAN_MODEL_DIR = _get_gfpgan_model_dir()
+    os.makedirs(GFPGAN_MODEL_DIR, exist_ok=True)
 
     print('face enhancer....')
     if not isinstance(images, list) and os.path.isfile(images): # handle video to images
@@ -77,11 +84,17 @@ def enhancer_generator_no_len(images, method='gfpgan', bg_upsampler='realesrgan'
             bg_upsampler = None
         else:
             from basicsr.archs.rrdbnet_arch import RRDBNet
+            from basicsr.utils.download_util import load_file_from_url
             from realesrgan import RealESRGANer
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+            esrgan_model_path = os.path.join(GFPGAN_MODEL_DIR, 'RealESRGAN_x2plus.pth')
+            if not os.path.isfile(esrgan_model_path):
+                esrgan_model_path = load_file_from_url(
+                    url='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+                    model_dir=GFPGAN_MODEL_DIR, progress=True)
             bg_upsampler = RealESRGANer(
                 scale=2,
-                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
+                model_path=esrgan_model_path,
                 model=model,
                 tile=400,
                 tile_pad=10,
@@ -91,11 +104,8 @@ def enhancer_generator_no_len(images, method='gfpgan', bg_upsampler='realesrgan'
         bg_upsampler = None
 
     # determine model paths
-    model_path = os.path.join('ckpt/weights', model_name + '.pth')
-    
-    if not os.path.isfile(model_path):
-        model_path = os.path.join('checkpoints', model_name + '.pth')
-    
+    model_path = os.path.join(GFPGAN_MODEL_DIR, model_name + '.pth')
+
     if not os.path.isfile(model_path):
         # download pre-trained models from url
         model_path = url
@@ -105,7 +115,8 @@ def enhancer_generator_no_len(images, method='gfpgan', bg_upsampler='realesrgan'
         upscale=2,
         arch=arch,
         channel_multiplier=channel_multiplier,
-        bg_upsampler=bg_upsampler)
+        bg_upsampler=bg_upsampler,
+        model_rootpath=GFPGAN_MODEL_DIR)
 
     # ------------------------ restore ------------------------
     for idx in tqdm(range(len(images)), 'Face Enhancer:'):

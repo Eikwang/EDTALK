@@ -52,9 +52,15 @@ class SyncNet_color(nn.Module):
             Conv2d(256, 512, kernel_size=3, stride=1, padding=0),
             Conv2d(512, 512, kernel_size=1, stride=1, padding=0),)
 
+        self.face_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.audio_pool = nn.AdaptiveAvgPool2d((1, 1))
+
     def forward(self, audio_sequences, face_sequences): # audio_sequences := (B, dim, T) # torch.Size([4, 15, 48, 96])
         face_embedding = self.face_encoder(face_sequences) # torch.Size([4, 512, 1, 1])
         audio_embedding = self.audio_encoder(audio_sequences)
+
+        face_embedding = self.face_pool(face_embedding)
+        audio_embedding = self.audio_pool(audio_embedding)
 
         audio_embedding = audio_embedding.view(audio_embedding.size(0), -1)
         face_embedding = face_embedding.view(face_embedding.size(0), -1)

@@ -79,14 +79,14 @@ class Vgg19(torch.nn.Module):
 
 
 class VGGLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, device='cuda'):
         super(VGGLoss, self).__init__()
 
         self.scales = [1, 0.5, 0.25, 0.125]
-        self.pyramid = ImagePyramide(self.scales, 3).cuda()
+        self.pyramid = ImagePyramide(self.scales, 3).to(device)
 
         # vgg loss
-        self.vgg = Vgg19().cuda()
+        self.vgg = Vgg19().to(device)
         self.weights = (10, 10, 10, 10, 10)
 
     def forward(self, img_recon, img_real):

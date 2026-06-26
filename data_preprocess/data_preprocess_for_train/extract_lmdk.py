@@ -1,40 +1,46 @@
+# -*- coding: utf-8 -*-
+"""
+从 LMDB 中提取每帧的 68 点面部关键点（dlib）
+用法: python extract_lmdk.py --base_dir HDTF
+"""
+
 import os
 import lmdb
-import random
-import collections
 import numpy as np
 from PIL import Image
 from io import BytesIO
-import json
-import torch
-from torch.utils.data import Dataset
-from torchvision import transforms
-from tqdm import tqdm
 import cv2
 import dlib
 from imutils import face_utils
-import warnings
-warnings.filterwarnings("ignore")
+from tqdm import tqdm
+from argparse import ArgumentParser
+import multiprocessing as mp
 
-hdtf_save_dir = 'HDTF/landmark'
-mead_save_dir = 'MEAD_front/landmark'
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
+warnings_imported = False
+try:
+    import warnings
+    warnings.filterwarnings("ignore")
+    warnings_imported = True
+except ImportError:
+    pass
 
-unextract = []
 
-env = lmdb.open(
-    'EDTalk_lmdb',
-    max_readers=32,
-    readonly=True,
-    lock=False,
-    readahead=False,
-    meminit=False,
-)
+# ============================================================
+# 全局变量（模块级，供多进程使用）
+# ============================================================
+_predictor_path = None
+_detector = None
+_predictor = None
 
-if not env:
-    raise IOError('Cannot open lmdb dataset', 'EDTalk_lmdb')
 
+def init_landmark_detector(predictor_path):
+    """初始化 dlib 检测器和预测器（每个子进程调用一次）"""
+    global _detector, _predictor, _predictor_path
+    if _detector is not None:
+        return
+    _predictor_path = predictor_path
+    _detector = dlib.get_frontal_face_detector()
+    _predictor = dlib.shape_predictor(predictor_path)
 
 
 def format_for_lmdb(*args):
@@ -46,86 +52,207 @@ def format_for_lmdb(*args):
     return '-'.join(key_parts).encode('utf-8')
 
 
+def get_video_list_from_lmdb(lmdb_path):
+    """从 LMDB 中读取所有视频名列表"""
+    env = lmdb.open(
+        lmdb_path,
+        max_readers=32,
+        readonly=True,
+        lock=False,
+        readahead=False,
+        meminit=False,
+    )
+    if not env:
+        raise IOError(f'Cannot open lmdb dataset: {lmdb_path}')
 
-def extract(video):
+    videos = set()
     with env.begin(write=False) as txn:
-        key = format_for_lmdb(video, 'length')
-        length = int(txn.get(key).decode('utf-8'))
-        landmark = []
-        for j in range(length):
-            key = format_for_lmdb(video, j) # M027#neutral#014-0000153
-            img_bytes = txn.get(key)
-            img = Image.open(BytesIO(img_bytes))
-            gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-
-            # 检测人脸并检测landmarks
-            rects = detector(gray, 0)
-            for rect in rects:
-                shape = predictor(gray, rect)
-                shape = face_utils.shape_to_np(shape)
-                landmark.append(shape)
-        landmark = np.array(landmark)
-        splits = video.split('#')
-        if len(splits)==2:
-            np.save(os.path.join(hdtf_save_dir, video+'.npy'),landmark)
+        # 先获取总长度
+        length_key = format_for_lmdb('length')
+        total_bytes = txn.get(length_key)
+        if total_bytes:
+            total = int(total_bytes.decode('utf-8'))
         else:
-            np.save(os.path.join(mead_save_dir, video+'.npy'),landmark)
-  
-        print(video)
+            total = 0
+
+        # 遍历所有 key，提取视频名
+        cursor = txn.cursor()
+        for key, _ in cursor:
+            key_str = key.decode('utf-8')
+            # key 格式: "0000005#71-0000003" 或 "0000005#71-length"
+            # 去掉末尾的 "-数字部分" 或 "-length"
+            if '-length' in key_str:
+                video_name = key_str.rsplit('-length', 1)[0]
+            else:
+                # 取最后一个 "-" 之前的部分
+                parts = key_str.rsplit('-', 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    video_name = parts[0]
+                else:
+                    continue
+
+            # 去掉 zfill 的前导零
+            if video_name:
+                videos.add(video_name)
+
+    env.close()
+
+    result = sorted(videos)
+
+    # 如果通过遍历没找到，用总长度回退
+    if len(result) == 0 and total > 0:
+        print(f"[WARN] 无法从 LMDB key 解析视频名，尝试按索引查找 (total={total})")
+        return [str(i) for i in range(total)]
+
+    return result
 
 
-from multiprocessing import Pool
-import multiprocessing as mp
+def extract_landmarks_for_video(args_tuple):
+    """处理单个视频：从 LMDB 读取所有帧 → 检测关键点 → 保存 .npy"""
+    video_name, lmdb_path, save_dir, predictor_path = args_tuple
 
-import math, time
-from argparse import ArgumentParser
+    # 确保每个进程初始化自己的检测器
+    init_landmark_detector(predictor_path)
+
+    env = lmdb.open(
+        lmdb_path,
+        max_readers=1,
+        readonly=True,
+        lock=False,
+        readahead=False,
+        meminit=False,
+    )
+
+    try:
+        with env.begin(write=False) as txn:
+            key = format_for_lmdb(video_name, 'length')
+            length_bytes = txn.get(key)
+            if length_bytes is None:
+                print(f"[WARN] Video not found in LMDB: {video_name}")
+                return False
+
+            length = int(length_bytes.decode('utf-8'))
+            landmarks = []
+
+            for j in range(length):
+                key = format_for_lmdb(video_name, j)
+                img_bytes = txn.get(key)
+                if img_bytes is None:
+                    continue
+
+                img = Image.open(BytesIO(img_bytes))
+                gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+
+                rects = _detector(gray, 0)
+                for rect in rects:
+                    shape = _predictor(gray, rect)
+                    shape = face_utils.shape_to_np(shape)
+                    landmarks.append(shape)
+
+            if len(landmarks) == 0:
+                print(f"[WARN] No face detected in any frame: {video_name}")
+                return False
+
+            landmarks = np.array(landmarks)
+            save_path = os.path.join(save_dir, video_name + '.npy')
+            np.save(save_path, landmarks)
+            return True
+
+    except Exception as e:
+        print(f"[ERROR] {video_name}: {e}")
+        return False
+    finally:
+        env.close()
 
 
+def find_lmdb_path(base_dir):
+    """自动查找 LMDB 目录"""
+    lmdb_path = os.path.join(base_dir, 'lmdb')
+    data_mdb = os.path.join(lmdb_path, 'data.mdb')
+    if not os.path.exists(data_mdb):
+        raise FileNotFoundError(
+            f"未找到 LMDB 数据库，请先运行 prepare_lmdb.py。"
+            f"\n  期望路径: {data_mdb}"
+        )
+    return lmdb_path
 
-def multi_pro(args):
-    for arg in args:
-        try:
-            extract(arg)
-        except:
-            unextract.append(arg)
-            print('skip!')
 
-def chunks(lst, n):
-	"""Yield successive n-sized chunks from lst."""
-	for i in range(0, len(lst), n):
-		yield lst[i:i + n]
-                
+def find_predictor_path():
+    """查找 shape_predictor_68_face_landmarks.dat"""
+    # 项目根目录
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidates = [
+        os.path.join(project_root, 'ckpts', 'shape_predictor_68_face_landmarks.dat'),
+        'shape_predictor_68_face_landmarks.dat',
+        os.path.join(project_root, 'shape_predictor_68_face_landmarks.dat'),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return os.path.abspath(p)
+    raise FileNotFoundError(
+        "未找到 shape_predictor_68_face_landmarks.dat。\n"
+        f"期望路径: {candidates[0]}\n"
+        "请从 http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2 下载。"
+    )
+
+
+def main(base_dir, num_processes=10):
+    """
+    从 LMDB 提取面部关键点
+
+    用法: python extract_lmdk.py --base_dir HDTF
+    """
+
+    # 自动查找 LMDB 路径
+    lmdb_path = find_lmdb_path(base_dir)
+
+    # 输出目录：{base_dir}/landmark
+    save_dir = os.path.join(base_dir, 'landmark')
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 查找预测器模型
+    predictor_path = find_predictor_path()
+
+    print(f"LMDB   : {lmdb_path}")
+    print(f"Output : {save_dir}")
+    print(f"Model  : {predictor_path}")
+
+    # 从 LMDB 读取视频列表
+    videos = get_video_list_from_lmdb(lmdb_path)
+    print(f"Found {len(videos)} videos")
+
+    # 过滤已处理的
+    pending = [v for v in videos if not os.path.exists(os.path.join(save_dir, v + '.npy'))]
+    if len(pending) < len(videos):
+        print(f"Skip {len(videos) - len(pending)} already processed")
+
+    if not pending:
+        print("All done!")
+        return
+
+    # 多进程提取
+    mp.set_start_method('spawn', force=True)
+
+    args_list = [(v, lmdb_path, save_dir, predictor_path) for v in pending]
+
+    success = 0
+    fail = 0
+
+    with mp.Pool(processes=num_processes) as pool:
+        for result in tqdm(pool.imap_unordered(extract_landmarks_for_video, args_list),
+                          total=len(pending), desc="Extracting landmarks"):
+            if result:
+                success += 1
+            else:
+                fail += 1
+
+    print(f"Done: {success} processed, {fail} failed")
+
+
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    mp.set_start_method('spawn')
-
-    parser.add_argument("--image_shape", default=(256, 256), type=lambda x: tuple(map(int, x.split(','))),
-                        help="Image shape")
-    parser.add_argument("--increase", default=0.1, type=float, help='Increase bbox by this amount')
-    parser.add_argument("--iou_with_initial", type=float, default=0.25, help="The minimal allowed iou with inital bbox")
-    parser.add_argument("--inp", default=None, help='Input image or video')
-    parser.add_argument("--outp", default=None, help='Input image or video')
-    parser.add_argument("--min_frames", type=int, default=0,  help='Minimum number of frames')
-    parser.add_argument("--cpu", dest="cpu", action="store_true", help="cpu mode.")
-    parser.add_argument("--num_processes", type=int, default=10, help="Number of processes to use")
-    parser.add_argument("--outp_audio", type=int, default=8, help="Number of processes to use")
-    
+    parser = ArgumentParser(description="从 LMDB 提取 68 点面部关键点")
+    parser.add_argument("--base_dir", type=str, required=True, help="数据集主目录（如 HDTF）")
+    parser.add_argument("--num_processes", type=int, default=10, help="工作进程数")
     args = parser.parse_args()
 
-
-
-    videos = []
-    with open('data_preprocess/lists/train.json',"r") as f:
-        videos += json.load(f)
-    with open('data_preprocess/lists/test.json',"r") as f:
-        videos += json.load(f)
-    print(len(videos))
-    file_chunks = list(chunks(videos, int(math.ceil(len(videos) / args.num_processes))))
-    print(len(file_chunks))
-    pool = mp.Pool(args.num_processes)
-    tic = time.time()
-    pool.map(multi_pro, file_chunks)
-    toc = time.time()
-    print('Mischief managed in {}s'.format(toc - tic))
-
-
+    main(args.base_dir, args.num_processes)

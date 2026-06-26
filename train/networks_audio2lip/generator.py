@@ -14,7 +14,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -28,7 +28,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q

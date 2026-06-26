@@ -421,7 +421,7 @@ class ToFlow(nn.Module):
         mask = torch.sigmoid(out[:, 2:3, :, :])
         flow = sampler.permute(0, 2, 3, 1) + xs
 
-        feat_warp = F.grid_sample(feat, flow) * mask
+        feat_warp = F.grid_sample(feat, flow, align_corners=True) * mask
 
         return feat_warp, feat_warp + input * (1.0 - mask), out
 
@@ -436,7 +436,7 @@ class Direction(nn.Module):
         # input: torch.Size([1, 20])
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         # q: torch.Size([512, 20]) 
         if input is None:
             return Q

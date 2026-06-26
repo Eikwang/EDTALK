@@ -106,9 +106,9 @@ def main(args):
         test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     else:
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=4, sampler=train_sampler, pin_memory=True, drop_last=True)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=2, sampler=train_sampler, pin_memory=True, drop_last=True)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
-        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=(test_sampler is None), num_workers=4, sampler=test_sampler, pin_memory=True, drop_last=True)
+        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=(test_sampler is None), num_workers=2, sampler=test_sampler, pin_memory=True, drop_last=True)
 
     trainSteps = len(dataloader)
     testSteps = len(test_dataloader)

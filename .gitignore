@@ -1,4 +1,6 @@
-__pycache__
+__pycache__/
+*.pyc
+*.pyo
 *pt
 gfpgan
 *pth
@@ -12,6 +14,31 @@ gfpgan
 *.png
 *.mp3
 *.wav
+*.log
 /gradio_cached_examples/
 webui_emotions2.py
 reference.py
+docs/
+.claude/
+.codegraph/
+.gradio/
+.idea/
+.omo/
+.openmem/
+.open-mem/
+.understand-anything/
+assets/
+avatar/
+avantar/
+ckpt_models/
+ckpts/
+code_for_webui/
+runtime/
+HDTF/
+logs/
+res/
+test_data/
+
+# open-mem: Auto-generated folder context files.
+# Uncomment to exclude from version control (recommended for large projects):
+**/AGENTS.md

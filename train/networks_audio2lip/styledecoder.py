@@ -421,7 +421,7 @@ class ToFlow(nn.Module):
         mask = torch.sigmoid(out[:, 2:3, :, :])
         flow = sampler.permute(0, 2, 3, 1) + xs
 
-        feat_warp = F.grid_sample(feat, flow) * mask
+        feat_warp = F.grid_sample(feat, flow, align_corners=True) * mask
 
         return feat_warp, feat_warp + input * (1.0 - mask), out
 

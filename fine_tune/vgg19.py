@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 from torchvision import models
+from torchvision.models import VGG19_Weights
 import numpy as np
 from networks.utils import AntiAliasInterpolation2d
 
@@ -34,7 +35,7 @@ class Vgg19(torch.nn.Module):
     def __init__(self, requires_grad=False):
         super(Vgg19, self).__init__()
 
-        vgg_model = models.vgg19(pretrained=True)
+        vgg_model = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
         # vgg_model.load_state_dict(torch.load('./vgg19-dcbb9e9d.pth'))
         vgg_pretrained_features = vgg_model.features
 

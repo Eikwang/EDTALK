@@ -45,7 +45,7 @@ if __name__ == '__main__':
     E_flame = ResnetEncoder(outsize=236).to('cuda') 
     model_path = 'DECA/data/deca_model.tar'
     print(f'trained model found. load {model_path}')
-    checkpoint = torch.load(model_path)
+    checkpoint = torch.load(model_path, weights_only=False)
     copy_state_dict(E_flame.state_dict(), checkpoint['E_flame'])
     E_flame.eval()
     x = torch.randn(4,3,224,224).cuda()

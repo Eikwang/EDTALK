@@ -126,7 +126,7 @@ class Trainer(nn.Module):
 
     def resume(self, resume_ckpt):
         print("load model:", resume_ckpt)
-        ckpt = torch.load(resume_ckpt)
+        ckpt = torch.load(resume_ckpt, weights_only=False)
         ckpt_name = os.path.basename(resume_ckpt)
         # try:
         #     self.start_iter = ckpt["start_iter"] #int(os.path.splitext(ckpt_name)[0])

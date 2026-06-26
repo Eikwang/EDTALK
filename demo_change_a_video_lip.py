@@ -5,14 +5,13 @@ from networks.generator_lip_pose import Generator
 from networks.audio_encoder import Audio2Lip
 import argparse
 import numpy as np
-import torchvision
-import os
 from PIL import Image
 from tqdm import tqdm
-from torchvision import transforms
 import torch.nn.functional as F
 from networks.utils import check_package_installed
-from moviepy.editor import *
+from moviepy import VideoFileClip, AudioFileClip
+import av
+from fractions import Fraction
 
 def load_image(filename, size):
     img = Image.open(filename).convert('RGB')
@@ -31,25 +30,71 @@ def img_preprocessing(img_path, size):
     return imgs_norm
 
 
-def vid_preprocessing(vid_path):
-    vid_dict = torchvision.io.read_video(vid_path, pts_unit='sec')
-    vid = vid_dict[0].permute(0, 3, 1, 2).unsqueeze(0)
-    fps = vid_dict[2]['video_fps']
-    vid_norm = (vid / 255.0 - 0.5) * 2.0  # [-1, 1]
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-    ])
-    
-    resized_frames = torch.stack([transform(frame) for frame in vid_norm[0]], dim=0).unsqueeze(0)
-    return resized_frames, fps
+class PreloadedVideoReader:
+    """启动时一次性解码所有视频帧到 GPU 显存，推理时直接索引，零延迟"""
+
+    def __init__(self, vid_path, size=256, device='cuda'):
+        self.vid_path = vid_path
+        self.size = size
+        self.device = device
+
+        container = av.open(vid_path)
+        stream = container.streams.video[0]
+        stream.thread_type = 'AUTO'
+        self.fps = float(stream.average_rate)
+
+        frames_list = []
+        for frame in container.decode(stream):
+            img = frame.to_ndarray(format='rgb24')  # H x W x 3, uint8
+            img = torch.from_numpy(img).permute(2, 0, 1).float()  # 3 x H x W
+            img = F.interpolate(img.unsqueeze(0), size=(size, size), mode='bilinear', align_corners=False)
+            img = (img / 255.0 - 0.5) * 2.0  # [-1, 1]
+            frames_list.append(img.squeeze(0))
+
+        container.close()
+
+        # [N, 3, H, W] 一次性存入 GPU
+        self.all_frames = torch.stack(frames_list).to(device)
+        self.total_frames = self.all_frames.shape[0]
+        print(f'==> video info: fps={self.fps:.2f}, total_frames={self.total_frames}, '
+              f'GPU memory: {self.all_frames.nelement() * 4 / 1024**2:.1f} MB')
+
+    def get_frame(self, idx):
+        """获取第 idx 帧（支持循环：idx 超出总帧数时取模），返回 [1, 3, H, W]"""
+        actual_idx = idx % self.total_frames
+        return self.all_frames[actual_idx:actual_idx+1]  # [1, 3, H, W]
+
+    def close(self):
+        self.all_frames = None
 
 
-def save_video(vid_target_recon, save_path, fps):
-    vid = vid_target_recon.permute(0, 2, 3, 4, 1)
-    vid = vid.clamp(-1, 1).cpu()
-    vid = ((vid - vid.min()) / (vid.max() - vid.min()) * 255).type('torch.ByteTensor')
+class StreamingVideoWriter:
+    """基于 PyAV 的流式视频写入器，逐帧写入，避免内存中积攒所有帧"""
 
-    torchvision.io.write_video(save_path, vid[0], fps=fps)
+    def __init__(self, save_path, fps, width=256, height=256):
+        self.save_path = save_path
+        self.container = av.open(save_path, mode='w')
+        self.stream = self.container.add_stream('libx264', rate=Fraction(int(fps), 1))
+        self.stream.width = width
+        self.stream.height = height
+        self.stream.pix_fmt = 'yuv420p'
+        self.frame_count = 0
+
+    def write_frame(self, frame_tensor):
+        """写入一帧 [1, 3, H, W] 的 tensor（[-1,1] 范围）"""
+        img = frame_tensor.squeeze(0).clamp(-1, 1).cpu()
+        img = (img + 1.0) * 127.5  # [-1,1] → [0,255]
+        img = img.permute(1, 2, 0).to(torch.uint8).numpy()  # H x W x 3, uint8
+        av_frame = av.VideoFrame.from_ndarray(img, format='rgb24')
+        for packet in self.stream.encode(av_frame):
+            self.container.mux(packet)
+        self.frame_count += 1
+
+    def close(self):
+        # Flush
+        for packet in self.stream.encode():
+            self.container.mux(packet)
+        self.container.close()
 
 import audio
 def parse_audio_length(audio_length, sr, fps):
@@ -113,11 +158,11 @@ class Demo(nn.Module):
         audio2lip_model_path = args.audio2lip_model_path
         print('==> loading model')
         self.audio2lip = Audio2Lip().cuda()
-        weight = torch.load(audio2lip_model_path, map_location=lambda storage, loc: storage)['audio2lip']
+        weight = torch.load(audio2lip_model_path, map_location=lambda storage, loc: storage, weights_only=False)['audio2lip']
         self.audio2lip.load_state_dict(weight)
         self.audio2lip.eval()
         self.gen = Generator().cuda()
-        weight = torch.load(model_path, map_location=lambda storage, loc: storage)['gen']
+        weight = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)['gen']
         self.gen.load_state_dict(weight)
         self.gen.eval()
         print('==> loading data')
@@ -138,11 +183,10 @@ class Demo(nn.Module):
         self.audio, self.bs, self.T = audio_preprocessing(args.audio_driving_path)
         self.audio_path = args.audio_driving_path
         self.save_path = args.save_path
-        self.fps = 25
 
-
-        self.img_source , self.fps = vid_preprocessing(args.source_path)
-        self.img_source  = self.img_source .cuda()
+        self.video_reader = PreloadedVideoReader(args.source_path, size=256, device='cuda')
+        self.fps = self.video_reader.fps
+        self.total_video_frames = self.video_reader.total_frames
 
     def run(self):
 
@@ -150,38 +194,37 @@ class Demo(nn.Module):
         with torch.no_grad():
             # self.save_path = args.save_path
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-            vid_target_recon = []
 
             h_start = None
             self.lip_vid_target = self.audio2lip(self.audio, self.bs, self.T)[0]
             self.lip_vid_target = conv_feat(self.lip_vid_target, k_size=3, sigma=1) # torch.Size([372, 500])
 
-            # len_pose = self.img_source.shape[1]
-            while self.img_source.shape[1] < self.lip_vid_target.size(0):
-                reversed_img_source = self.img_source.flip(dims=[1])
-                self.img_source = torch.cat((self.img_source, reversed_img_source), dim=1)
+            total_lip_frames = self.lip_vid_target.size(0)
+            total_video_frames = self.total_video_frames
 
-            for i in tqdm(range(self.lip_vid_target.size(0))):
+            # 流式写入器，逐帧写入，不占用内存
+            writer = StreamingVideoWriter(self.save_path.replace('.mp4','_temp.mp4'), fps=self.fps)
+
+            for i in tqdm(range(total_lip_frames)):
                 img_target_lip = self.lip_vid_target[i:i+1]
 
-                # if i>=len_pose:
-                #     img_target_pose = self.img_source[:, -1, :, :, :]
-                # else:
-                img_target_pose = self.img_source[:, i, :, :, :]
+                # 流式读取源视频帧，自动循环
+                vid_idx = i % total_video_frames if total_video_frames > 0 else 0
+                img_target_pose = self.video_reader.get_frame(vid_idx)
 
                 img_recon = self.gen.test_from_audio_pose_image(img_target_pose, img_target_lip, img_target_pose, h_start)
                 
-                vid_target_recon.append(img_recon.unsqueeze(2))
+                writer.write_frame(img_recon)
 
-            vid_target_recon = torch.cat(vid_target_recon, dim=2)
+            writer.close()
+            self.video_reader.close()
             
             temp_path = self.save_path.replace('.mp4','_temp.mp4')
-            save_video(vid_target_recon, temp_path, self.fps)
             cmd = r'ffmpeg -y -i "%s" -i "%s" -vcodec copy "%s"' % (temp_path, self.audio_path, self.save_path)
             os.system(cmd)
             os.remove(temp_path)
 
-            if args.face_sr and check_package_installed('gfpgan'):
+            if self.args.face_sr and check_package_installed('gfpgan'):
                 from face_sr.face_enhancer import enhancer_list
                 import imageio
 
@@ -193,7 +236,7 @@ class Demo(nn.Module):
                 # Merge audio and video
                 video_clip = VideoFileClip(temp_512_path + '.tmp.mp4')
                 audio_clip = AudioFileClip(self.save_path)
-                final_clip = video_clip.set_audio(audio_clip)
+                final_clip = video_clip.with_audio(audio_clip)
                 final_clip.write_videofile(temp_512_path, codec='libx264', audio_codec='aac')
                 
                 os.remove(temp_512_path + '.tmp.mp4')
@@ -203,7 +246,7 @@ def conv_feat(features, k_size, weight=None, sigma=1.0):
     c = features.shape[1] # torch.Size([101, 500])
     if weight is None:
         pad = k_size // 2
-        k = np.zeros(k_size).astype(np.float)
+        k = np.zeros(k_size, dtype=np.float64)
         for x in range(-pad, k_size-pad):
             k[x+pad] = np.exp(-x**2 / (2 * (sigma ** 2)))
         k = k / k.sum()

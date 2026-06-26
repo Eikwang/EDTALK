@@ -244,11 +244,27 @@ class Discriminator(nn.Module):
         out = self.convs(input)
         batch, channel, height, width = out.shape
 
-        group = min(batch, self.stddev_group)
-        stddev = out.view(group, -1, self.stddev_feat, channel // self.stddev_feat, height, width)
-        stddev = torch.sqrt(stddev.var(0, unbiased=False) + 1e-8)
-        stddev = stddev.mean([2, 3, 4], keepdims=True).squeeze(2)
-        stddev = stddev.repeat(group, 1, height, width)
+        # 确保 group 能整除 batch
+        group = self.stddev_group
+        while batch % group != 0 and group > 1:
+            group //= 2
+
+        # 计算每组有多少样本
+        samples_per_group = batch // group
+
+        # [batch, C, H, W] -> [group, samples, C, H, W]
+        stddev = out.view(group, samples_per_group, channel, height, width)
+        # 在 group 维度上计算方差: [group, samples, C, H, W] -> [samples, C, H, W]
+        stddev = stddev.var(0, unbiased=False)
+        stddev = torch.sqrt(stddev + 1e-8)
+        # 对 C, H, W 维度取均值 -> [samples, 1, 1, 1]
+        stddev = stddev.mean(dim=[1, 2, 3], keepdim=True)
+        # [samples, 1, 1, 1] -> [samples, 1]
+        stddev = stddev.squeeze(-1).squeeze(-1).squeeze(-1).unsqueeze(-1)  # [samples, 1]
+        # 复制每个样本到对应的 group 位置: [samples, 1] -> [batch, 1]
+        stddev = stddev.repeat_interleave(group, dim=0)
+        # 扩展到 [batch, 1, H, W]
+        stddev = stddev.view(batch, 1, 1, 1).expand(batch, 1, height, width)
         out = torch.cat([out, stddev], 1)
 
         out = self.final_conv(out)

@@ -1,10 +1,19 @@
-import argparse
+# 解决 Windows OpenMP 冲突（必须在任何 import 之前设置！）
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import datetime, os
+import argparse
+import sys
+
+# 确保项目根目录在 sys.path 中（支持从任意目录运行）
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+import datetime
 import torch
 from torch.utils import data
 from torch.utils.data import DataLoader
-# from dataset import Vox256, Taichi, TED
 from datasets.dataset_audio2lip import Audio2LipDataset_image_sync
 import torchvision
 import torchvision.transforms as transforms
@@ -65,10 +74,18 @@ def ddp_setup(args, rank, world_size):
 
 
 def main(args):
+    # 预热 CUDA - 确保 CUDA 上下文干净
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == 'cuda':
+        print(f"[INFO] CUDA 预热中... GPU: {torch.cuda.get_device_name(0)}")
+        _dummy = torch.empty(1, device=device)
+        del _dummy
+        torch.cuda.empty_cache()
+        print(f"[INFO] CUDA 预热完成")
+
     # init distributed computing
     # ddp_setup(args, rank, world_size)
     # torch.cuda.set_device(rank)
-    device = torch.device("cuda")
     date = str(datetime.datetime.now())
     date = date[:date.rfind(":")].replace("-", "")\
                                 .replace(":", "")\
@@ -92,8 +109,8 @@ def main(args):
     #     dataset = TED('train', transform, True)
     #     dataset_test = TED('test', transform)
     # elif args.dataset == 'vox':
-    dataset = Audio2LipDataset_image_sync(is_train= True, transform = transform)
-    dataset_test = Audio2LipDataset_image_sync(is_train= False, transform = transform)
+    dataset = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=True, transform=transform)
+    dataset_test = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=False, transform=transform)
     # elif args.dataset == 'taichi':
     #     dataset = Taichi('train', transform, True)
     #     dataset_test = Taichi('test', transform)
@@ -105,9 +122,9 @@ def main(args):
         test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     else:
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=4, sampler=train_sampler, pin_memory=True, drop_last=True)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=2, sampler=train_sampler, pin_memory=True, drop_last=True)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
-        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=(test_sampler is None), num_workers=4, sampler=test_sampler, pin_memory=True, drop_last=True)
+        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=(test_sampler is None), num_workers=2, sampler=test_sampler, pin_memory=True, drop_last=True)
 
     trainSteps = len(dataloader)
     testSteps = len(test_dataloader)
@@ -132,24 +149,36 @@ def main(args):
     for epoch in range(args.epoch):
         if args.distributed:
             dataloader.sampler.set_epoch(epoch)
+        # 累加器：用于统计本 epoch 的平均损失
+        epoch_l_g_total = 0.0
+        epoch_loss_sums = {}
+        epoch_step_count = 0
         for bii, bi in enumerate(dataloader):
             current_iter += 1
             audio_features, lip_features, pose_features, identity_img, target_img, bbox\
             = bi['audio_features'], bi['lip_features'],bi['pose_features'], bi['identity_img'], bi['target_img'], bi['bbox']
             audio_features, lip_features, pose_features, identity_img, target_img, bbox = \
                         audio_features.cuda(), lip_features.cuda(), pose_features.cuda(), identity_img.cuda(), target_img.cuda(), bbox.cuda()
+            
+            # 梯度累积：只在每 accumulation_steps 步执行一次优化器 step
+            step_optimizer = ((bii + 1) % args.accumulation_steps == 0) or (bii + 1 == len(dataloader))
+            
             # update generator
-            G_losses, recon, l_g_total = trainer.gen_update(audio_features, lip_features, pose_features, identity_img, target_img, bbox)
+            G_losses, recon, l_g_total = trainer.gen_update(
+                audio_features, lip_features, pose_features, identity_img, target_img, bbox,
+                accumulation_steps=args.accumulation_steps,
+                step_optimizer=step_optimizer
+            )
 
             # update discriminator
             # gan_d_loss = trainer.dis_update(torch.cat([img_a, img_b], dim=0), torch.cat([recon_a_cross, recon_b_cross], dim=0))
 
-            log_info = 'train_Epoch [{}/{}], Step [{}/{}] '.format(epoch, args.epoch, current_iter, args.iter,
-                        l_g_total.detach().item())
-            
-            for key, value in G_losses.items():
-                log_info+='{}: {:.4f} '.format(key, value.detach().item())
-            print(log_info)
+            # 只在实际执行 optimizer step 时累加 epoch 统计（避免重复计数）
+            if step_optimizer:
+                epoch_l_g_total += l_g_total.detach().item()
+                for key, value in G_losses.items():
+                    epoch_loss_sums[key] = epoch_loss_sums.get(key, 0.0) + value.detach().item()
+                epoch_step_count += 1
 
             if current_iter % args.log_iter == 0:
                 writer.add_scalar('train_loss/l_g_total_loss', l_g_total.detach().item(), current_iter)
@@ -168,7 +197,6 @@ def main(args):
                     os.path.join(checkpoint_path, "epoch_%05d_step_%05d_train.jpg"%(epoch, current_iter)),
                     nrow=int(args.batch_size),
                     normalize=True,
-                    range=(-1, 1),
                 )
 
             if current_iter % args.eval_iter == 0:
@@ -207,7 +235,6 @@ def main(args):
                                 os.path.join(checkpoint_path, "epoch_%05d_step_%05d_test.jpg"%(epoch, test_iter)),
                                 nrow=int(args.batch_size),
                                 normalize=True,
-                                range=(-1, 1),
                             )
                             last_name = os.path.join(checkpoint_path, "epoch_%05d_step_%05d_test.jpg"%(epoch, test_iter))
                         # break
@@ -240,7 +267,6 @@ def main(args):
                                 os.path.join(checkpoint_path, "best_epoch_%06d_step_%06dd_%05d.jpg"%(epoch, current_iter, start_i)),
                                 nrow=int(args.batch_size),
                                 normalize=True,
-                                range=(-1, 1),
                             )
 
             if current_iter%args.save_freq==0:
@@ -271,18 +297,29 @@ def main(args):
                             os.path.join(checkpoint_path, "step_%05d_%05d.jpg"%(current_iter, start_i)),
                             nrow=int(args.batch_size),
                             normalize=True,
-                            range=(-1, 1),
                         )
-            
-            
-            # # save model
-            # if i % args.save_freq == 0 and rank == 0:
-            #     trainer.save(i, checkpoint_path)
+
+        # === Epoch 结束：打印本 epoch 的平均损失 ===
+        if epoch_step_count > 0:
+            avg_l_g_total = epoch_l_g_total / epoch_step_count
+            log_info = 'train_Epoch [{}/{}] done, Steps={}, Avg l_g_total: {:.4f}'.format(
+                epoch, args.epoch, epoch_step_count, avg_l_g_total)
+            for key in sorted(epoch_loss_sums.keys()):
+                avg_value = epoch_loss_sums[key] / epoch_step_count
+                log_info += ' {}: {:.4f}'.format(key, avg_value)
+            print(log_info)
 
     return
 
 
 if __name__ == "__main__":
+    # Windows 下必须使用 spawn 模式解决多进程问题
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # 已经设置过了
+
     # training params
     parser = argparse.ArgumentParser()
     parser.add_argument("--iter", type=int, default=800000)
@@ -310,18 +347,21 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--semantic_radius", type=int, default=13)
     parser.add_argument("--log_iter", type=int, default=10)
-    parser.add_argument("--image_save_iter", type=int, default=100, help="local rank for distributed training")
+    parser.add_argument("--image_save_iter", type=int, default=500, help="local rank for distributed training")
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
-    parser.add_argument("--distributed", type=bool, default=False, help="local rank for distributed training")
+    parser.add_argument("--distributed", action='store_true', help="Enable distributed training")
     parser.add_argument("--eval_iter", type=int, default=800, help="local rank for distributed training")
-    parser.add_argument("--sync_weight", type=int, default=5, help="local rank for distributed training")
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--sync_weight", type=int, default=0, help="SyncNet loss weight (0=disabled, need syncnet_ckpt)")
+    parser.add_argument("--syncnet_ckpt", type=str, default=None, help="Path to SyncNet pre-trained checkpoint (e.g. ckpts/EDTalk.pt)")
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--dis_weight", type=int, default=1, help="local rank for distributed training")
     parser.add_argument("--vis_num", type=int, default=10, help="local rank for distributed training")
     parser.add_argument("--save_freq", type=int, default=1000)
     parser.add_argument("--train_generator", type=bool, default=False, help="local rank for distributed training")
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--audio2lip_ckpt", type=str, default=None)
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数（单卡显存不足时使用，等效 batch_size = batch_size * accumulation_steps）")
+    parser.add_argument("--data_path", type=str, default='HDTF', help="Dataset base directory path")
     
     opts = parser.parse_args()
 

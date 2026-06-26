@@ -14,7 +14,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         if Q.dtype != torch.float32:
             Q = torch.tensor(Q, dtype=torch.float32)
         if input is None:
@@ -31,7 +31,7 @@ class Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -60,7 +60,7 @@ class Pose_Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         if Q.dtype != torch.float32:
             Q = torch.tensor(Q, dtype=torch.float32)
         if input is None:
@@ -77,7 +77,7 @@ class Pose_Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -106,7 +106,7 @@ class Lip_Direction(nn.Module):
         # input: (bs*t) x 512
         weight = torch.cat([self.weight, pose_weight], -1)
         weight = weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
         if Q.dtype != torch.float32:
             Q = torch.tensor(Q, dtype=torch.float32)
         if input is None:
@@ -121,7 +121,7 @@ class Lip_Direction(nn.Module):
         # input: (bs*t) x 512
 
         weight = self.weight + 1e-8
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
@@ -209,3 +209,26 @@ class Generator(nn.Module):
         latent_poseD = wa + directions_D 
         img_recon = self.dec(latent_poseD, None, feats)
         return img_recon
+
+    def get_lip_pose_feature(self, img_source):
+        """
+        从单张图像提取 lip 和 pose 特征（用于训练数据预处理）
+        
+        Args:
+            img_source: 预处理后的人脸图像 [B, 3, 256, 256]
+            
+        Returns:
+            lip_feat: [B, 20] 口型特征
+            pose_feat: [B, 6] 姿态特征
+        """
+        # Encoder 需要两个参数: (input_source, input_target)
+        # input_target 设为 None 表示不需要驱动图像
+        # 返回: h_source, h_target(None), feats, feats_t(None)
+        wa_t_p, _, _, _ = self.enc(img_source, None)
+        
+        # 通过 FC 层提取特征
+        shared_fc_p = self.fc(wa_t_p)
+        alpha_D_pose = self.pose_fc(shared_fc_p)
+        alpha_D_lip = self.lip_fc(shared_fc_p)
+        
+        return alpha_D_lip, alpha_D_pose
