@@ -25,6 +25,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torchvision import utils
 import shutil
+from tqdm import tqdm
 from util.distributed_stylegan import (
     get_rank,
     synchronize,
@@ -109,8 +110,17 @@ def main(args):
     #     dataset = TED('train', transform, True)
     #     dataset_test = TED('test', transform)
     # elif args.dataset == 'vox':
-    dataset = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=True, transform=transform)
-    dataset_test = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=False, transform=transform)
+    dataset = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=True, transform=transform,
+                                           preload_features=args.preload_features)
+    dataset_test = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=False, transform=transform,
+                                                preload_features=args.preload_features)
+
+    # 限制测试集为训练集的 1%, 避免每次 eval 跑一整轮 (与训练同规模) 浪费时间
+    # 原因: train/test 共享同一份 samples 列表, eval 一次要跑 2 万+ batch, ~1 小时
+    test_size = max(1, len(dataset.samples) // 100)
+    dataset_test.samples = dataset_test.samples[:test_size]
+    print(f"[Dataset] 测试集截断: {len(dataset_test.samples)} 样本 (训练集 1%, "
+          f"原 {len(dataset.samples)} 条)")
     # elif args.dataset == 'taichi':
     #     dataset = Taichi('train', transform, True)
     #     dataset_test = Taichi('test', transform)
@@ -118,13 +128,22 @@ def main(args):
     #     raise NotImplementedError
 
     if args.distributed == False:
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, 
+                                num_workers=4, pin_memory=True, drop_last=True,
+                                persistent_workers=True, prefetch_factor=2)
+        # 关键修复: test_dataloader 不使用多进程 worker
+        # 原因: Windows spawn 模式下 persistent_workers=True 会导致 eval 时 worker 死锁
+        # (worker 在训练阶段长时间空闲后 LMDB env 失效, 主进程永远阻塞)
+        # 验证集不大, 主进程加载完全够用, 彻底消除死锁风险
+        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=True,
+                                     num_workers=0, pin_memory=True, drop_last=True)
     else:
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=2, sampler=train_sampler, pin_memory=True, drop_last=True)
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
+                                num_workers=2, sampler=train_sampler, pin_memory=True, drop_last=True)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
-        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=(test_sampler is None), num_workers=2, sampler=test_sampler, pin_memory=True, drop_last=True)
+        test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=(test_sampler is None), 
+                                     num_workers=2, sampler=test_sampler, pin_memory=True, drop_last=True)
 
     trainSteps = len(dataloader)
     testSteps = len(test_dataloader)
@@ -153,7 +172,12 @@ def main(args):
         epoch_l_g_total = 0.0
         epoch_loss_sums = {}
         epoch_step_count = 0
-        for bii, bi in enumerate(dataloader):
+        # 滚动统计窗口：用于 tqdm 后缀显示最近 N batch 的平均损失
+        recent_losses = []
+        # tqdm 进度条：显示 epoch 内 batch 进度
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{args.epoch}', 
+                    total=trainSteps, leave=True, ncols=100)
+        for bii, bi in enumerate(pbar):
             current_iter += 1
             audio_features, lip_features, pose_features, identity_img, target_img, bbox\
             = bi['audio_features'], bi['lip_features'],bi['pose_features'], bi['identity_img'], bi['target_img'], bi['bbox']
@@ -175,10 +199,31 @@ def main(args):
 
             # 只在实际执行 optimizer step 时累加 epoch 统计（避免重复计数）
             if step_optimizer:
-                epoch_l_g_total += l_g_total.detach().item()
+                loss_val = l_g_total.detach().item()
+                epoch_l_g_total += loss_val
                 for key, value in G_losses.items():
                     epoch_loss_sums[key] = epoch_loss_sums.get(key, 0.0) + value.detach().item()
                 epoch_step_count += 1
+                # 滚动窗口：保留最近 100 个 step 的 loss
+                recent_losses.append(loss_val)
+                if len(recent_losses) > 100:
+                    recent_losses.pop(0)
+
+            # 更新 tqdm 后缀：显示最近 batch 的 loss
+            if (bii + 1) % 50 == 0 or (bii + 1) == trainSteps:
+                recent_avg = sum(recent_losses) / max(len(recent_losses), 1)
+                pbar.set_postfix({
+                    'loss': f'{recent_avg:.4f}',
+                    'iter': current_iter
+                })
+
+            # 每 log_freq 个 batch 打印一次滚动日志（单行，不刷屏）
+            if args.log_freq > 0 and (bii + 1) % args.log_freq == 0:
+                recent_avg = sum(recent_losses) / max(len(recent_losses), 1)
+                loss_str = ' '.join(f'{k}:{v.detach().item():.4f}' for k, v in G_losses.items())
+                cur_loss = l_g_total.detach().item()
+                print(f'  [Epoch {epoch+1} Batch {bii+1}/{trainSteps}] '
+                      f'recent_avg={recent_avg:.4f} total={cur_loss:.4f} {loss_str}')
 
             if current_iter % args.log_iter == 0:
                 writer.add_scalar('train_loss/l_g_total_loss', l_g_total.detach().item(), current_iter)
@@ -200,13 +245,22 @@ def main(args):
                 )
 
             if current_iter % args.eval_iter == 0:
+                # 验证阶段：收集所有 batch 的 loss，验证完后打印汇总
                 curloss = 0
+                eval_losses = {}  # 收集所有 batch 的 loss
+                eval_steps = 0
                 # lip_mlp = lip_mlp.eval()
                 if args.distributed:
                     test_epoch +=1
                     test_dataloader.sampler.set_epoch(test_epoch)
-                for bii, bi in enumerate(test_dataloader):
+                # 用 tqdm 进度条替代每 20 batch 的 print，避免验证集较大时刷屏
+                # （原写法在 testSteps=20605 时会打印 ~1000 行 [Eval] batch 日志）
+                eval_pbar = tqdm(test_dataloader, desc=f'  [Eval] Epoch {epoch+1}',
+                                 total=testSteps, leave=False, ncols=100)
+                for bii, bi in enumerate(eval_pbar):
                     test_iter+=1
+                    if test_iter % 1000 == 0:
+                        eval_pbar.set_postfix_str(f'iter={test_iter}')
                     with torch.no_grad():
                         audio_features, lip_features, pose_features, identity_img, target_img, bbox\
                         = bi['audio_features'], bi['lip_features'],bi['pose_features'], bi['identity_img'], bi['target_img'], bi['bbox']
@@ -214,19 +268,14 @@ def main(args):
                                     audio_features.cuda(), lip_features.cuda(), pose_features.cuda(), identity_img.cuda(), target_img.cuda(), bbox.cuda()
                         
                         G_losses, recon, l_g_total = trainer.sample(audio_features, lip_features, pose_features, identity_img, target_img, bbox)
-                        curloss+= l_g_total.detach().item()
-
-                        log_info = 'eval_Epoch [{}/{}], Step [{}/{}] '.format(epoch, args.epoch, bii, testSteps,
-                                    l_g_total.detach().item())
+                        curloss += l_g_total.detach().item()
+                        eval_steps += 1
                         
+                        # 收集各 loss
                         for key, value in G_losses.items():
-                            log_info+='{}: {:.4f} '.format(key, value.detach().item())
-                        print(log_info)
-
-                        if test_iter % args.log_iter == 0:
-                            writer.add_scalar('eval_loss/l_g_total_loss', l_g_total.detach().item(), test_iter)
-                            for key, value in G_losses.items():
-                                writer.add_scalar('eval_loss/{}'.format(key), value.detach().item(), test_iter)
+                            eval_losses[key] = eval_losses.get(key, 0.0) + value.detach().item()
+                        eval_losses['l_g_total'] = eval_losses.get('l_g_total', 0.0) + l_g_total.detach().item()
+                        
                         if test_iter % args.image_save_iter == 0:
                             sample = F.interpolate(torch.cat((identity_img.detach(),target_img.detach()[:,-1], recon.detach()), dim=0), 256)
                             # sample = torch.flip(sample, [1])
@@ -238,7 +287,17 @@ def main(args):
                             )
                             last_name = os.path.join(checkpoint_path, "epoch_%05d_step_%05d_test.jpg"%(epoch, test_iter))
                         # break
-                curloss = curloss/len(test_dataloader)
+                
+                # === 验证完成：打印汇总日志 ===
+                curloss = curloss / eval_steps
+                avg_losses = {k: v / eval_steps for k, v in eval_losses.items()}
+                
+                log_info = f'[Eval] Epoch {epoch+1}/{args.epoch} | Steps: {eval_steps} | Avg Loss: {curloss:.4f}'
+                log_info += f' | L1: {avg_losses.get("recon_l1_loss", 0):.4f}'
+                log_info += f' | VGG: {avg_losses.get("recon_vgg_loss", 0):.1f}'
+                log_info += f' | Sync: {avg_losses.get("sync", 0):.4f}'
+                log_info += f' | Best: {best_loss:.4f}'
+                print(log_info)
 
 
                 if curloss<best_loss:
@@ -309,6 +368,14 @@ def main(args):
                 log_info += ' {}: {:.4f}'.format(key, avg_value)
             print(log_info)
 
+            # === 每个 epoch 结束时保存完整 checkpoint ===
+            # 确保每个 epoch 都有一个完整的模型备份，避免因 save_freq 间隔导致的"中间状态"丢失
+            # 注意: trainer.save(path) 内部会再拼 /{idx:06d}.pt, 所以这里必须传目录而非 .pt 文件路径
+            epoch_ckpt_dir = os.path.join(checkpoint_path, f'epoch_{epoch:03d}')
+            os.makedirs(epoch_ckpt_dir, exist_ok=True)
+            trainer.save(current_iter, epoch_ckpt_dir)
+            print(f'[Epoch {epoch+1}] checkpoint saved: {os.path.join(epoch_ckpt_dir, f"{current_iter:06d}.pt")}')
+
     return
 
 
@@ -323,13 +390,13 @@ if __name__ == "__main__":
     # training params
     parser = argparse.ArgumentParser()
     parser.add_argument("--iter", type=int, default=800000)
-    parser.add_argument("--epoch", type=int, default=100)
+    parser.add_argument("--epoch", type=int, default=50)
     parser.add_argument("--size", type=int, default=256)
     
     parser.add_argument("--d_reg_every", type=int, default=16)
     parser.add_argument("--g_reg_every", type=int, default=4)
     
-    parser.add_argument("--lr", type=float, default=0.002)
+    parser.add_argument("--lr", type=float, default=0.0005)
     parser.add_argument("--channel_multiplier", type=int, default=1)
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--display_freq", type=int, default=1)
@@ -346,22 +413,25 @@ if __name__ == "__main__":
     parser.add_argument("--path", type=str, default=None)
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--semantic_radius", type=int, default=13)
-    parser.add_argument("--log_iter", type=int, default=10)
-    parser.add_argument("--image_save_iter", type=int, default=500, help="local rank for distributed training")
+    parser.add_argument("--log_iter", type=int, default=1000)
+    parser.add_argument("--image_save_iter", type=int, default=2500, help="local rank for distributed training")
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
     parser.add_argument("--distributed", action='store_true', help="Enable distributed training")
-    parser.add_argument("--eval_iter", type=int, default=800, help="local rank for distributed training")
+    parser.add_argument("--eval_iter", type=int, default=10000, help="local rank for distributed training")
     parser.add_argument("--sync_weight", type=int, default=0, help="SyncNet loss weight (0=disabled, need syncnet_ckpt)")
     parser.add_argument("--syncnet_ckpt", type=str, default=None, help="Path to SyncNet pre-trained checkpoint (e.g. ckpts/EDTalk.pt)")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--dis_weight", type=int, default=1, help="local rank for distributed training")
     parser.add_argument("--vis_num", type=int, default=10, help="local rank for distributed training")
-    parser.add_argument("--save_freq", type=int, default=1000)
+    parser.add_argument("--save_freq", type=int, default=5000)
     parser.add_argument("--train_generator", type=bool, default=False, help="local rank for distributed training")
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--audio2lip_ckpt", type=str, default=None)
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数（单卡显存不足时使用，等效 batch_size = batch_size * accumulation_steps）")
+    parser.add_argument("--accumulation_steps", type=int, default=4, help="梯度累积步数（单卡显存不足时使用，等效 batch_size = batch_size * accumulation_steps）")
     parser.add_argument("--data_path", type=str, default='HDTF', help="Dataset base directory path")
+    parser.add_argument("--log_freq", type=int, default=5000, help="每 N 个 batch 打印一次滚动日志（0=只在 epoch 结束打印）")
+    parser.add_argument("--preload_features", action='store_true',
+                        help="将所有特征预加载到内存 (小数据集微调推荐, 大数据集慎用)")
     
     opts = parser.parse_args()
 

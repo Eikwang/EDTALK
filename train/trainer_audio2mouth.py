@@ -268,7 +268,12 @@ class Trainer(nn.Module):
 
             G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
             pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-            value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, device).mean() # torch.Size([4, 3, 5, 96, 96])
+            # SyncNet 训练时 mel 输入为 (B, 1, 80, T*16) - T 帧 mel 沿 W 维度拼接
+            # (见 train_syncnet.py 的 mel.view(1, 80, -1))
+            # 之前误用 [:,0:1] 只取第 1 帧 (B,1,80,16), 导致 SyncNet 输出垃圾,
+            # 余弦相似度 ≈ 0, BCE 被 clamp 到 100, sync 恒为 sync_weight*100=500
+            mel_for_sync = audio_features.reshape(batch_size, T, 80, 16).permute(0, 2, 1, 3).reshape(batch_size, 1, 80, T*16)
+            value = self.get_sync_loss(mel_for_sync, pre_bbox, self.device).mean()
             G_losses['sync'] = self.sync_weight * value
             
         G_losses_values = [val.mean() for val in G_losses.values()]
@@ -362,7 +367,7 @@ class Trainer(nn.Module):
 
                 G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
                 pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-                value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, device).mean() # torch.Size([4, 3, 5, 96, 96])
+                value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, self.device).mean() # torch.Size([4, 3, 5, 96, 96])
                 G_losses['sync'] = self.sync_weight * value
                 
             G_losses_values = [val.mean() for val in G_losses.values()]
@@ -475,6 +480,16 @@ class Trainer(nn.Module):
         return start_iter
 
     def save(self, idx, checkpoint_path):
+        # 兼容两种调用方式：
+        #   1) 传目录:        trainer.save(iter, "logs/.../checkpoint")         -> 保存为 logs/.../checkpoint/000123.pt
+        #   2) 传完整文件路径: trainer.save(iter, "logs/.../checkpoint/xxx.pt")  -> 直接用该路径
+        if os.path.isdir(checkpoint_path) or not checkpoint_path.endswith('.pt'):
+            save_path = os.path.join(checkpoint_path, f"{str(idx).zfill(6)}.pt")
+        else:
+            save_path = checkpoint_path
+        save_dir = os.path.dirname(save_path)
+        if save_dir and not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
         torch.save(
             {
                 "audio2lip": self.audio2lip.state_dict(),
@@ -483,5 +498,5 @@ class Trainer(nn.Module):
                 # "d_optim": self.d_optim.state_dict(),
                 "args": self.args
             },
-            f"{checkpoint_path}/{str(idx).zfill(6)}.pt"
+            save_path
         )

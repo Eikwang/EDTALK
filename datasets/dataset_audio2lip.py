@@ -62,7 +62,7 @@ _lmdb_env_cache = {}
 
 
 def _get_lmdb_env(lmdb_path):
-    """获取 LMDB env，单例模式"""
+    """获取图像 LMDB env，单例模式"""
     if lmdb_path not in _lmdb_env_cache:
         _lmdb_env_cache[lmdb_path] = lmdb.open(
             lmdb_path,
@@ -75,15 +75,54 @@ def _get_lmdb_env(lmdb_path):
     return _lmdb_env_cache[lmdb_path]
 
 
+# 特征 LMDB 连接缓存 (mel/lip_feature/pose_feature/bbox)
+_feat_lmdb_env_cache = {}
+
+
+def _get_feat_lmdb_env(lmdb_path):
+    """获取特征 LMDB env，单例模式 (与图像 LMDB 独立缓存)"""
+    if lmdb_path not in _feat_lmdb_env_cache:
+        _feat_lmdb_env_cache[lmdb_path] = lmdb.open(
+            lmdb_path,
+            max_readers=32,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False
+        )
+    return _feat_lmdb_env_cache[lmdb_path]
+
+
+
+# 样本列表缓存（按数据集路径 + max_samples_per_video 缓存，避免每次启动重新扫描所有 .npy）
+_samples_cache = {}
+
+
+def _get_npy_length(path):
+    """只读 .npy header 获取长度，不加载整个数组到内存"""
+    return np.load(path, mmap_mode='r').shape[0]
+
 
 class Audio2LipDataset_image_sync(Dataset):
-    def __init__(self, hdtf, is_train=True, transform=None, max_samples_per_video=None):
+    def __init__(self, hdtf, is_train=True, transform=None, max_samples_per_video=None,
+                 preload_features=False):
         self.is_train = is_train
         self.hdtf_path = hdtf
         self.transform = transform
         self.max_samples_per_video = max_samples_per_video
 
-        # LMDB 路径：{base_dir}/lmdb，使用缓存避免重复打开
+        # 特征 LMDB 路径: {base_dir}/lmdb_features (可选, 不存在则回退 .npy)
+        feat_lmdb_path = os.path.join(hdtf, 'lmdb_features')
+        self.feat_env = None
+        self._feature_cache = None  # preload_features=True 时为 dict, 否则 None
+        if os.path.exists(feat_lmdb_path):
+            self.feat_env = _get_feat_lmdb_env(feat_lmdb_path)
+            print(f"[Audio2LipDataset] 检测到特征 LMDB: {feat_lmdb_path}")
+        else:
+            print(f"[Audio2LipDataset] 未找到特征 LMDB ({feat_lmdb_path}), "
+                  f"将回退到 .npy 文件读取 (建议运行 prepare_feature_lmdb.py 预处理)")
+
+        # 图像 LMDB 路径：{base_dir}/lmdb，使用缓存避免重复打开
         lmdb_path = os.path.join(hdtf, 'lmdb')
         if not os.path.exists(lmdb_path):
             raise FileNotFoundError(f"LMDB not found: {lmdb_path}")
@@ -92,45 +131,156 @@ class Audio2LipDataset_image_sync(Dataset):
         # 从已打开的 env 中提取视频列表（避免重复打开同一 LMDB 路径）
         self.video_list = _extract_video_names_from_env(self.env)
 
-        # 预计算所有可采样片段: (video_idx, start_frame)
-        # 关键修改：按帧采样而非按视频采样，确保每个 epoch 能遍历全部数据
-        self.samples = []
-        for v_idx, name in enumerate(self.video_list):
-            # 获取各特征长度
-            audio_path = os.path.join(hdtf, 'mel', name + '.npy')
-            lip_path = os.path.join(hdtf, 'lip_feature', name + '.npy')
-            pose_path = os.path.join(hdtf, 'pose_feature', name + '.npy')
-            
-            if not all(os.path.exists(p) for p in [audio_path, lip_path, pose_path]):
-                continue
-            
-            audio_len = len(np.load(audio_path))
-            lip_len = len(np.load(lip_path))
-            pose_len = len(np.load(pose_path))
-            
+        # 缓存 key：数据集路径 + 采样参数，train/test 共享同一份 samples 列表
+        cache_key = (os.path.abspath(hdtf), max_samples_per_video)
+
+        if cache_key not in _samples_cache:
+            # 首次构建：扫描所有视频，预计算 (video_idx, start_frame) 列表
+            print(f"[Audio2LipDataset] 首次扫描视频列表（缓存后续启动将秒加载）...")
+            t0 = time.time()
+            samples = []
+            # 批量读取 LMDB length（单次事务遍历所有视频）
             with self.env.begin(write=False) as txn:
-                key = format_for_lmdb(name, 'length')
-                length = int(txn.get(key).decode('utf-8'))
-            
-            l = min(audio_len, lip_len, pose_len, length)
-            max_start = l - 5  # 需要连续5帧: [r, r+5)
-            if max_start <= 0:
-                continue
-            
-            # 限制每个视频的采样数（可选，用于控制 epoch 大小）
-            # 设置为 None 则使用所有可能帧
-            if max_samples_per_video is not None and max_samples_per_video < max_start:
-                step = max(1, max_start // max_samples_per_video)
-                starts = list(range(0, max_start, step))[:max_samples_per_video]
-            else:
-                starts = list(range(max_start))
-            
-            for start in starts:
-                self.samples.append((v_idx, start))
-        
+                for v_idx, name in enumerate(self.video_list):
+                    audio_path = os.path.join(hdtf, 'mel', name + '.npy')
+                    lip_path = os.path.join(hdtf, 'lip_feature', name + '.npy')
+                    pose_path = os.path.join(hdtf, 'pose_feature', name + '.npy')
+
+                    if not all(os.path.exists(p) for p in [audio_path, lip_path, pose_path]):
+                        continue
+
+                    # mmap_mode='r' 只读 header 获取 shape[0]，不加载整个数组
+                    audio_len = _get_npy_length(audio_path)
+                    lip_len = _get_npy_length(lip_path)
+                    pose_len = _get_npy_length(pose_path)
+
+                    key = format_for_lmdb(name, 'length')
+                    length = int(txn.get(key).decode('utf-8'))
+
+                    l = min(audio_len, lip_len, pose_len, length)
+                    max_start = l - 5  # 需要连续5帧: [r, r+5)
+                    if max_start <= 0:
+                        continue
+
+                    if max_samples_per_video is not None and max_samples_per_video < max_start:
+                        step = max(1, max_start // max_samples_per_video)
+                        starts = list(range(0, max_start, step))[:max_samples_per_video]
+                    else:
+                        starts = list(range(max_start))
+
+                    for start in starts:
+                        samples.append((v_idx, start))
+
+            _samples_cache[cache_key] = samples
+            print(f"[Audio2LipDataset] 扫描完成: {len(self.video_list)} videos, "
+                  f"{len(samples)} clips, 耗时 {time.time()-t0:.1f}s")
+
+        # train/test 共享同一份 samples 列表（拷贝避免 shuffle 互相影响）
+        self.samples = list(_samples_cache[cache_key])
         print(f"[Audio2LipDataset] Videos: {len(self.video_list)}, Total clips: {len(self.samples)}")
         if is_train:
             random.shuffle(self.samples)
+
+        # 可选: 将所有特征预加载到内存 (适用于小数据集微调, 消除训练中所有特征 IO)
+        if preload_features:
+            self._preload_all_features()
+
+    def _load_feature(self, feature_name, video_name):
+        """从特征 LMDB / 内存缓存 / .npy 文件加载特征数组 (三级回退)
+
+        优先级:
+          1. 内存缓存 (preload_features=True 时)
+          2. 特征 LMDB (lmdb_features 目录存在时)
+          3. .npy 文件 (回退, 保持兼容)
+
+        Args:
+            feature_name: 'mel' / 'lip_feature' / 'pose_feature' / 'bbox'
+            video_name: 视频名 (不含扩展名)
+
+        Returns:
+            numpy 数组 (整个视频的特征序列)
+        """
+        cache_key = f"{feature_name}-{video_name}"
+
+        # 1. 内存缓存
+        if self._feature_cache is not None:
+            arr = self._feature_cache.get(cache_key)
+            if arr is not None:
+                return arr
+
+        # 2. 特征 LMDB
+        if self.feat_env is not None:
+            with self.feat_env.begin(write=False) as txn:
+                data = txn.get(cache_key.encode('utf-8'))
+            if data is not None:
+                return np.load(BytesIO(data))
+
+        # 3. 回退到 .npy 文件
+        npy_path = os.path.join(self.hdtf_path, feature_name, video_name + '.npy')
+        return np.load(npy_path)
+
+    def _preload_all_features(self):
+        """将所有视频的 mel/lip_feature/pose_feature/bbox 预加载到内存
+
+        适用于小数据集微调 (如单人视频): 一次性加载后 __getitem__ 零 IO。
+        大数据集不建议使用 (内存消耗大)。
+
+        数据来源优先级: 特征 LMDB > .npy 文件
+        """
+        feature_names = ['mel', 'lip_feature', 'pose_feature', 'bbox']
+        self._feature_cache = {}
+        total_bytes = 0
+
+        if self.feat_env is not None:
+            # 从特征 LMDB 批量加载
+            with self.feat_env.begin(write=False) as txn:
+                cursor = txn.cursor()
+                for key, value in cursor:
+                    key_str = key.decode('utf-8')
+                    if key_str.startswith('__'):
+                        continue  # 跳过元数据键
+                    arr = np.load(BytesIO(value))
+                    self._feature_cache[key_str] = arr
+                    total_bytes += arr.nbytes
+        else:
+            # 从 .npy 文件批量加载
+            for name in self.video_list:
+                for feat in feature_names:
+                    npy_path = os.path.join(self.hdtf_path, feat, name + '.npy')
+                    if os.path.exists(npy_path):
+                        arr = np.load(npy_path)
+                        cache_key = f"{feat}-{name}"
+                        self._feature_cache[cache_key] = arr
+                        total_bytes += arr.nbytes
+
+        total_mb = total_bytes / 1024 / 1024
+        print(f"[Audio2LipDataset] 预加载 {len(self._feature_cache)} 个特征到内存, "
+              f"总计 {total_mb:.1f} MB")
+
+    # -- DataLoader 多进程兼容 --
+    # Windows spawn 模式下 worker 进程需要 pickle dataset,
+    # 但 lmdb.Environment 不可 pickle。这里在序列化时移除 env 引用,
+    # 在 worker 进程反序列化时通过模块级缓存重新打开。
+
+    def __getstate__(self):
+        """pickle 时移除不可序列化的 LMDB env 对象"""
+        state = self.__dict__.copy()
+        state['env'] = None
+        state['feat_env'] = None
+        return state
+
+    def __setstate__(self, state):
+        """反序列化时恢复状态并重新打开 LMDB env"""
+        self.__dict__.update(state)
+        # 重新打开图像 LMDB (必需, __getitem__ 要读图像)
+        lmdb_path = os.path.join(self.hdtf_path, 'lmdb')
+        if os.path.exists(lmdb_path):
+            self.env = _get_lmdb_env(lmdb_path)
+        # 重新打开特征 LMDB (仅在未预加载到内存时需要)
+        if self._feature_cache is None:
+            feat_lmdb_path = os.path.join(self.hdtf_path, 'lmdb_features')
+            if os.path.exists(feat_lmdb_path):
+                self.feat_env = _get_feat_lmdb_env(feat_lmdb_path)
 
     def __len__(self):
         # 关键修改：返回总片段数，而非视频数
@@ -143,17 +293,11 @@ class Audio2LipDataset_image_sync(Dataset):
         name_a = self.video_list[v_idx]
         
 
-        audio_path = os.path.join(self.hdtf_path, 'mel', name_a + '.npy')
-        audio_features = np.load(audio_path)
-
-        lip_path = os.path.join(self.hdtf_path, 'lip_feature', name_a + '.npy')
-        lip_features = np.load(lip_path)
-
-        pose_path = os.path.join(self.hdtf_path, 'pose_feature', name_a + '.npy')
-        pose_features = np.load(pose_path)
-
-        bbox_path = os.path.join(self.hdtf_path, 'bbox', name_a + '.npy')
-        bbox_features = np.load(bbox_path)
+        # 从特征 LMDB / 内存缓存 / .npy 加载 (三级回退, 消除重复磁盘 IO)
+        audio_features = self._load_feature('mel', name_a)
+        lip_features = self._load_feature('lip_feature', name_a)
+        pose_features = self._load_feature('pose_feature', name_a)
+        bbox_features = self._load_feature('bbox', name_a)
 
         with self.env.begin(write=False) as txn:
             key = format_for_lmdb(name_a, 'length')

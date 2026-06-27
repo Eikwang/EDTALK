@@ -299,18 +299,43 @@ class SyncNetDataset(Dataset):
             # 获取当前视频的有效帧范围（使用预缓存长度，不再重复加载 mel）
             mel_len = self.mel_lengths.get(video_name, frame_idx + 1)
 
-            # 负样本策略：偏移范围 [2, 6] 帧（约 0.08-0.24秒）
-            # 太小会让任务太简单（~0.08s），太大会让任务太难（>0.3s）
-            neg_offset = random.randint(2, 6)  # [2, 6]
+            # 负样本策略：偏移范围 [5, 10] 帧（约 0.2-0.4秒）
+            # 增大偏移量使任务更有区分度
             if random.random() < 0.5:
-                neg_offset = -neg_offset
-            neg_frame_idx = frame_idx + neg_offset
+                # 50% 概率：跨视频负样本（随机选另一个视频的 mel）
+                # 这样负样本的嘴型差异更大，任务更有区分度
+                other_videos = [v for v in self.train_videos if v != video_name]
+                if other_videos:
+                    other_video = random.choice(list(other_videos))
+                    other_mel_path = os.path.join(self.data_path, 'mel', other_video + '.npy')
+                    try:
+                        other_mel_data = np.load(other_mel_path)
+                        # 随机取该视频的任意帧
+                        other_frame_idx = random.randint(
+                            self.half_T,
+                            len(other_mel_data) - self.half_T - 1
+                        )
+                        neg_mel = self._load_mel(other_video, other_frame_idx, mel_data=other_mel_data)
+                        if neg_mel is not None:
+                            neg_mel = neg_mel.view(1, 80, -1)
+                        else:
+                            neg_mel = mel  # 回退
+                    except Exception:
+                        neg_mel = mel  # 回退
+                else:
+                    neg_mel = mel  # 无其他视频时回退
+            else:
+                # 50% 概率：同视频偏移 [5, 10] 帧
+                neg_offset = random.randint(5, 10)  # [5, 10]
+                if random.random() < 0.5:
+                    neg_offset = -neg_offset
+                neg_frame_idx = frame_idx + neg_offset
 
-            # 确保在有效范围内（使用视频实际帧数）
-            neg_frame_idx = max(self.half_T, min(neg_frame_idx, mel_len - self.half_T - 1))
+                # 确保在有效范围内（使用视频实际帧数）
+                neg_frame_idx = max(self.half_T, min(neg_frame_idx, mel_len - self.half_T - 1))
 
-            # 复用已加载的 mel 数据，避免重复磁盘读取
-            neg_mel = self._load_mel(video_name, neg_frame_idx, mel_data=full_mel_data)
+                # 复用已加载的 mel 数据，避免重复磁盘读取
+                neg_mel = self._load_mel(video_name, neg_frame_idx, mel_data=full_mel_data)
             if neg_mel is None:
                 neg_mel = mel  # 回退
             else:
@@ -326,6 +351,28 @@ class SyncNetDataset(Dataset):
 
         # 无法找到有效样本，返回空样本（不应该发生）
         raise RuntimeError(f"Cannot find valid sample after {max_attempts} attempts")
+
+
+class _SyncNetDatasetView(SyncNetDataset):
+    """SyncNetDataset 的轻量级视图，共享底层加载逻辑但持有独立的 samples 列表。
+
+    用于解决 train_loader 和 val_loader 共享同一 dataset 对象时，
+    set_mode() 切换 self.samples 导致 DataLoader.__len__() 动态计算错误的问题。
+
+    PyTorch DataLoader.__len__() 的调用链:
+        len(loader) -> len(BatchSampler) -> len(Sampler) -> len(dataset) -> len(dataset.samples)
+    由于 __len__ 是动态计算的（非创建时缓存），若 train_loader 和 val_loader
+    共享同一个 dataset 对象，set_mode() 会污染所有 loader 的长度计算结果。
+    """
+
+    def __init__(self, base: 'SyncNetDataset', samples):
+        # 共享底层所有状态（lmdb_path, mel_lengths, video_list, half_T, syncnet_T 等）
+        # 避免重复加载 mel 文件信息
+        self.__dict__.update(base.__dict__)
+        # 仅替换 samples 为指定的列表（train_samples 或 val_samples）
+        self.samples = samples
+        # env 不 pickle，每个 worker 进程独立初始化 LMDB
+        self.env = None
 
 
 # ---------------------------------------------------------------------------
@@ -356,10 +403,11 @@ class SyncNetLoss(nn.Module):
         Returns:
             loss: 标量损失
         """
-        # 正样本对的 cosine similarity
+        # 正样本对的 cosine similarity，范围 [-1, 1]
         pos_sim = F.cosine_similarity(a_emb, v_emb, dim=1)  # (B,)
-        # 映射到 logits: (sim + 1) / 2 -> [0,1], 然后 logit
-        pos_logits = pos_sim * 5.0  # 缩放因子，使梯度更明显
+        # 移除缩放因子，与 Wav2Lip 原版对齐
+        # 原版直接用 cosine_sim 作为 logits，让 BCEWithLogitsLoss 处理
+        pos_logits = pos_sim
 
         # 正样本标签为 1
         pos_labels = torch.ones_like(pos_logits)
@@ -368,7 +416,7 @@ class SyncNetLoss(nn.Module):
         # 负样本对（如果提供）
         if neg_a_emb is not None and neg_v_emb is not None:
             neg_sim = F.cosine_similarity(neg_a_emb, neg_v_emb, dim=1)
-            neg_logits = neg_sim * 5.0
+            neg_logits = neg_sim
             neg_labels = torch.zeros_like(neg_logits)
             loss = loss + self.bce(neg_logits, neg_labels)
 
@@ -516,17 +564,40 @@ def main(args):
 
     # 数据集（划分训练/验证集）
     print("[INFO] Loading datasets...")
-    dataset = SyncNetDataset(
-        args.data_path,
-        syncnet_T=args.syncnet_T,
-        image_size=args.image_size,
-        val_split=args.val_split
-    )
+
+    # 处理 --no_val_split：使用全量数据集训练（不划分验证集）
+    if args.no_val_split:
+        # 临时创建 dataset 获取所有样本
+        temp_dataset = SyncNetDataset(
+            args.data_path,
+            syncnet_T=args.syncnet_T,
+            image_size=args.image_size,
+            val_split=0.0  # 不划分验证集
+        )
+        # 使用全部样本作为训练集
+        all_samples = temp_dataset.train_samples + temp_dataset.val_samples
+        base_dataset = temp_dataset
+        train_dataset = _SyncNetDatasetView(base_dataset, all_samples)
+        val_dataset = None
+        print(f"[INFO] Using FULL dataset (no val split): {len(all_samples)} samples")
+    else:
+        # 标准模式：按 val_split 划分训练/验证集
+        base_dataset = SyncNetDataset(
+            args.data_path,
+            syncnet_T=args.syncnet_T,
+            image_size=args.image_size,
+            val_split=args.val_split
+        )
+        # 创建独立的训练/验证视图，避免共享同一 dataset 对象导致 set_mode 状态污染。
+        # PyTorch DataLoader.__len__() 是动态计算的（非创建时缓存），若共享同一个
+        # dataset 对象，后调用的 set_mode 会污染所有 loader 的长度和采样索引。
+        # _SyncNetDatasetView 共享底层 LMDB/mel 缓存，但持有独立的 samples 列表。
+        train_dataset = _SyncNetDatasetView(base_dataset, base_dataset.train_samples)
+        val_dataset = _SyncNetDatasetView(base_dataset, base_dataset.val_samples)
 
     # 训练集
-    dataset.set_mode(is_train=True)
     train_loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -535,19 +606,22 @@ def main(args):
         drop_last=False
     )
 
-    # 验证集
-    dataset.set_mode(is_train=False)
-    val_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
-        drop_last=False
-    )
+    # 验证集（仅在非 no_val_split 模式时创建）
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            drop_last=False
+        )
+    else:
+        val_loader = None
 
-    print(f"[INFO] Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    print(f"[INFO] Train batches: {len(train_loader)}" +
+          (f", Val batches: {len(val_loader)}" if val_loader else ", Val: DISABLED"))
 
     # 模型
     print("[INFO] Initializing SyncNet...")
@@ -565,14 +639,12 @@ def main(args):
         start_epoch = load_checkpoint(args.resume, model, optimizer, str(device))
         start_epoch += 1
 
-    # 学习率调度：连续 lr_patience 个 epoch 训练损失未创新低则降低 10%
-    lr_patience = 5
-    lr_decay_factor = 0.9
-    min_lr = 1e-6  # 最小学习率保护
+    # 学习率调度：在 no_val_split 模式下不使用（基于训练损失无意义）
+    # 保留配置但不使用：lr_patience = 3, lr_decay_factor = 0.9, min_lr = 1e-6
     epochs_since_improvement = 0
 
-    # Early Stopping
-    es_patience = 10
+    # Early Stopping: 使用较小的 patience 以避免过度训练
+    es_patience = 5
     es_counter = 0
 
     # 训练循环
@@ -589,58 +661,77 @@ def main(args):
             model, train_loader, optimizer, criterion, device, epoch
         )
 
-        # 验证并获取验证集指标
-        val_loss, val_pos_sim, val_neg_sim = eval_epoch(
-            model, val_loader, criterion, device, epoch
-        )
+        # 验证并获取验证集指标（仅在非 no_val_split 模式时）
+        if val_loader is not None:
+            val_loss, val_pos_sim, val_neg_sim = eval_epoch(
+                model, val_loader, criterion, device, epoch
+            )
+            # 打印 epoch 结束后的完整指标
+            print(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+                  f"Val Pos Sim: {val_pos_sim:.4f} | Val Neg Sim: {val_neg_sim:.4f}")
 
-        # 打印 epoch 结束后的完整指标
-        print(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
-              f"Val Pos Sim: {val_pos_sim:.4f} | Val Neg Sim: {val_neg_sim:.4f}")
+            # TensorBoard 记录
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('Sim/pos_train', train_pos_sim, epoch)
+            writer.add_scalar('Sim/neg_train', train_neg_sim, epoch)
+            writer.add_scalar('Sim/pos_val', val_pos_sim, epoch)
+            writer.add_scalar('Sim/neg_val', val_neg_sim, epoch)
+            writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
-        # TensorBoard 记录
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('Sim/pos_train', train_pos_sim, epoch)
-        writer.add_scalar('Sim/neg_train', train_neg_sim, epoch)
-        writer.add_scalar('Sim/pos_val', val_pos_sim, epoch)
-        writer.add_scalar('Sim/neg_val', val_neg_sim, epoch)
-        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+            # 保存 checkpoint（每5个epoch保存一次）
+            if epoch % 5 == 0 or epoch == args.epochs - 1:
+                checkpoint_path = os.path.join(args.checkpoint_dir, f'syncnet_epoch_{epoch:04d}.pt')
+                save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_path)
 
-        # 保存 checkpoint（每5个epoch保存一次）
-        if epoch % 5 == 0 or epoch == args.epochs - 1:
-            checkpoint_path = os.path.join(args.checkpoint_dir, f'syncnet_epoch_{epoch:04d}.pt')
-            save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_path)
-
-        # 保存最佳模型 & 学习率调度 & Early Stopping（基于验证损失）
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_path = os.path.join(args.checkpoint_dir, 'syncnet_best.pt')
-            save_checkpoint(model, optimizer, epoch, val_loss, best_path)
-            print(f"[INFO] New best model saved! Val Loss: {val_loss:.6f}")
-            epochs_since_improvement = 0
-            es_counter = 0
+            # 保存最佳模型 & 学习率调度 & Early Stopping（基于验证损失）
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_path = os.path.join(args.checkpoint_dir, 'syncnet_best.pt')
+                save_checkpoint(model, optimizer, epoch, val_loss, best_path)
+                print(f"[INFO] New best model saved! Val Loss: {val_loss:.6f}")
+                epochs_since_improvement = 0
+                es_counter = 0
+            else:
+                epochs_since_improvement += 1
+                es_counter += 1
         else:
-            epochs_since_improvement += 1
-            es_counter += 1
+            # no_val_split 模式：基于训练损失保存 checkpoint
+            print(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | "
+                  f"Train Pos Sim: {train_pos_sim:.4f} | Train Neg Sim: {train_neg_sim:.4f}")
 
-            # 学习率衰减：连续 lr_patience 个 epoch 未改善则降低 10%
-            if epochs_since_improvement >= lr_patience:
-                old_lr = optimizer.param_groups[0]['lr']
-                if old_lr > min_lr:
-                    new_lr = max(old_lr * lr_decay_factor, min_lr)
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = new_lr
-                    print(f"[LR] No improvement for {lr_patience} epochs, "
-                          f"lr: {old_lr:.8f} -> {new_lr:.8f}")
-                    epochs_since_improvement = 0  # 重置计数，等待下一个 lr_patience 窗口
-                else:
-                    print(f"[LR] Already at minimum lr ({min_lr:.8f}), no more decay")
+            # TensorBoard 记录（仅训练指标）
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Sim/pos_train', train_pos_sim, epoch)
+            writer.add_scalar('Sim/neg_train', train_neg_sim, epoch)
+            writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+
+            # 保存 checkpoint（每5个epoch保存一次）
+            if epoch % 5 == 0 or epoch == args.epochs - 1:
+                checkpoint_path = os.path.join(args.checkpoint_dir, f'syncnet_epoch_{epoch:04d}.pt')
+                save_checkpoint(model, optimizer, epoch, train_loss, checkpoint_path)
+
+            # 基于训练损失早停（连续多个 epoch 训练损失未下降）
+            if train_loss < best_val_loss:
+                best_val_loss = train_loss
+                best_path = os.path.join(args.checkpoint_dir, 'syncnet_best.pt')
+                save_checkpoint(model, optimizer, epoch, train_loss, best_path)
+                print(f"[INFO] New best model saved! Train Loss: {train_loss:.6f}")
+                es_counter = 0
+            else:
+                es_counter += 1
+
+            # 学习率衰减：在 no_val_split 模式下禁用（基于训练损失的 LR 调度无意义）
+            # 若未来需要，可在 val 模式下恢复此逻辑
 
             # Early Stopping
             if es_counter >= es_patience:
-                print(f"[Early Stop] No improvement for {es_patience} epochs. "
-                      f"Best Val Loss: {best_val_loss:.6f}")
+                if val_loader is not None:
+                    print(f"[Early Stop] No improvement for {es_patience} epochs. "
+                          f"Best Val Loss: {best_val_loss:.6f}")
+                else:
+                    print(f"[Early Stop] No improvement for {es_patience} epochs. "
+                          f"Best Train Loss: {best_val_loss:.6f}")
                 break
 
         # 定期清理缓存
@@ -680,6 +771,8 @@ if __name__ == '__main__':
                         help='恢复训练的 checkpoint 路径')
     parser.add_argument('--val_split', type=float, default=0.05,
                         help='验证集比例（按视频划分），默认 5%%')
+    parser.add_argument('--no_val_split', action='store_true',
+                        help='禁用验证集划分，使用全量数据集进行训练（适用于特定人物微调场景）')
 
     args = parser.parse_args()
     main(args)
