@@ -79,9 +79,6 @@ class Trainer(nn.Module):
         # self.gen = DDP(self.gen, device_ids=[rank], find_unused_parameters=True)
         # self.dis = DDP(self.dis, device_ids=[rank], find_unused_parameters=True)
 
-        g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
-        # d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
-
         if args.distributed:
             self.audio2lip = self.audio2lip.module
             if self.train_generator:
@@ -89,31 +86,35 @@ class Trainer(nn.Module):
                 # self.dis = self.dis.module
 
         # 参数分组学习率：audio2lip 使用更低 lr，避免破坏预训练权重
-        # audio_encoder 已冻结，这里只包含 audio2lip 的可训练参数
+        # audio_encoder 已冻结，这里只包含 audio2lip 的可训练参数 (mapping 层)
         audio2lip_params = list(filter(lambda p: p.requires_grad, self.audio2lip.parameters()))
-        
+
         # 为不同模块设置不同学习率倍数
-        # audio2lip: 0.1x (微调预训练权重，需要更保守)
+        # audio2lip: 0.1x (mapping 层学习率保守，避免 latent direction 漂移过大)
         # gen (generator): 1.0x (正常训练)
+        # NOTE: 原 StyleGAN2 配置 betas=(0, 0.99) 配合 path length regularization 使用。
+        # 本训练无 path length reg，audio2lip 微调是回归任务(L1/VGG/MSE)，
+        # beta1=0 无动量导致收敛慢且抖动。改为 (0.5, 0.99)，lr 不再乘 g_reg_ratio。
+        betas = (0.5, 0.99)
         param_groups = [
             {
                 'params': audio2lip_params,
-                'lr': args.lr * g_reg_ratio * 0.1,
+                'lr': args.lr * 0.1,
                 'name': 'audio2lip'
             }
         ]
-        
+
         if self.train_generator:
             gen_params = list(filter(lambda p: p.requires_grad, self.gen.parameters()))
             param_groups.append({
                 'params': gen_params,
-                'lr': args.lr * g_reg_ratio,
+                'lr': args.lr,
                 'name': 'generator'
             })
-        
+
         self.g_optim = optim.Adam(
             param_groups,
-            betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio)
+            betas=betas
         )
 
 
@@ -293,17 +294,31 @@ class Trainer(nn.Module):
         return G_losses, recon[:,-1], g_loss
 
     def get_sync_loss(self, mel, g, device):
-        def cosine_loss(a, v, y): # torch.Size([4, 512]) y torch.Size([4, 1])
-            d = F.cosine_similarity(a, v)
-            with torch.cuda.amp.autocast(enabled=False):
-                loss = self.logloss(d.unsqueeze(1), y)
-            return loss
-        g = g[:, :, :, g.size(3)//2:] # # torch.Size([4, 3, 5, 96, 96])
-        g = torch.cat([g[:, :, i] for i in range(g.size(2))], dim=1) # torch.Size([4, 15, 48, 96])
-        # B, 3 * T, H//2, W
-        a, v = self.syncnet(mel, g)
-        y = torch.ones(g.size(0), 1).float().to(device)
-        return cosine_loss(a, v, y)
+        """对比损失 (Wav2Lip 标准)。
+
+        SyncNet 输出已 L2 归一化，audio_embedding(a) 与 face_embedding(v) 的
+        cosine_similarity 实为点积，值域 [-1, 1]。
+
+        原实现用 BCELoss(cosine, target=1) 是数学错误的：
+        - BCE 要求输入 ∈ [0, 1]（概率），而余弦值可为负 → log(负数) = NaN。
+        - 退化时余弦 ≈ 0，BCE 被 clamp 到 ~100，sync 恒为 sync_weight*100。
+        改为 InfoNCE 对比损失：拉近正样本(音频↔正确帧)、推开负样本(音频↔错位帧)。
+        """
+        g = g[:, :, :, g.size(3)//2:]  # torch.Size([B, 3, T, 96, 48]) 取下半脸(嘴部)
+        g = torch.cat([g[:, :, i] for i in range(g.size(2))], dim=1)  # torch.Size([B, 3*T, 48, 96])
+        a, v = self.syncnet(mel, g)  # a, v: (B, 512), 已 L2 normalize
+
+        # 正样本：音频与对应帧的点积 (每行 i 对应 batch 内第 i 个样本)
+        pos = (a * v).sum(dim=1)  # (B,)，越大约好
+
+        # 负样本：音频与错位帧的点积 (batch 内 shuffle，避免与自身配对)
+        v_neg = torch.roll(v, shifts=1, dims=0)
+        neg = (a * v_neg).sum(dim=1)  # (B,)，越小越好
+
+        # InfoNCE：最大化 pos - neg，等价于 softplus(neg - pos).mean()
+        # 当 batch=1 时退化为 -pos 的单边损失 (无负样本可比)，仍能提供"对齐"梯度
+        sync_loss = F.softplus(neg - pos).mean()
+        return sync_loss
 
 
     def dis_update(self, img_real, img_recon):
@@ -367,7 +382,10 @@ class Trainer(nn.Module):
 
                 G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
                 pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-                value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, self.device).mean() # torch.Size([4, 3, 5, 96, 96])
+                # SyncNet mel 输入需 T 帧沿 W 维度拼接 (B,1,80,T*16)，与 gen_update 一致。
+                # 之前误用 [:,0:1] 只取第 1 帧，导致 eval 日志 sync loss 错误，误导调参。
+                mel_for_sync = audio_features.reshape(batch_size, T, 80, 16).permute(0, 2, 1, 3).reshape(batch_size, 1, 80, T*16)
+                value = self.get_sync_loss(mel_for_sync, pre_bbox, self.device).mean()
                 G_losses['sync'] = self.sync_weight * value
                 
             G_losses_values = [val.mean() for val in G_losses.values()]
@@ -490,13 +508,15 @@ class Trainer(nn.Module):
         save_dir = os.path.dirname(save_path)
         if save_dir and not os.path.exists(save_dir):
             os.makedirs(save_dir, exist_ok=True)
-        torch.save(
-            {
-                "audio2lip": self.audio2lip.state_dict(),
-                # "dis": self.dis.state_dict(),
-                # "g_optim": self.g_optim.state_dict(),
-                # "d_optim": self.d_optim.state_dict(),
-                "args": self.args
-            },
-            save_path
-        )
+        state = {
+            "audio2lip": self.audio2lip.state_dict(),
+            "args": self.args
+        }
+        # train_generator=True 时保存 gen 和 g_optim，否则 gen 未训练无需保存
+        if self.train_generator:
+            state["gen"] = self.gen.state_dict()
+            state["g_optim"] = self.g_optim.state_dict()
+        # dis_weight!=0 时保存 dis (d_optim 链路当前未启用，暂不保存)
+        if self.dis_weight != 0:
+            state["dis"] = self.dis.state_dict()
+        torch.save(state, save_path)

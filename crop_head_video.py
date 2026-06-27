@@ -698,11 +698,11 @@ if __name__ == '__main__':
         description='Face detection + crop to sequence frames (with optional GFPGAN enhancement)'
     )
     parser.add_argument('input', type=str,
-                        help='Input video file OR directory containing image sequence')
+                        help='Input dataset directory (must contain original_videos/ subdirectory)')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='Output directory (default: avantar/<video_name>/)')
+                        help='Output directory (default: <dataset_dir>/count/)')
     parser.add_argument('--output_size', type=int, default=256,
-                        help='Output image size N×N (default: 256)')
+                        help='Output image size N*N (default: 256)')
     parser.add_argument('--output_format', type=str, default='png',
                         choices=['png', 'jpg'],
                         help='Output image format (default: png)')
@@ -716,7 +716,7 @@ if __name__ == '__main__':
     parser.add_argument('--s3fd_conf_th', type=float, default=0.5,
                         help='S3FD confidence threshold (default: 0.5)')
     parser.add_argument('--max_detect_size', type=int, default=640,
-                        help='Max image short side for detection (4K→1280 = 10x faster, default: 1280)')
+                        help='Max image short side for detection (4K->1280 = 10x faster, default: 1280)')
     parser.add_argument('--detect_interval', type=int, default=1,
                         help='Detect every N frames (1=all frames, 5=every 5th frame, default: 1)')
 
@@ -743,42 +743,76 @@ if __name__ == '__main__':
 
     opt = parser.parse_args()
 
-    # 默认输出目录: avantar/<视频名称>/  (位于项目根目录)
+    # 验证输入目录存在
+    dataset_dir = os.path.abspath(opt.input)
+    if not os.path.isdir(dataset_dir):
+        print(f'[ERROR] Input directory does not exist: {dataset_dir}')
+        sys.exit(1)
+
+    # 在数据集目录下寻找 original_videos 子目录
+    original_videos_dir = os.path.join(dataset_dir, 'original_videos')
+    if not os.path.isdir(original_videos_dir):
+        print(f'[ERROR] original_videos/ subdirectory not found in: {dataset_dir}')
+        sys.exit(1)
+
+    # 遍历 original_videos 目录中的视频文件
+    video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+    video_files = [f for f in os.listdir(original_videos_dir)
+                   if f.lower().endswith(video_extensions)]
+    video_files.sort()
+
+    if len(video_files) == 0:
+        print(f'[ERROR] No video files found in: {original_videos_dir}')
+        sys.exit(1)
+
+    # 默认输出目录: <dataset_dir>/count/
     if opt.output_dir is None:
-        if os.path.isdir(opt.input):
-            # 输入是目录: 用目录名作为子目录
-            name = os.path.basename(os.path.normpath(opt.input))
-        else:
-            # 输入是视频文件: 用文件名(不含扩展名)作为子目录
-            name = os.path.splitext(os.path.basename(opt.input))[0]
-        opt.output_dir = os.path.join(_PROJECT_ROOT, 'avantar', name)
+        opt.output_dir = os.path.join(dataset_dir, 'count')
 
     # 确保输出目录是绝对路径
     if not os.path.isabs(opt.output_dir):
         opt.output_dir = os.path.join(_PROJECT_ROOT, opt.output_dir)
 
     # 启动消息
-    input_display = os.path.basename(opt.input.rstrip(os.sep)) if os.path.isdir(opt.input) else os.path.basename(opt.input)
-    print(f'输入: {input_display} → 输出: {os.path.basename(opt.output_dir)}'
-          f' | {opt.output_size}×{opt.output_size} {opt.output_format.upper()}'
+    print(f'Dataset: {os.path.basename(dataset_dir)} | '
+          f'Videos: {len(video_files)} | '
+          f'Output: {os.path.basename(opt.output_dir)}'
+          f' | {opt.output_size}x{opt.output_size} {opt.output_format.upper()}'
           f' | device={opt.device} | workers={opt.num_workers}'
           f' | rembg={"ON" if opt.rembg else "OFF"}'
           f' | enhance={"ON" if opt.enhance else "off"}')
 
-    process(
-        input_path=opt.input,
-        output_dir=opt.output_dir,
-        output_size=opt.output_size,
-        output_format=opt.output_format,
-        pad_ratio_range=(opt.pad_ratio_min, opt.pad_ratio_max),
-        min_face_size=opt.min_face_size,
-        enhance=opt.enhance,
-        gfpgan_model_path=opt.gfpgan_model,
-        enhance_strength=opt.enhance_strength,
-        num_workers=opt.num_workers,
-        device=opt.device,
-        s3fd_conf_th=opt.s3fd_conf_th,
-        max_detect_size=opt.max_detect_size,
-        detect_interval=opt.detect_interval,
-        enable_rembg=opt.rembg,
-    )
+    # 遍历每个视频文件进行处理
+    for video_file in video_files:
+        video_path = os.path.join(original_videos_dir, video_file)
+        video_name = os.path.splitext(video_file)[0]
+
+        # 每个视频的输出子目录: <output_dir>/<video_name>/
+        video_output_dir = os.path.join(opt.output_dir, video_name)
+
+        print(f'\n{"="*60}')
+        print(f'Processing: {video_file} -> {video_name}/')
+        print(f'{"="*60}')
+
+        process(
+            input_path=video_path,
+            output_dir=video_output_dir,
+            output_size=opt.output_size,
+            output_format=opt.output_format,
+            pad_ratio_range=(opt.pad_ratio_min, opt.pad_ratio_max),
+            min_face_size=opt.min_face_size,
+            enhance=opt.enhance,
+            gfpgan_model_path=opt.gfpgan_model,
+            enhance_strength=opt.enhance_strength,
+            num_workers=opt.num_workers,
+            device=opt.device,
+            s3fd_conf_th=opt.s3fd_conf_th,
+            max_detect_size=opt.max_detect_size,
+            detect_interval=opt.detect_interval,
+            enable_rembg=opt.rembg,
+        )
+
+    print(f'\n{"="*60}')
+    print(f'All done. {len(video_files)} videos processed.')
+    print(f'Output directory: {opt.output_dir}')
+    print(f'{"="*60}')

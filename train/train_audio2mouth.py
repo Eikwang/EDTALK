@@ -421,7 +421,7 @@ if __name__ == "__main__":
     parser.add_argument("--sync_weight", type=int, default=0, help="SyncNet loss weight (0=disabled, need syncnet_ckpt)")
     parser.add_argument("--syncnet_ckpt", type=str, default=None, help="Path to SyncNet pre-trained checkpoint (e.g. ckpts/EDTalk.pt)")
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--dis_weight", type=int, default=1, help="local rank for distributed training")
+    parser.add_argument("--dis_weight", type=int, default=0, help="GAN 判别器权重 (0=禁用)。微调推荐关闭：小数据集 GAN 易崩溃，且 d_optim 链路未启用时 dis 仅向 audio2lip 注入噪声梯度")
     parser.add_argument("--vis_num", type=int, default=10, help="local rank for distributed training")
     parser.add_argument("--save_freq", type=int, default=5000)
     parser.add_argument("--train_generator", type=bool, default=False, help="local rank for distributed training")
