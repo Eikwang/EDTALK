@@ -117,7 +117,11 @@ class Trainer(nn.Module):
         self.gen.train()
         self.gen.zero_grad()
 
-        requires_grad(self.gen, True)
+        if self.args.only_fine_tune_dec:
+            requires_grad(self.gen, False)
+            requires_grad(self.gen.dec, True)
+        else:
+            requires_grad(self.gen, True)
         requires_grad(self.dis, False)
 
         img_target_recon = self.gen(img_source, img_target)
@@ -127,17 +131,21 @@ class Trainer(nn.Module):
         l1_loss = F.l1_loss(img_target_recon, img_target)
         gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
 
-        # 身份保持损失：约束重建图的身份 latent 与 source 一致。
-        # 始终在 no_grad 下计算 (仅监控),避免 encoder 产生第二条梯度路径:
-        # 非冻结模式下 encoder 前向两次 (source + recon),backward 时两条路径
-        # 同时回传,显著增加峰值显存 (batch_size=8 时约增加 1-2 GB),
-        # 在 Windows WDDM 模式下极易触发静默崩溃。
+        # 身份保持损失: 约束重建图身份 latent 与 source 一致, 防止 decoder
+        # 牺牲身份一致性换取重建质量 (背景/衣服变化)。
+        # only_fine_tune_dec: encoder 冻结, id_loss 梯度仅回传到 decoder
+        #   (wa_source no_grad 作为目标, wa_recon 通过 img_target_recon 回传)
+        # 非 only_fine_tune_dec: encoder + decoder 都参与, 梯度全面回传
         id_weight = getattr(self.args, 'id_weight', 0.5)
         if id_weight > 0:
-            with torch.no_grad():
+            if self.args.only_fine_tune_dec:
+                with torch.no_grad():
+                    wa_source, _, _, _ = self.gen.enc(img_source, None)
+                wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
+            else:
                 wa_source, _, _, _ = self.gen.enc(img_source, None)
                 wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
-                id_loss = F.mse_loss(wa_recon, wa_source) * id_weight
+            id_loss = F.mse_loss(wa_recon, wa_source) * id_weight
         else:
             id_loss = 0.0
 
