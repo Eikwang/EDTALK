@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import threading
 import multiprocessing as mp
 from functools import partial
+import queue
 import onnxruntime as ort
 
 # 检查 onnxruntime 能否正确加载 CUDA
@@ -106,6 +107,11 @@ def detect_face(detector_info, frame, min_face_size=30, max_detect_size=640):
     return None
 
 
+def detect_faces_batch(detector_info, frames, min_face_size=30, max_detect_size=640):
+    """批量检测人脸 (逐帧调用，PriorBox 已缓存)"""
+    return [detect_face(detector_info, f, min_face_size, max_detect_size) for f in frames]
+
+
 # ============================================================
 # 简化的头部跟踪器（2025 重写版）
 # 核心原则：
@@ -135,8 +141,8 @@ class HeadTracker:
 
         self.first_detection = False
 
-    def update(self, face_cx=None, face_cy=None, face_size=0,
-               face_w=0, face_h=0, frame_w=1920, frame_h=1080,
+    def update(self, face_cx=None, face_cy=None, face_size=0.0,
+               face_w=0.0, face_h=0.0, frame_w=1920, frame_h=1080,
                face_detected=True):
         fh, fw = float(frame_h), float(frame_w)
 
@@ -169,13 +175,13 @@ class HeadTracker:
             }
 
         # 鼻尖近似位置：面部中心偏上 1/6（鼻子在面部上方 2/3 处）
-        nose_cx = face_cx
-        nose_cy = face_cy - face_h / 6.0
+        nose_cx = face_cx if face_cx is not None else 0.0
+        nose_cy = (face_cy if face_cy is not None else 0.0) - (face_h if face_h is not None else 0.0) / 6.0
 
         # 目标裁切框：鼻尖居中 + 向上偏移35像素
         target_cx = nose_cx
         target_cy = nose_cy + 60.0
-        target_size = face_size * self.pad_ratio
+        target_size = (face_size if face_size is not None else 0.0) * self.pad_ratio
 
         # 首次检测到面部：直接初始化
         if not self.first_detection:
@@ -186,15 +192,15 @@ class HeadTracker:
         else:
             # EMA 平滑：当前位置向目标位置插值
             # crop_cx = crop_cx * (1 - alpha) + target_cx * alpha
-            self.crop_cx = self.crop_cx + self.pan_alpha * (target_cx - self.crop_cx)
-            self.crop_cy = self.crop_cy + self.pan_alpha * (target_cy - self.crop_cy)
-            self.crop_size = self.crop_size + self.zoom_alpha * (target_size - self.crop_size)
+            self.crop_cx = (self.crop_cx if self.crop_cx is not None else 0.0) + self.pan_alpha * (target_cx - (self.crop_cx if self.crop_cx is not None else 0.0))
+            self.crop_cy = (self.crop_cy if self.crop_cy is not None else 0.0) + self.pan_alpha * (target_cy - (self.crop_cy if self.crop_cy is not None else 0.0))
+            self.crop_size = (self.crop_size if self.crop_size is not None else 0.0) + self.zoom_alpha * (target_size - (self.crop_size if self.crop_size is not None else 0.0))
 
         # ========== 画面边界约束 ==========
-        crop_size = self.crop_size
+        crop_size = self.crop_size if self.crop_size is not None else 0.0
         # 确保不超出画面
-        self.crop_cx = max(crop_size / 2.0, min(self.crop_cx, fw - crop_size / 2.0))
-        self.crop_cy = max(crop_size / 2.0, min(self.crop_cy, fh - crop_size / 2.0))
+        self.crop_cx = max(crop_size / 2.0, min(self.crop_cx if self.crop_cx is not None else 0.0, fw - crop_size / 2.0))
+        self.crop_cy = max(crop_size / 2.0, min(self.crop_cy if self.crop_cy is not None else 0.0, fh - crop_size / 2.0))
 
         # 确保裁切框尺寸不小于画面
         crop_size = min(crop_size, min(fh, fw))
@@ -317,7 +323,7 @@ class CropFaceEnhancer:
         mask = np.zeros((region_h, region_w), dtype=np.float32)
         center = (region_w // 2, region_h // 2)
         axes = (region_w // 2, region_h // 2)
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+        cv2.ellipse(mask, center, axes, 0, 0, 360, (1.0,), -1)
         mask = cv2.GaussianBlur(mask, (51, 51), 0)
         mask = mask[:, :, np.newaxis]
 
@@ -459,8 +465,20 @@ def _process_single_frame_global(args):
                     )
 
                     # 替换为纯白背景
-                    white_bg = Image.new("RGBA", pil_img_no_bg.size, (255, 255, 255, 255))
-                    final_img = Image.alpha_composite(white_bg, pil_img_no_bg).convert("RGB")
+                    if isinstance(pil_img_no_bg, Image.Image):
+                        img_size = pil_img_no_bg.size
+                    else:
+                        img_size = (cropped.shape[1], cropped.shape[0])
+                    white_bg = Image.new("RGBA", img_size, (255, 255, 255, 255))
+                    if isinstance(pil_img_no_bg, Image.Image) and pil_img_no_bg.mode == 'RGBA':
+                        final_img = Image.alpha_composite(white_bg, pil_img_no_bg).convert("RGB")
+                    else:
+                        if isinstance(pil_img_no_bg, Image.Image):
+                            final_img = pil_img_no_bg.convert("RGB")
+                        elif isinstance(pil_img_no_bg, np.ndarray):
+                            final_img = Image.fromarray(pil_img_no_bg).convert("RGB")
+                        else:
+                            final_img = Image.fromarray(np.array(pil_img_no_bg)).convert("RGB")
                     cropped = cv2.cvtColor(np.array(final_img), cv2.COLOR_RGB2BGR)
                 else:
                     # 如果 session 为 None，说明模型加载彻底失败了
@@ -480,6 +498,9 @@ def _process_single_frame_global(args):
         
         return frame_idx, crop_info, face_result
     except Exception as e:
+        print(f"\n[ERROR] 帧 {frame_idx} 处理失败: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, None
 
 
@@ -494,8 +515,9 @@ def process(input_path, output_dir, output_size=256, output_format='png',
     if output_ext not in ('png', 'jpg', 'jpeg'):
         output_ext = 'png'
 
-    # 扫描输出目录中已有的图像文件，获取最大序号，新帧从 max_idx+1 开始编号
+    # 扫描输出目录中已有的图像文件，获取最大序号
     start_idx = 0
+    existing_files = []
     if os.path.isdir(output_dir):
         existing_files = [f for f in os.listdir(output_dir)
                           if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))]
@@ -520,14 +542,17 @@ def process(input_path, output_dir, output_size=256, output_format='png',
     detector_info = _get_face_detector(device=device, s3fd_conf_th=s3fd_conf_th)
     det_device = detector_info[2]
 
-    # === 初始化 Rembg 抠图模型（GPU 加速）===
-    print("正在加载 Rembg 抠图模型 (首次运行可能需要下载)...")
-
-    # 设置模型保存目录为项目根目录的 ckpts/rembg
+    # 初始化 Rembg 抠图模型（仅在启用时）
     global _model_dir
     _model_dir = os.path.join(_PROJECT_ROOT, "ckpts", "rembg")
     os.makedirs(_model_dir, exist_ok=True)
     os.environ["U2NET_HOME"] = _model_dir
+    if enable_rembg:
+        print("正在加载 Rembg 抠图模型 (首次运行可能需要下载)...")
+        # 预加载一个 session 确保模型可用
+        _get_worker_session(_model_dir)
+    else:
+        print("[INFO] 抠图已禁用，使用快速裁切模式")
 
     # 初始化跟踪器
     tracker = HeadTracker(
@@ -556,14 +581,38 @@ def process(input_path, output_dir, output_size=256, output_format='png',
         'frames': [],
     }
 
-    # ========== 多进程并行处理 ==========
-    # 注意：Windows 上 ProcessPoolExecutor 有兼容性问题（需要 pickle 序列化）
-    # 使用 ThreadPoolExecutor + u2net 模型（比 u2netp 更好的发丝保留）
-    BATCH_SIZE = 32  # 减小批次以增加并行度
+    # ========== 核心优化：检测与写入解耦 ==========
+    # 关闭抠图时：裁切+resize<2ms，瓶颈100%在S3FD检测
+    # 策略：主线程只做检测+裁切，写入线程池只做I/O
     
-    # 使用 ThreadPoolExecutor（Windows 兼容性更好）
-    write_executor = ThreadPoolExecutor(max_workers=max(1, num_workers))
-    pending_futures = []
+    # 当 enable_rembg=True 时，抠图耗时(50-200ms/帧)，需要更多写入线程
+    # 当 enable_rembg=False 时，裁切极快，只需1-2个写入线程做磁盘I/O
+    effective_workers = max(1, num_workers) if enable_rembg else 2
+
+    write_executor = ThreadPoolExecutor(max_workers=effective_workers)
+    
+    # 写入队列：主线程放入裁切好的数据，写入线程消费
+    write_queue = queue.Queue(maxsize=256)
+    write_error_count = 0
+
+    def _writer_loop():
+        """写入线程：从队列取数据并写磁盘"""
+        nonlocal write_error_count
+        while True:
+            item = write_queue.get()
+            if item is None:
+                write_queue.task_done()
+                break
+            resized_img, out_path, params = item
+            try:
+                cv2.imwrite(out_path, resized_img, params)
+            except Exception as e:
+                write_error_count += 1
+            write_queue.task_done()
+
+    # 启动写入线程
+    writer_thread = threading.Thread(target=_writer_loop, name='disk_writer', daemon=True)
+    writer_thread.start()
 
     # 获取帧生成器 + 总数
     frame_gen, total_frames = iter_frames(input_path)
@@ -571,17 +620,78 @@ def process(input_path, output_dir, output_size=256, output_format='png',
     pbar = tqdm(
         total=total_frames if total_frames > 0 else None,
         desc='裁切', unit='帧',
-        mininterval=2.0,        # 最少 1 秒才刷新
-        miniters=100,            # 最少 100 帧才刷新
+        mininterval=2.0,
+        miniters=50,
         ncols=90,
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
     )
 
     frame_idx = start_idx
     face_hit = 0
-    last_face_result = None  # 用于跳帧检测时的缓存
+    last_face_result = None
+
+    import torch
 
     try:
+        # 预热 GPU：让 CUDA context 和模型权重常驻 GPU
+        warmup_frame = None
+        for frame in frame_gen:
+            if frame is not None:
+                warmup_frame = frame
+                break
+        
+        if warmup_frame is not None:
+            warmup_h, warmup_w = warmup_frame.shape[:2]
+            if 'source_resolution' not in metadata:
+                metadata['source_resolution'] = [warmup_w, warmup_h]
+            
+            # 预热检测
+            _warmup_result = detect_face(detector_info, warmup_frame,
+                                          min_face_size=min_face_size,
+                                          max_detect_size=max_detect_size)
+            
+            # 确保 CUDA stream 同步完毕
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            # 处理预热帧
+            face_result = _warmup_result
+            last_face_result = face_result
+            
+            if face_result is not None:
+                x1, y1, w, h, conf = face_result
+                face_size = max(w, h)
+                face_cx = x1 + w / 2.0
+                face_cy = y1 + h / 2.0
+                crop_info = tracker.update(
+                    face_cx=face_cx, face_cy=face_cy, face_size=face_size,
+                    face_w=w, face_h=h, frame_w=warmup_w, frame_h=warmup_h,
+                )
+                face_hit += 1
+            else:
+                crop_info = tracker.update(
+                    face_detected=False, frame_w=warmup_w, frame_h=warmup_h,
+                )
+            
+            crop_info['frame_idx'] = frame_idx
+            
+            # 裁切 + resize（极轻量，<2ms）
+            if enable_rembg:
+                # 开启抠图：提交到线程池做裁切+抠图+resize
+                task = (warmup_frame, crop_info, frame_idx, output_dir, output_size,
+                        output_ext, imwrite_params, _model_dir, face_result, enable_rembg)
+                write_executor.submit(_process_single_frame_global, task)
+            else:
+                # 关闭抠图：直接裁切+resize，丢给写入线程
+                resized, _ = crop_and_resize(warmup_frame, crop_info, output_size)
+                out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
+                write_queue.put((resized, out_path, imwrite_params))
+            
+            _append_meta(metadata, crop_info, face_result, frame_idx)
+            frame_idx += 1
+            pbar.update(1)
+
+        # 主循环
         for frame in frame_gen:
             if frame is None:
                 continue
@@ -589,8 +699,7 @@ def process(input_path, output_dir, output_size=256, output_format='png',
             if 'source_resolution' not in metadata:
                 metadata['source_resolution'] = [frame_w, frame_h]
 
-            # 跳帧检测优化：每 N 帧实际检测一次，中间帧使用上次检测结果
-            # 注意：默认 detect_interval=1，每帧都检测
+            # 跳帧检测
             if detect_interval <= 1 or frame_idx % detect_interval == 0:
                 face_result = detect_face(
                     detector_info, frame,
@@ -599,7 +708,6 @@ def process(input_path, output_dir, output_size=256, output_format='png',
                 )
                 last_face_result = face_result
             else:
-                # 跳帧时：使用上次的检测结果，让跟踪器进行平滑处理
                 face_result = last_face_result
 
             if face_result is not None:
@@ -617,53 +725,37 @@ def process(input_path, output_dir, output_size=256, output_format='png',
                     face_detected=False, frame_w=frame_w, frame_h=frame_h,
                 )
             
-            # 添加 frame_idx 到 crop_info 用于输出文件命名
             crop_info['frame_idx'] = frame_idx
             
-            # 将任务提交到线程池（裁切+抠图+缩放+写入全部并行）
-            task = (frame, crop_info, frame_idx, output_dir, output_size, output_ext, imwrite_params, _model_dir, face_result, enable_rembg)
-            fut = write_executor.submit(_process_single_frame_global, task)
-            pending_futures.append((fut, frame_idx, face_result, crop_info))
+            # 裁切 + 写入
+            if enable_rembg:
+                task = (frame, crop_info, frame_idx, output_dir, output_size,
+                        output_ext, imwrite_params, _model_dir, face_result, enable_rembg)
+                write_executor.submit(_process_single_frame_global, task)
+            else:
+                resized, _ = crop_and_resize(frame, crop_info, output_size)
+                out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
+                write_queue.put((resized, out_path, imwrite_params))
             
-            # 收集元数据（基于检测结果）
-            scale_factor = 1.0  # 不再在主进程计算，因为不再需要
-            meta = {
-                'frame_idx': frame_idx,
-                'crop_x': crop_info['crop_x'],
-                'crop_y': crop_info['crop_y'],
-                'crop_size': crop_info['crop_size'],
-                'scale_factor': scale_factor,
-                'face_detected': face_result is not None,
-                'pad_ratio': crop_info.get('pad_ratio', 0.0),
-            }
-            if face_result is not None:
-                meta['face_bbox'] = {
-                    'x': crop_info['face_cx'] - crop_info['face_w'] / 2,
-                    'y': crop_info['face_cy'] - crop_info['face_h'] / 2,
-                    'w': crop_info['face_w'],
-                    'h': crop_info['face_h'],
-                }
-            metadata['frames'].append(meta)
-            
-            # 控制未完成的批次数量（避免内存爆炸）
-            if len(pending_futures) >= BATCH_SIZE:
-                # 等待最早的一个完成
-                oldest = pending_futures.pop(0)
-                oldest[0].result()
-            
+            _append_meta(metadata, crop_info, face_result, frame_idx)
             frame_idx += 1
             pbar.update(1)
 
     finally:
-        # 等待所有写入完成
-        pbar.set_description('写入中')
-        for fut, idx, _, _ in pending_futures:
-            try:
-                fut.result()
-            except Exception as e:
-                print(f"\n[ERROR] 后台线程处理帧 {idx} 时发生致命错误: {e}")
-        write_executor.shutdown(wait=True)
+        # 通知写入线程结束
+        write_queue.put(None)
+        write_queue.join()
+        writer_thread.join()
+        
+        # 关闭写入线程池（抠图模式用）
+        if enable_rembg:
+            pbar.set_description('写入中')
+            write_executor.shutdown(wait=True)
+        
         pbar.close()
+
+    if write_error_count > 0:
+        print(f'[WARN] {write_error_count} 帧写入失败')
 
     metadata['frame_count'] = len(metadata['frames'])
 
@@ -687,6 +779,27 @@ def process(input_path, output_dir, output_size=256, output_format='png',
         print('[WARN] 没有处理任何帧，请检查输入')
 
     return metadata, meta_path
+
+
+def _append_meta(metadata, crop_info, face_result, frame_idx):
+    """追加帧元数据"""
+    meta = {
+        'frame_idx': frame_idx,
+        'crop_x': crop_info['crop_x'],
+        'crop_y': crop_info['crop_y'],
+        'crop_size': crop_info['crop_size'],
+        'scale_factor': 1.0,
+        'face_detected': face_result is not None,
+        'pad_ratio': crop_info.get('pad_ratio', 0.0),
+    }
+    if face_result is not None:
+        meta['face_bbox'] = {
+            'x': crop_info['face_cx'] - crop_info['face_w'] / 2,
+            'y': crop_info['face_cy'] - crop_info['face_h'] / 2,
+            'w': crop_info['face_w'],
+            'h': crop_info['face_h'],
+        }
+    metadata['frames'].append(meta)
 
 
 # ============================================================
@@ -715,7 +828,7 @@ if __name__ == '__main__':
                         help='Device for S3FD detection (default: cuda, auto-falls-back to cpu)')
     parser.add_argument('--s3fd_conf_th', type=float, default=0.5,
                         help='S3FD confidence threshold (default: 0.5)')
-    parser.add_argument('--max_detect_size', type=int, default=640,
+    parser.add_argument('--max_detect_size', type=int, default=480,
                         help='Max image short side for detection (4K->1280 = 10x faster, default: 1280)')
     parser.add_argument('--detect_interval', type=int, default=1,
                         help='Detect every N frames (1=all frames, 5=every 5th frame, default: 1)')

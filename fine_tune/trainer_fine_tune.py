@@ -68,6 +68,9 @@ class Trainer(nn.Module):
 
         # LR warmup + cosine 衰减调度器
         # warmup 从 0 线性升到 args.lr (前 warmup_iters 步)，之后 cosine 衰减到 0
+        # 每次启动训练 (含 resume) scheduler 基于 args.iter 重新开始:
+        # resume 训练时用户指定 --iter 为本轮步数, --lr 为本轮学习率,
+        # scheduler 从 step=0 重新 warmup+cosine, 不延续上一轮的衰减位置。
         warmup_iters = getattr(args, 'warmup_iters', 500)
         total_iters = args.iter
 
@@ -90,15 +93,22 @@ class Trainer(nn.Module):
 
         return real_loss.mean() + fake_loss.mean()
 
-    def r1_reg(self, real_img):
+    def r1_reg(self, real_img, r1_batch_size=2):
         """R1 梯度惩罚 (StyleGAN2)。对真实图像输入求判别器输出的梯度，
         惩罚梯度的平方和，防止判别器在小数据集上过拟合导致 GAN 信号失效。
-        每隔 d_reg_every 步执行一次 (lazy regularization)。
+
+        使用小 batch 子集计算二阶梯度 (create_graph=True)，
+        降低 Windows WDDM 模式下的二阶梯度内存压力和 access violation 风险。
+        r1_batch_size=2 时二阶梯度内存约为完整 batch 的 1/4。
         """
-        real_img.requires_grad = True
-        real_pred = self.dis(real_img)
+        if real_img.shape[0] > r1_batch_size:
+            real_img_sub = real_img[:r1_batch_size].detach()
+        else:
+            real_img_sub = real_img.detach()
+        real_img_sub.requires_grad = True
+        real_pred = self.dis(real_img_sub)
         grad_real = torch.autograd.grad(
-            outputs=real_pred.sum(), inputs=real_img, create_graph=True
+            outputs=real_pred.sum(), inputs=real_img_sub, create_graph=True
         )[0]
         grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
         return grad_penalty
@@ -118,17 +128,16 @@ class Trainer(nn.Module):
         gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
 
         # 身份保持损失：约束重建图的身份 latent 与 source 一致。
-        # 旧的实现用像素 L1(recon, source) 与重建损失 L1(recon, target) 数学冲突，
-        # 会让模型在两个不同目标间妥协，导致模糊。改为在 latent 空间约束身份：
-        # 只约束"五官结构/脸型"等身份信息，允许姿态/表情/口型自由变化。
-        # Encoder 冻结时(only_fine_tune_dec)，梯度仍可通过冻结的计算图回传到 Decoder，
-        # 督促 Decoder 生成身份一致的图像。
-        id_weight = getattr(self.args, 'id_weight', 0.05)
+        # 始终在 no_grad 下计算 (仅监控),避免 encoder 产生第二条梯度路径:
+        # 非冻结模式下 encoder 前向两次 (source + recon),backward 时两条路径
+        # 同时回传,显著增加峰值显存 (batch_size=8 时约增加 1-2 GB),
+        # 在 Windows WDDM 模式下极易触发静默崩溃。
+        id_weight = getattr(self.args, 'id_weight', 0.5)
         if id_weight > 0:
             with torch.no_grad():
                 wa_source, _, _, _ = self.gen.enc(img_source, None)
-            wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
-            id_loss = F.mse_loss(wa_recon, wa_source) * id_weight
+                wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
+                id_loss = F.mse_loss(wa_recon, wa_source) * id_weight
         else:
             id_loss = 0.0
 
@@ -145,19 +154,33 @@ class Trainer(nn.Module):
         requires_grad(self.gen, False)
         requires_grad(self.dis, True)
 
+        # Part 1: d_loss (无 create_graph, 纯一阶 backward)
         real_img_pred = self.dis(img_real)
         recon_img_pred = self.dis(img_recon.detach())
 
         d_loss = self.d_nonsaturating_loss(recon_img_pred, real_img_pred)
+        d_loss.backward()
 
-        # R1 正则 (lazy regularization): 每 d_reg_every 步执行一次
-        # 权重按 d_reg_every 缩放 (StyleGAN2 惯例: lazy reg 乘以 reg_every/2, 平均到每步)
+        # 释放中间张量,降低 R1 阶段的显存峰值
+        del real_img_pred, recon_img_pred
+
+        # Part 2: R1 正则 (小 batch + create_graph, 独立 backward)
+        # 分离 backward 避免一阶+二阶梯度混合 (混合 backward 是 Windows 上
+        # access violation 的主因); 小 batch 降低二阶梯度内存;
+        # try/except 保护: 若 R1 仍触发 CUDA 错误则跳过该步 R1, 不中断训练。
+        r1_penalty = None
         if do_r1:
-            r1_penalty = self.r1_reg(img_real)
-            (d_loss + r1_penalty * (self.args.d_reg_every / 2.0)).backward()
-        else:
+            try:
+                r1_batch_size = getattr(self.args, 'r1_batch_size', 2)
+                r1_penalty = self.r1_reg(img_real, r1_batch_size=r1_batch_size)
+                (r1_penalty * (self.args.d_reg_every / 2.0)).backward()
+            except RuntimeError as e:
+                print(f"[WARNING] R1 computation failed, skipping: {e}")
+                r1_penalty = None
+                torch.cuda.empty_cache()
+
+        if r1_penalty is None:
             r1_penalty = torch.tensor(0.0, device=img_real.device)
-            d_loss.backward()
 
         self.d_optim.step()
 

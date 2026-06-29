@@ -32,11 +32,8 @@ def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, 
     out = out[:, :, max(-pad_y0, 0): out.shape[2] - max(-pad_y1, 0),
           max(-pad_x0, 0): out.shape[3] - max(-pad_x1, 0), ]
 
-    out = out.reshape([-1, 1, in_h * up_y + pad_y0 + pad_y1, in_w * up_x + pad_x0 + pad_x1])
-    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w)
-    out = F.conv2d(out, w)
-    out = out.reshape(-1, minor, in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1,
-                      in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1, )
+    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w).repeat(minor, 1, 1, 1)
+    out = F.conv2d(out, w, groups=minor)
 
     return out[:, :, ::down_y, ::down_x]
 

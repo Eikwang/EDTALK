@@ -476,10 +476,19 @@ class Trainer(nn.Module):
             for key in current_state:
                 if key in g_optim_state:
                     # 额外检查形状是否匹配
-                    if g_optim_state[key].shape == current_state[key].shape:
+                    saved_val = g_optim_state[key]
+                    cur_val = current_state[key]
+                    # param_groups 和 state 是嵌套结构，不是 tensor，不能直接比 shape
+                    if isinstance(saved_val, torch.Tensor) and isinstance(cur_val, torch.Tensor):
+                        if saved_val.shape == cur_val.shape:
+                            filtered_state[key] = saved_val
+                        else:
+                            missing_keys.append(f"{key} (shape mismatch: {saved_val.shape} vs {cur_val.shape})")
+                    elif isinstance(saved_val, (dict, list)) and isinstance(cur_val, (dict, list)):
+                        # state dict 和 param_groups — 直接使用保存的值
                         filtered_state[key] = g_optim_state[key]
                     else:
-                        missing_keys.append(f"{key} (shape mismatch)")
+                        missing_keys.append(f"{key} (type mismatch: {type(saved_val).__name__} vs {type(cur_val).__name__})")
                 else:
                     missing_keys.append(key)
             

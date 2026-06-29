@@ -38,6 +38,7 @@ HDTF/
 logs/
 res/
 test_data/
+diag_out/
 
 # open-mem: Auto-generated folder context files.
 # Uncomment to exclude from version control (recommended for large projects):

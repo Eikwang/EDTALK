@@ -2,6 +2,9 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+# CUDA 内存分配策略:减少 Windows 上的内存碎片导致的 access violation
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import argparse
 import sys
 
@@ -34,8 +37,12 @@ from util.distributed_stylegan import (
     get_world_size,
 )
 
+# 不设置 set_per_process_memory_fraction 硬限制,避免 backward 峰值撞上限制导致
+# Windows WDDM 静默崩溃。改用显式 del + empty_cache 控制显存。
+
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
+
 import warnings
 warnings.filterwarnings("ignore")
 

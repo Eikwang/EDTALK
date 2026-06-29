@@ -36,11 +36,8 @@ def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, 
           max(-pad_x0, 0): out.shape[3] - max(-pad_x1, 0), ]
 
     # out = out.permute(0, 3, 1, 2)
-    out = out.reshape([-1, 1, in_h * up_y + pad_y0 + pad_y1, in_w * up_x + pad_x0 + pad_x1])
-    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w)
-    out = F.conv2d(out, w)
-    out = out.reshape(-1, minor, in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1,
-                      in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1, )
+    w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w).repeat(minor, 1, 1, 1)
+    out = F.conv2d(out, w, groups=minor)
     # out = out.permute(0, 2, 3, 1)
 
     return out[:, :, ::down_y, ::down_x]
@@ -251,29 +248,50 @@ class ModulatedConv2d(nn.Module):
             demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
             weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
 
-        weight = weight.view(batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size)
-
+        # 逐样本卷积替代 groups=batch 分组卷积。
+        # PyTorch 2.11.0 + cuDNN 91900 + Windows + RTX 40 系列的 groups=batch
+        # backward kernel 存在间歇性 access violation bug (Iter 1200+ 崩溃)。
+        # 数学等价:F.conv2d(input, weight, groups=N) 等价于对每个样本独立卷积。
+        # 牺牲约 5-10% 性能换取训练稳定性。
         if self.upsample:
-            input = input.view(1, batch * in_channel, height, width)
-            weight = weight.view(batch, self.out_channel, in_channel, self.kernel_size, self.kernel_size)
-            weight = weight.transpose(1, 2).reshape(batch * in_channel, self.out_channel, self.kernel_size,
-                                                    self.kernel_size)
-            out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            weight_t = weight.transpose(1, 2).reshape(
+                batch, in_channel, self.out_channel, self.kernel_size, self.kernel_size
+            )
+            outs = []
+            for b in range(batch):
+                o = F.conv_transpose2d(
+                    input[b:b+1], weight_t[b], padding=0, stride=2
+                )
+                outs.append(o)
+            out = torch.cat(outs, dim=0)
             out = self.blur(out)
         elif self.downsample:
             input = self.blur(input)
-            _, _, height, width = input.shape
-            input = input.view(1, batch * in_channel, height, width)
-            out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            w = weight.view(
+                batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
+            )
+            outs = []
+            for b in range(batch):
+                o = F.conv2d(
+                    input[b:b+1],
+                    w[b * self.out_channel:(b + 1) * self.out_channel],
+                    padding=0, stride=2
+                )
+                outs.append(o)
+            out = torch.cat(outs, dim=0)
         else:
-            input = input.view(1, batch * in_channel, height, width)
-            out = F.conv2d(input, weight, padding=self.padding, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            w = weight.view(
+                batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
+            )
+            outs = []
+            for b in range(batch):
+                o = F.conv2d(
+                    input[b:b+1],
+                    w[b * self.out_channel:(b + 1) * self.out_channel],
+                    padding=self.padding
+                )
+                outs.append(o)
+            out = torch.cat(outs, dim=0)
 
         return out
 
