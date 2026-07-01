@@ -168,14 +168,17 @@ class Generator(nn.Module):
         self.pose_fc = nn.Sequential(*pose_fc)
 
 
-    def forward(self, img_source, img_drive, h_start=None):
+    def forward(self, img_source, img_drive, h_start=None, return_masks=False):
         wa, wa_t, feats, feats_t = self.enc(img_source, img_drive, h_start) # torch.Size([1, 512]) alpha3个torch.Size([1, 20])
         shared_fc = self.fc(wa_t)
         alpha_D_lip = self.lip_fc(shared_fc)
         alpha_D_pose = self.pose_fc(shared_fc)
         alpha_D = torch.cat([alpha_D_lip, alpha_D_pose], dim=-1)
         directions_D = self.direction_lipnonlip(alpha_D) # torch.Size([1, 512])
-        latent_poseD = wa + directions_D 
+        latent_poseD = wa + directions_D
+        if return_masks:
+            img_recon, masks = self.dec(latent_poseD, None, feats, return_masks=True)
+            return img_recon, masks
         img_recon = self.dec(latent_poseD, None, feats)
         return img_recon
 

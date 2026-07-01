@@ -240,7 +240,7 @@ class Trainer(nn.Module):
         pose_features = pose_features.reshape([batch_size*T, 6])
         alpha = torch.cat([lip_features_predict, pose_features], dim=-1)
         directions = self.gen.direction_lipnonlip(alpha)
-        rep = torch.LongTensor([T]*batch_size).cuda()
+        rep = torch.tensor([T] * batch_size, dtype=torch.long, device='cuda')
         wa_identity = torch.repeat_interleave(wa_identity, rep, dim=0)
         layer_num = len(feats_identity)
         for i in range(layer_num):
@@ -251,19 +251,19 @@ class Trainer(nn.Module):
         recon = self.gen.dec(latent, None, feats_identity)# torch.Size([20, 3, 256, 256])
         if self.dis_weight !=0:
             recon_pred = self.dis(recon)
-        target_img = target_img.reshape([batch_size*T, 3, 256, 256]) 
+        target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
         G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
         if self.dis_weight !=0:
             G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
         G_losses['recon_l1_loss'] = F.l1_loss(recon, target_img)
-        
+
         if self.sync_weight != 0:
 
             preds = bbox.reshape(batch_size*T, 4)
             preds = preds.to('cuda')/256.
-            box_to_feat = torch.from_numpy(np.array([i for i in range(batch_size*T)]))
+            box_to_feat = torch.arange(batch_size * T, device=target_img.device)
             gt_bbox = crop_bbox_batch(target_img, preds, box_to_feat, 96)
             pre_bbox = crop_bbox_batch(recon, preds, box_to_feat, 96)
 
@@ -353,7 +353,7 @@ class Trainer(nn.Module):
             pose_features = pose_features.reshape([batch_size*T, 6])
             alpha = torch.cat([lip_features_predict, pose_features], dim=-1)
             directions = self.gen.direction_lipnonlip(alpha)
-            rep = torch.LongTensor([T]*batch_size).cuda()
+            rep = torch.tensor([T] * batch_size, dtype=torch.long, device='cuda')
             wa_identity = torch.repeat_interleave(wa_identity, rep, dim=0)
             layer_num = len(feats_identity)
             for i in range(layer_num):
@@ -364,19 +364,19 @@ class Trainer(nn.Module):
             recon = self.gen.dec(latent, None, feats_identity)# torch.Size([20, 3, 256, 256])
             if self.dis_weight !=0:
                 recon_pred = self.dis(recon)
-            target_img = target_img.reshape([batch_size*T, 3, 256, 256]) 
+            target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
             G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
             if self.dis_weight !=0:
                 G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
             G_losses['recon_l1_loss'] = F.l1_loss(recon, target_img)
-            
+
             if self.sync_weight != 0:
 
                 preds = bbox.reshape(batch_size*T, 4)
                 preds = preds.to('cuda')/256.
-                box_to_feat = torch.from_numpy(np.array([i for i in range(batch_size*T)]))
+                box_to_feat = torch.arange(batch_size * T, device=target_img.device)
                 gt_bbox = crop_bbox_batch(target_img, preds, box_to_feat, 96)
                 pre_bbox = crop_bbox_batch(recon, preds, box_to_feat, 96)
 
@@ -408,7 +408,7 @@ class Trainer(nn.Module):
             pose_features = pose_features.reshape([batch_size*T, 6])
             alpha = torch.cat([lip_features_predict, pose_features], dim=-1)
             directions = self.gen.direction_lipnonlip(alpha)
-            rep = torch.LongTensor([T]*batch_size).cuda()
+            rep = torch.tensor([T] * batch_size, dtype=torch.long, device='cuda')
             wa_identity = torch.repeat_interleave(wa_identity, rep, dim=0)
             layer_num = len(feats_identity)
             for i in range(layer_num):

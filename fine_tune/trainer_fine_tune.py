@@ -27,21 +27,39 @@ class Trainer(nn.Module):
         self.dis = Discriminator().to(device)
 
         # distributed computing
+        # 修复 BUG-3: 原代码 DDP 包装后立即 unwrap (self.gen = self.gen.module),
+        #   导致 forward 绕过 DDP wrapper, 多卡训练梯度不同步。
+        #   现保留 DDP wrapper (gen_ddp/dis_ddp) 用于 forward (梯度 all-reduce),
+        #   self.gen/self.dis 保留原始 module 用于 state_dict/save/load。
         if args.distributed:
-            self.gen = DDP(self.gen, device_ids=[rank], find_unused_parameters=True)
-            self.dis = DDP(self.dis, device_ids=[rank], find_unused_parameters=True)
-            self.gen = self.gen.module
-            self.dis = self.dis.module
+            self.gen_ddp = DDP(self.gen, device_ids=[rank], find_unused_parameters=True)
+            self.dis_ddp = DDP(self.dis, device_ids=[rank], find_unused_parameters=True)
 
         # NOTE: 原配置 betas=(0**reg_ratio, 0.99**reg_ratio) => beta1=0(无动量)，
         # 这是 StyleGAN2 配合 path length regularization 用的。但本训练无 path length reg，
         # 且主要损失是 VGG+L1 回归任务，无动量收敛慢且抖。改为 (0.5, 0.99)。
         # lr 不再乘 reg_ratio（无 path length reg 时不适用该缩放）。
-        betas = (0.5, 0.99)
+        betas = (args.beta1, 0.99)
 
         if args.only_fine_tune_dec:
             requires_grad(self.gen, False)
             requires_grad(self.gen.dec, True)
+            net_parameters = filter(lambda p: p.requires_grad, self.gen.parameters())
+
+            self.g_optim = optim.Adam(
+                net_parameters,
+                lr=args.lr,
+                betas=betas
+            )
+
+        elif getattr(args, 'freeze_direction', False):
+            # 冻结 Direction + fc + lip_fc + pose_fc，只训练 Encoder + Decoder
+            # 目的: 防止 QR 正交基漂移和 latent->alpha 映射漂移，
+            #       同时允许 Encoder 适配单人数据提升重建质量
+            requires_grad(self.gen, False)
+            requires_grad(self.gen.enc, True)
+            requires_grad(self.gen.dec, True)
+            # direction_lipnonlip, fc, lip_fc, pose_fc 保持冻结
             net_parameters = filter(lambda p: p.requires_grad, self.gen.parameters())
 
             self.g_optim = optim.Adam(
@@ -58,10 +76,12 @@ class Trainer(nn.Module):
                 betas=betas
             )
 
+        d_wd = getattr(args, 'd_weight_decay', 0.01)
         self.d_optim = optim.Adam(
             self.dis.parameters(),
             lr=args.lr,
-            betas=betas
+            betas=betas,
+            weight_decay=d_wd,
         )
 
         self.criterion_vgg = VGGLoss().to(device)
@@ -93,106 +113,190 @@ class Trainer(nn.Module):
 
         return real_loss.mean() + fake_loss.mean()
 
-    def r1_reg(self, real_img, r1_batch_size=2):
-        """R1 梯度惩罚 (StyleGAN2)。对真实图像输入求判别器输出的梯度，
-        惩罚梯度的平方和，防止判别器在小数据集上过拟合导致 GAN 信号失效。
+    def _mask_regularization(self, masks, mouth_region_ratio=0.4):
+        """Mask 正则化: 强制非嘴部区域 mask 向 1 饱和。
 
-        使用小 batch 子集计算二阶梯度 (create_graph=True)，
-        降低 Windows WDDM 模式下的二阶梯度内存压力和 access violation 风险。
-        r1_batch_size=2 时二阶梯度内存约为完整 batch 的 1/4。
+        masks: list of [B, 1, H, W] 各层 ToFlow 的 mask 张量
+        mouth_region_ratio: 嘴部区域占图像高度的底部比例 (0.4 = 下方 40%)
+
+        原理: mask=1 表示完全使用 source feat (背景保持)，
+              mask=0 表示完全使用 generated input (受 latent/direction 控制)。
+              背景偏移的本质是 mask 在背景区域不饱和 (< 1)。
         """
-        if real_img.shape[0] > r1_batch_size:
-            real_img_sub = real_img[:r1_batch_size].detach()
-        else:
-            real_img_sub = real_img.detach()
-        real_img_sub.requires_grad = True
-        real_pred = self.dis(real_img_sub)
-        grad_real = torch.autograd.grad(
-            outputs=real_pred.sum(), inputs=real_img_sub, create_graph=True
-        )[0]
-        grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
-        return grad_penalty
+        reg_loss = torch.tensor(0.0, device=masks[0].device)
+        for mask in masks:
+            B, C, H, W = mask.shape
+            # 创建嘴部区域 mask: 图像底部 mouth_region_ratio 部分视为嘴部
+            # 顶部 (1 - mouth_region_ratio) 部分视为背景区域
+            mouth_start = int(H * (1.0 - mouth_region_ratio))
+            # 背景区域 mask: 顶部 + 两侧
+            bg_mask = torch.ones(1, 1, H, W, device=mask.device)
+            bg_mask[:, :, mouth_start:, :] = 0.0  # 嘴部区域豁免
+            # 约束: 背景区域 mask -> 1
+            reg_loss += ((1.0 - mask) * bg_mask).abs().mean()
+        return reg_loss / len(masks)
 
-    def gen_update(self, img_source, img_target):
+    def _compute_decouple_loss(self, img_source, img_target, img_cross):
+        """单人场景解耦损失:
+        - pose direction 应对 lip 变化不变 (cosine similarity 接近 1)
+        - lip direction: 允许变化，但约束变化幅度合理 (L2)
+        """
+        # 编码 target 和 cross 的 latent
+        _, wa_t_tgt, _, _ = self.gen.enc(img_source, img_target)
+        _, wa_t_cross, _, _ = self.gen.enc(img_source, img_cross)
+
+        # target 的 lip/pose direction
+        shared_tgt = self.gen.fc(wa_t_tgt)
+        lip_tgt = self.gen.lip_fc(shared_tgt)
+        pose_tgt = self.gen.pose_fc(shared_tgt)
+        alpha_tgt = torch.cat([lip_tgt, pose_tgt], -1)
+        dir_tgt = self.gen.direction_lipnonlip.get_shared_out(alpha_tgt)
+        dir_tgt_pose = self.gen.direction_lipnonlip.get_pose_latent(dir_tgt)
+
+        # cross 的 lip/pose direction
+        shared_cross = self.gen.fc(wa_t_cross)
+        lip_cross = self.gen.lip_fc(shared_cross)
+        pose_cross = self.gen.pose_fc(shared_cross)
+        alpha_cross = torch.cat([lip_cross, pose_cross], -1)
+        dir_cross = self.gen.direction_lipnonlip.get_shared_out(alpha_cross)
+        dir_cross_pose = self.gen.direction_lipnonlip.get_pose_latent(dir_cross)
+
+        # pose direction 应对 lip 变化不变
+        pose_space = torch.exp(-F.cosine_similarity(dir_tgt_pose, dir_cross_pose)).sum()
+
+        # lip direction: 允许变化，但约束变化幅度合理 (soft 约束)
+        dir_tgt_lip = self.gen.direction_lipnonlip.get_lip_latent(dir_tgt)
+        dir_cross_lip = self.gen.direction_lipnonlip.get_lip_latent(dir_cross)
+        lip_space = (dir_tgt_lip - dir_cross_lip).pow(2).mean()
+
+        return lip_space, pose_space
+
+    def gen_update(self, img_source, img_target, img_cross=None):
         self.gen.train()
         self.gen.zero_grad()
 
         if self.args.only_fine_tune_dec:
             requires_grad(self.gen, False)
             requires_grad(self.gen.dec, True)
+        elif getattr(self.args, 'freeze_direction', False):
+            requires_grad(self.gen, False)
+            requires_grad(self.gen.enc, True)
+            requires_grad(self.gen.dec, True)
         else:
             requires_grad(self.gen, True)
         requires_grad(self.dis, False)
 
-        img_target_recon = self.gen(img_source, img_target)
-        img_recon_pred = self.dis(img_target_recon)
+        gen_fwd = self.gen_ddp if getattr(self.args, 'distributed', False) else self.gen
+        dis_fwd = self.dis_ddp if getattr(self.args, 'distributed', False) else self.dis
 
+        id_weight = getattr(self.args, 'id_weight', 0.5)
+        mask_reg_weight = getattr(self.args, 'mask_reg_weight', 0.0)
+        cross_weight = getattr(self.args, 'cross_weight', 0.0)
+        lip_space_weight = getattr(self.args, 'lip_space_weight', 0.0)
+        pose_space_weight = getattr(self.args, 'pose_space_weight', 0.0)
+
+        cross_vgg_val = torch.tensor(0.0, device=img_source.device)
+        cross_l1_val = torch.tensor(0.0, device=img_source.device)
+        lip_space_val = torch.tensor(0.0, device=img_source.device)
+        pose_space_val = torch.tensor(0.0, device=img_source.device)
+        mask_reg_val = torch.tensor(0.0, device=img_source.device)
+
+        need_masks = mask_reg_weight > 0
+        masks = None
+        if need_masks:
+            img_target_recon, masks = gen_fwd(img_source, img_target, return_masks=True)
+        else:
+            img_target_recon = gen_fwd(img_source, img_target)
+
+        has_valid_cross = (img_cross is not None and not torch.equal(img_cross, img_target))
+        img_cross_recon = None
+
+        if has_valid_cross and cross_weight > 0:
+            img_cross_recon = gen_fwd(img_source, img_cross)
+
+        if has_valid_cross and (lip_space_weight > 0 or pose_space_weight > 0):
+            with torch.no_grad():
+                _, wa_t_tgt, _, _ = self.gen.enc(img_source, img_target)
+                _, wa_t_cross, _, _ = self.gen.enc(img_source, img_cross)
+            shared_tgt = self.gen.fc(wa_t_tgt)
+            lip_tgt = self.gen.lip_fc(shared_tgt)
+            pose_tgt = self.gen.pose_fc(shared_tgt)
+            alpha_tgt = torch.cat([lip_tgt, pose_tgt], -1)
+            dir_tgt = self.gen.direction_lipnonlip.get_shared_out(alpha_tgt)
+            dir_tgt_pose = self.gen.direction_lipnonlip.get_pose_latent(dir_tgt)
+            dir_tgt_lip = self.gen.direction_lipnonlip.get_lip_latent(dir_tgt)
+
+            shared_cross = self.gen.fc(wa_t_cross)
+            lip_cross = self.gen.lip_fc(shared_cross)
+            pose_cross = self.gen.pose_fc(shared_cross)
+            alpha_cross = torch.cat([lip_cross, pose_cross], -1)
+            dir_cross = self.gen.direction_lipnonlip.get_shared_out(alpha_cross)
+            dir_cross_pose = self.gen.direction_lipnonlip.get_pose_latent(dir_cross)
+            dir_cross_lip = self.gen.direction_lipnonlip.get_lip_latent(dir_cross)
+
+            pose_space_val = torch.exp(-F.cosine_similarity(dir_tgt_pose, dir_cross_pose)).sum()
+            lip_space_val = (dir_tgt_lip - dir_cross_lip).pow(2).mean()
+
+        id_loss_val = torch.tensor(0.0, device=img_source.device)
+        if id_weight > 0:
+            with torch.no_grad():
+                wa_source, _, _, _ = self.gen.enc(img_source, None)
+            wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
+            id_loss_val = F.mse_loss(wa_recon, wa_source) * id_weight
+
+        img_recon_pred = dis_fwd(img_target_recon)
         vgg_loss = self.criterion_vgg(img_target_recon, img_target).mean()
         l1_loss = F.l1_loss(img_target_recon, img_target)
         gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
 
-        # 身份保持损失: 约束重建图身份 latent 与 source 一致, 防止 decoder
-        # 牺牲身份一致性换取重建质量 (背景/衣服变化)。
-        # only_fine_tune_dec: encoder 冻结, id_loss 梯度仅回传到 decoder
-        #   (wa_source no_grad 作为目标, wa_recon 通过 img_target_recon 回传)
-        # 非 only_fine_tune_dec: encoder + decoder 都参与, 梯度全面回传
-        id_weight = getattr(self.args, 'id_weight', 0.5)
+        total_loss = vgg_loss + l1_loss + gan_g_loss
         if id_weight > 0:
-            if self.args.only_fine_tune_dec:
-                with torch.no_grad():
-                    wa_source, _, _, _ = self.gen.enc(img_source, None)
-                wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
-            else:
-                wa_source, _, _, _ = self.gen.enc(img_source, None)
-                wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
-            id_loss = F.mse_loss(wa_recon, wa_source) * id_weight
-        else:
-            id_loss = 0.0
+            total_loss = total_loss + id_loss_val
+        if need_masks:
+            mask_reg_val = self._mask_regularization(
+                masks, mouth_region_ratio=getattr(self.args, 'mask_mouth_ratio', 0.4))
+            total_loss = total_loss + mask_reg_val * mask_reg_weight
+            del masks
 
-        g_loss = vgg_loss + l1_loss + gan_g_loss + id_loss
+        if has_valid_cross and cross_weight > 0 and img_cross_recon is not None:
+            cross_vgg_val = self.criterion_vgg(img_cross_recon, img_source).mean()
+            cross_l1_val = F.l1_loss(img_cross_recon, img_source)
+            total_loss = total_loss + (cross_vgg_val + cross_l1_val) * cross_weight
+            del img_cross_recon
 
-        g_loss.backward()
+        if has_valid_cross and (lip_space_weight > 0 or pose_space_weight > 0):
+            if lip_space_weight > 0:
+                total_loss = total_loss + lip_space_val * lip_space_weight
+            if pose_space_weight > 0:
+                total_loss = total_loss + pose_space_val * pose_space_weight
+
+        total_loss.backward()
+        del total_loss, img_recon_pred
+
         self.g_optim.step()
 
-        return vgg_loss, l1_loss, gan_g_loss, id_loss, img_target_recon
+        return vgg_loss, l1_loss, gan_g_loss, id_loss_val, img_target_recon, \
+               cross_vgg_val, cross_l1_val, lip_space_val, pose_space_val, mask_reg_val
 
-    def dis_update(self, img_real, img_recon, do_r1=False):
+    def dis_update(self, img_real, img_recon):
         self.dis.zero_grad()
 
         requires_grad(self.gen, False)
         requires_grad(self.dis, True)
 
-        # Part 1: d_loss (无 create_graph, 纯一阶 backward)
-        real_img_pred = self.dis(img_real)
-        recon_img_pred = self.dis(img_recon.detach())
+        dis_fwd = self.dis_ddp if getattr(self.args, 'distributed', False) else self.dis
+
+        real_img_pred = dis_fwd(img_real)
+        recon_img_pred = dis_fwd(img_recon.detach())
 
         d_loss = self.d_nonsaturating_loss(recon_img_pred, real_img_pred)
         d_loss.backward()
 
-        # 释放中间张量,降低 R1 阶段的显存峰值
         del real_img_pred, recon_img_pred
-
-        # Part 2: R1 正则 (小 batch + create_graph, 独立 backward)
-        # 分离 backward 避免一阶+二阶梯度混合 (混合 backward 是 Windows 上
-        # access violation 的主因); 小 batch 降低二阶梯度内存;
-        # try/except 保护: 若 R1 仍触发 CUDA 错误则跳过该步 R1, 不中断训练。
-        r1_penalty = None
-        if do_r1:
-            try:
-                r1_batch_size = getattr(self.args, 'r1_batch_size', 2)
-                r1_penalty = self.r1_reg(img_real, r1_batch_size=r1_batch_size)
-                (r1_penalty * (self.args.d_reg_every / 2.0)).backward()
-            except RuntimeError as e:
-                print(f"[WARNING] R1 computation failed, skipping: {e}")
-                r1_penalty = None
-                torch.cuda.empty_cache()
-
-        if r1_penalty is None:
-            r1_penalty = torch.tensor(0.0, device=img_real.device)
 
         self.d_optim.step()
 
-        return d_loss, r1_penalty
+        return d_loss
 
     def sample(self, img_source, img_target):
         with torch.no_grad():
@@ -213,7 +317,8 @@ class Trainer(nn.Module):
         vgg_loss = self.criterion_vgg(img_target_recon, img_target).mean()
         l1_loss = F.l1_loss(img_target_recon, img_target)
 
-        id_weight = getattr(self.args, 'id_weight', 0.05)
+        # 修复 BUG-7: id_weight 默认值与 gen_update (0.5) 对齐, 原为 0.0
+        id_weight = getattr(self.args, 'id_weight', 0.5)
         if id_weight > 0:
             wa_source, _, _, _ = self.gen.enc(img_source, None)
             wa_recon, _, _, _ = self.gen.enc(img_target_recon, None)
@@ -237,7 +342,10 @@ class Trainer(nn.Module):
             self.g_optim.load_state_dict(ckpt["g_optim"])
         except:
             pass
-        self.d_optim.load_state_dict(ckpt["d_optim"])
+        try:
+            self.d_optim.load_state_dict(ckpt["d_optim"])
+        except:
+            pass
 
         return start_iter
 

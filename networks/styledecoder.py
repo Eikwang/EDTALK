@@ -195,6 +195,27 @@ class ScaledLeakyReLU(nn.Module):
         return F.leaky_relu(input, negative_slope=self.negative_slope)
 
 
+def _use_per_sample_conv(batch):
+    """检测是否应使用逐样本卷积替代 groups=batch 分组卷积。
+
+    PyTorch 2.11.0 + cuDNN 9.1.0+ + Windows + RTX 40 系列的 groups=batch
+    backward kernel 存在间歇性 access violation bug (Iter 1200+ 崩溃)。
+
+    条件:
+    - batch <= 1: groups=batch 退化为普通卷积（无 gain），直接用 for 循环（安全保守）
+    - Windows + cuDNN 9.x: 强制保守路径
+    - 其他情况: 可尝试 groups=batch（正常路径，有性能 gain）
+    """
+    import platform
+    if batch <= 1:
+        return True  # groups=batch 无意义，保守路径
+    if platform.system() == 'Windows':
+        cudnn_ver = torch.backends.cudnn.version()
+        if cudnn_ver is not None and cudnn_ver >= 90000:
+            return True  # Windows + cuDNN 9.x 的已知 bug
+    return False  # 安全：Linux 或无版本冲突时走 groups=batch 高效路径
+
+
 class ModulatedConv2d(nn.Module):
     def __init__(self, in_channel, out_channel, kernel_size, style_dim, demodulate=True, upsample=False,
                  downsample=False, blur_kernel=[1, 3, 3, 1], ):
@@ -248,50 +269,66 @@ class ModulatedConv2d(nn.Module):
             demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
             weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
 
-        # 逐样本卷积替代 groups=batch 分组卷积。
-        # PyTorch 2.11.0 + cuDNN 91900 + Windows + RTX 40 系列的 groups=batch
-        # backward kernel 存在间歇性 access violation bug (Iter 1200+ 崩溃)。
-        # 数学等价:F.conv2d(input, weight, groups=N) 等价于对每个样本独立卷积。
-        # 牺牲约 5-10% 性能换取训练稳定性。
+        # 环境检测决定使用 groups=batch 还是逐样本卷积：
+        # - Windows + cuDNN 9.x + RTX 40 系列: 需逐样本循环规避 access violation
+        # - batch <= 1: groups=batch 无意义，直接走保守 for 循环
+        # - 其他环境: 走 groups=batch 高效路径
+        use_per_sample = _use_per_sample_conv(batch)
+
         if self.upsample:
             weight_t = weight.transpose(1, 2).reshape(
                 batch, in_channel, self.out_channel, self.kernel_size, self.kernel_size
             )
-            outs = []
-            for b in range(batch):
-                o = F.conv_transpose2d(
-                    input[b:b+1], weight_t[b], padding=0, stride=2
+            if use_per_sample:
+                outs = []
+                for b in range(batch):
+                    o = F.conv_transpose2d(
+                        input[b:b+1], weight_t[b], padding=0, stride=2
+                    )
+                    outs.append(o)
+                out = torch.cat(outs, dim=0)
+            else:
+                out = F.conv_transpose2d(
+                    input, weight_t, padding=0, stride=2, groups=batch
                 )
-                outs.append(o)
-            out = torch.cat(outs, dim=0)
             out = self.blur(out)
         elif self.downsample:
             input = self.blur(input)
             w = weight.view(
                 batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
             )
-            outs = []
-            for b in range(batch):
-                o = F.conv2d(
-                    input[b:b+1],
-                    w[b * self.out_channel:(b + 1) * self.out_channel],
-                    padding=0, stride=2
+            if use_per_sample:
+                outs = []
+                for b in range(batch):
+                    o = F.conv2d(
+                        input[b:b+1],
+                        w[b * self.out_channel:(b + 1) * self.out_channel],
+                        padding=0, stride=2
+                    )
+                    outs.append(o)
+                out = torch.cat(outs, dim=0)
+            else:
+                out = F.conv2d(
+                    input, w, padding=0, stride=2, groups=batch
                 )
-                outs.append(o)
-            out = torch.cat(outs, dim=0)
         else:
             w = weight.view(
                 batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size
             )
-            outs = []
-            for b in range(batch):
-                o = F.conv2d(
-                    input[b:b+1],
-                    w[b * self.out_channel:(b + 1) * self.out_channel],
-                    padding=self.padding
+            if use_per_sample:
+                outs = []
+                for b in range(batch):
+                    o = F.conv2d(
+                        input[b:b+1],
+                        w[b * self.out_channel:(b + 1) * self.out_channel],
+                        padding=self.padding
+                    )
+                    outs.append(o)
+                out = torch.cat(outs, dim=0)
+            else:
+                out = F.conv2d(
+                    input, w, padding=self.padding, groups=batch
                 )
-                outs.append(o)
-            out = torch.cat(outs, dim=0)
 
         return out
 
@@ -420,16 +457,28 @@ class ToFlow(nn.Module):
         self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
-    def forward(self, input, style, feat, skip=None):
+        # 坐标网格缓存：输入尺寸固定时避免每步 NumPy->GPU 同步
+        self.register_buffer('_cached_grid', None, persistent=False)
+        self._cached_size_int = 0
+
+    def _get_grid(self, H, device):
+        if self._cached_size_int == H and self._cached_grid is not None:
+            return self._cached_grid
+        ys = torch.linspace(-1, 1, H, device=device)
+        xs = torch.linspace(-1, 1, H, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        grid = torch.stack([grid_x, grid_y], dim=-1)
+        self._cached_grid = grid
+        self._cached_size_int = H
+        return grid
+
+    def forward(self, input, style, feat, skip=None, return_mask=False):
         out = self.conv(input, style)
         out = out + self.bias
 
         # warping
-        xs = np.linspace(-1, 1, input.size(2))
-        xs = np.meshgrid(xs, xs)
-        xs = np.stack(xs, 2)
-
-        xs = torch.tensor(xs, requires_grad=False).float().unsqueeze(0).repeat(input.size(0), 1, 1, 1).cuda()
+        grid = self._get_grid(input.size(2), input.device)
+        xs = grid.unsqueeze(0).repeat(input.size(0), 1, 1, 1)
 
         if skip is not None:
             skip = self.upsample(skip)
@@ -441,6 +490,8 @@ class ToFlow(nn.Module):
 
         feat_warp = F.grid_sample(feat, flow, align_corners=True) * mask
 
+        if return_mask:
+            return feat_warp, feat_warp + input * (1.0 - mask), out, mask
         return feat_warp, feat_warp + input * (1.0 - mask), out
 
 
@@ -454,6 +505,21 @@ class ToFlow2(nn.Module):
         self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
+        # 坐标网格缓存：输入尺寸固定时避免每步 NumPy->GPU 同步
+        self.register_buffer('_cached_grid', None, persistent=False)
+        self._cached_size_int = 0
+
+    def _get_grid(self, H, device):
+        if self._cached_size_int == H and self._cached_grid is not None:
+            return self._cached_grid
+        ys = torch.linspace(-1, 1, H, device=device)
+        xs = torch.linspace(-1, 1, H, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        grid = torch.stack([grid_x, grid_y], dim=-1)
+        self._cached_grid = grid
+        self._cached_size_int = H
+        return grid
+
     def forward(self, input, style=None, feat=None, skip=None):
         if style==None:
             return input
@@ -461,11 +527,8 @@ class ToFlow2(nn.Module):
         out = out + self.bias
 
         # warping
-        xs = np.linspace(-1, 1, input.size(2))
-        xs = np.meshgrid(xs, xs)
-        xs = np.stack(xs, 2)
-
-        xs = torch.tensor(xs, requires_grad=False).float().unsqueeze(0).repeat(input.size(0), 1, 1, 1).cuda()
+        grid = self._get_grid(input.size(2), input.device)
+        xs = grid.unsqueeze(0).repeat(input.size(0), 1, 1, 1)
 
         if skip is not None:
             skip = self.upsample(skip)
@@ -778,10 +841,10 @@ class Synthesis_lip_pose(nn.Module):
 
         self.n_latent = self.log_size * 2 - 2
 
-    def forward(self, wa, alpha, feats):
+    def forward(self, wa, alpha, feats, return_masks=False):
 
         # wa: bs x style_dim torch.Size([1, 512])
-        # alpha: bs x style_dim 3个1*20的列表 
+        # alpha: bs x style_dim 3个1*20的列表
 
         bs = wa.size(0)
         latent = wa
@@ -792,19 +855,31 @@ class Synthesis_lip_pose(nn.Module):
         out = self.input(latent) # torch.Size([1, 512, 4, 4])
         out = self.conv1(out, latent[:, 0])
 
+        masks = [] if return_masks else None
+
         i = 1
         for conv1, conv2, to_rgb, to_flow, feat in zip(self.convs[::2], self.convs[1::2], self.to_rgbs,
                                                        self.to_flows, feats):
             out = conv1(out, latent[:, i])
             out = conv2(out, latent[:, i + 1])
             if out.size(2) == 8:
-                out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat)
+                if return_masks:
+                    out_warp, out, skip_flow, layer_mask = to_flow(out, latent[:, i + 2], feat, return_mask=True)
+                    masks.append(layer_mask)
+                else:
+                    out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat)
                 skip = to_rgb(out_warp)
             else:
-                out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat, skip_flow)
+                if return_masks:
+                    out_warp, out, skip_flow, layer_mask = to_flow(out, latent[:, i + 2], feat, skip_flow, return_mask=True)
+                    masks.append(layer_mask)
+                else:
+                    out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat, skip_flow)
                 skip = to_rgb(out_warp, skip)
             i += 2
 
         img = skip
 
+        if return_masks:
+            return img, masks
         return img

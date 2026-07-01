@@ -39,6 +39,10 @@ logs/
 res/
 test_data/
 diag_out/
+GazeAnimation/
+eyeGazeRedirection/
+fine_tune/
+EDTalk-bak/
 
 # open-mem: Auto-generated folder context files.
 # Uncomment to exclude from version control (recommended for large projects):

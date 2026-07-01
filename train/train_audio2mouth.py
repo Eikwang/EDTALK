@@ -1,6 +1,8 @@
 # 解决 Windows OpenMP 冲突（必须在任何 import 之前设置！）
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 # CUDA 内存分配策略:减少 Windows 上的内存碎片导致的 access violation
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -135,13 +137,16 @@ def main(args):
     #     raise NotImplementedError
 
     if args.distributed == False:
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, 
-                                num_workers=4, pin_memory=True, drop_last=True,
-                                persistent_workers=True, prefetch_factor=2)
+        # num_workers=6: 充分利用 CPU 核心预加载数据，减少 GPU 等待 I/O 的空泡
+        # prefetch_factor=4: 每个 worker 预取 4 个 batch，进一步减少 GPU 等待时间
+        # persistent_workers=True: worker 进程复用，避免每 epoch 重启的开销
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                                num_workers=6, pin_memory=True, drop_last=True,
+                                persistent_workers=True, prefetch_factor=4)
         # 关键修复: test_dataloader 不使用多进程 worker
         # 原因: Windows spawn 模式下 persistent_workers=True 会导致 eval 时 worker 死锁
         # (worker 在训练阶段长时间空闲后 LMDB env 失效, 主进程永远阻塞)
-        # 验证集不大, 主进程加载完全够用, 彻底消除死锁风险
+        # 验证集不大 (已截断至训练集 1%), 主进程加载完全够用, 彻底消除死锁风险
         test_dataloader = DataLoader(dataset_test, batch_size=args.batch_size, shuffle=True,
                                      num_workers=0, pin_memory=True, drop_last=True)
     else:
@@ -403,7 +408,7 @@ if __name__ == "__main__":
     parser.add_argument("--d_reg_every", type=int, default=16)
     parser.add_argument("--g_reg_every", type=int, default=4)
     
-    parser.add_argument("--lr", type=float, default=0.0005)
+    parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--channel_multiplier", type=int, default=1)
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--display_freq", type=int, default=1)

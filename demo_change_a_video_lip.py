@@ -205,6 +205,13 @@ class Demo(nn.Module):
             # 流式写入器，逐帧写入，不占用内存
             writer = StreamingVideoWriter(self.save_path.replace('.mp4','_temp.mp4'), fps=self.fps)
 
+            # 时序一致性平滑状态 (方案D)
+            prev_frame = None
+            use_temporal_smooth = getattr(self.args, 'temporal_smooth', False)
+            smooth_weight = getattr(self.args, 'smooth_weight', 0.7)
+            # 预定义嘴部区域 mask: 图像底部 40% 作为嘴部区域
+            mouth_ratio = 0.4
+
             for i in tqdm(range(total_lip_frames)):
                 img_target_lip = self.lip_vid_target[i:i+1]
 
@@ -213,7 +220,20 @@ class Demo(nn.Module):
                 img_target_pose = self.video_reader.get_frame(vid_idx)
 
                 img_recon = self.gen.test_from_audio_pose_image(img_target_pose, img_target_lip, img_target_pose, h_start)
-                
+
+                # 时序一致性平滑 (方案D)
+                if use_temporal_smooth and prev_frame is not None:
+                    # 创建嘴部区域 mask: 顶部是背景, 底部 mouth_ratio 是嘴部
+                    H = img_recon.shape[2]
+                    mouth_start = int(H * (1.0 - mouth_ratio))
+                    mouth_mask = torch.zeros(1, 1, H, img_recon.shape[3], device=img_recon.device)
+                    mouth_mask[:, :, mouth_start:, :] = 1.0
+                    # 背景区域: 用历史帧平滑; 嘴部区域: 保留当前帧
+                    img_recon = (1.0 - mouth_mask) * (smooth_weight * prev_frame + (1.0 - smooth_weight) * img_recon) \
+                                + mouth_mask * img_recon
+
+                prev_frame = img_recon.detach().clone()
+
                 writer.write_frame(img_recon)
 
             writer.close()
@@ -281,6 +301,10 @@ if __name__ == '__main__':
     parser.add_argument("--audio2lip_model_path", type=str, default='ckpts/Audio2Lip.pt')
     parser.add_argument("--model_path", type=str, default='ckpts/EDTalk_lip_pose.pt')
     parser.add_argument('--face_sr', action='store_true', help='Face super-resolution (Optional). Please install GFPGAN first')
+    parser.add_argument('--temporal_smooth', action='store_true',
+                        help='启用时序一致性平滑 (方案D: 对背景区域做帧间平滑，缓解背景闪烁)')
+    parser.add_argument("--smooth_weight", type=float, default=0.7,
+                        help='时序平滑中历史帧权重 (默认0.7，越大背景越平滑但响应越慢)')
 
     parser.add_argument("--need_crop_source_img", action='store_true', help='crop input source_img. Please download shape_predictor_68_face_landmarks.dat and put it in ./data_preprocess first')
     parser.add_argument("--need_crop_pose_video", action='store_true', help='crop input pose_driving video.')
