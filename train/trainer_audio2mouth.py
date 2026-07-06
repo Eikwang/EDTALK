@@ -210,15 +210,30 @@ class Trainer(nn.Module):
 
         return real_loss.mean() + fake_loss.mean()
 
-    def gen_update(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox = None, accumulation_steps=1, step_optimizer=True): # torch.Size([64, 5, 80, 16])
-        
-        self.audio2lip.train()
-        self.gen.train()
-        
-        # 只在梯度累积第一步时清零梯度
-        if step_optimizer:
+    def gen_update(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox = None, accumulation_steps=1, step_optimizer=True, compute_vgg=True): # torch.Size([64, 5, 80, 16])
+
+        # 仅在模型不在 train 模式时切换，避免每个 iter 都遍历所有子模块
+        # 原因: nn.Module.train() 递归遍历 children(), 在 Windows WDDM 模式下
+        # 如果 CUDA tensor 存储因 empty_cache() 页面回收而损坏, 遍历会触发 access violation
+        if not self.audio2lip.training:
+            self.audio2lip.train()
+        if not self.gen.training:
+            self.gen.train()
+
+        # 梯度累积：在累积周期的第一步清零梯度，而非最后一步
+        # 之前错误地在 step_optimizer=True 时 zero_grad，导致前 N-1 步累积的梯度被清零
+        # 正确时序: zero_grad → backward(累积1) → backward(累积2) → ... → step
+        is_first_accum_step = (not hasattr(self, '_accum_counter')) or (self._accum_counter == 0)
+        if is_first_accum_step:
             self.gen.zero_grad()
             self.audio2lip.zero_grad()
+
+        # 更新累积计数器
+        if not hasattr(self, '_accum_counter'):
+            self._accum_counter = 0
+        self._accum_counter += 1
+        if step_optimizer:
+            self._accum_counter = 0
         
         G_losses = {}
         # requires_grad(self.audio2lip, True)
@@ -253,7 +268,10 @@ class Trainer(nn.Module):
             recon_pred = self.dis(recon)
         target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
-        G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
+        if compute_vgg:
+            G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
+        else:
+            G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
         if self.dis_weight !=0:
             G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
@@ -283,15 +301,23 @@ class Trainer(nn.Module):
         # 梯度累积时缩放损失
         if accumulation_steps > 1:
             g_loss = g_loss / accumulation_steps
-        
+
         g_loss.backward()
-        
+
         # 只在累积完成时执行优化器步进
         if step_optimizer:
             self.g_optim.step()
-        
-        recon = recon.reshape(batch_size, T, 3,256,256)
-        return G_losses, recon[:,-1], g_loss
+
+        # 提前 detach 返回值，保护其不被后续操作破坏
+        recon_out = recon.reshape(batch_size, T, 3, 256, 256)[:, -1].detach()
+        g_loss_out = g_loss.detach()
+
+        # 不在 gen_update 内调用 synchronize() + empty_cache()
+        # 原因: num_workers=0 已消除 access violation 根因(子进程竞争),
+        # 每 iteration 调用 synchronize() 会强制 CPU 等待 GPU, 严重拖慢训练速度。
+        # CUDA caching allocator 自动管理内存, 碎片回收由训练循环在低频间隔处理。
+
+        return G_losses, recon_out, g_loss_out
 
     def get_sync_loss(self, mel, g, device):
         """对比损失 (Wav2Lip 标准)。
@@ -336,9 +362,10 @@ class Trainer(nn.Module):
 
         return d_loss
 
-    def sample(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox):
+    def sample(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox, compute_vgg=True):
         with torch.no_grad():
-            self.audio2lip.eval()
+            if self.audio2lip.training:
+                self.audio2lip.eval()
             G_losses = {}
 
             batch_size, T = audio_features.shape[0], audio_features.shape[1]
@@ -366,7 +393,10 @@ class Trainer(nn.Module):
                 recon_pred = self.dis(recon)
             target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
-            G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
+            if compute_vgg:
+                G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
+            else:
+                G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
             if self.dis_weight !=0:
                 G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
@@ -397,7 +427,8 @@ class Trainer(nn.Module):
 
     def sample_no_loss(self, audio_features, lip_features, pose_features, identity_img, target_img):
         with torch.no_grad():
-            self.audio2lip.eval()
+            if self.audio2lip.training:
+                self.audio2lip.eval()
             G_losses = {}
 
             batch_size, T = audio_features.shape[0], audio_features.shape[1]

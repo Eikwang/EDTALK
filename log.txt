@@ -1,0 +1,115 @@
+(D:\AI\EDTalk\runtime) PS D:\AI\EDTalk> python train/train_audio2mouth.py --data_path HDTF --resume_ckpt ckpt_models\wy\checkpoint\036000.pt --audio2lip_ckpt ckpts\Audio2Lip.pt --batch_size 4  --epoch 10 --sync_weight 5 --syncnet_ckpt ckpt_models\syncnet\syncnet_best.pt --preload_features --vgg_sparse_freq 500
+[INFO] CUDA 预热中... GPU: NVIDIA GeForce RTX 4080 SUPER
+[INFO] CUDA 预热完成
+==> preparing dataset
+[Audio2LipDataset] 检测到特征 LMDB: HDTF\lmdb_features
+[Audio2LipDataset] 首次扫描视频列表（缓存后续启动将秒加载）...
+[Audio2LipDataset] 扫描完成: 345 videos, 41211 clips, 耗时 0.2s
+[Audio2LipDataset] Videos: 345, Total clips: 41211
+[Audio2LipDataset] 预加载 1380 个特征到内存, 总计 215.2 MB
+[Audio2LipDataset] 检测到特征 LMDB: HDTF\lmdb_features
+[Audio2LipDataset] Videos: 345, Total clips: 41211
+[Audio2LipDataset] 预加载 1380 个特征到内存, 总计 215.2 MB
+[Dataset] 测试集截断: 412 样本 (训练集 1%, 原 41211 条)
+==> initializing trainer
+[INFO] Loaded 91 audio_encoder layers from Wav2Lip
+[INFO] Loaded SyncNet from ckpt_models\syncnet\syncnet_best.pt[state_dict]
+load model: ckpt_models\wy\checkpoint\036000.pt
+[WARN] Cannot load pretrained g_optim: loaded state dict contains a parameter group that doesn't match the size of optimizer's group
+[INFO] Training will continue with fresh optimizer state (may need lower lr)
+==> resume from iteration 36000
+==> training
+[INFO] VGG 稀疏模式: 每 500 iter 计算一次 (预计节省 ~100% VGG 计算)
+[INFO] 初始内存状态: [MEM] OK | Process: 2.9GB RSS | System: 31% used, 43.9GB avail | GPU: 0.3GB alloc, 0.3GB reserved
+
+[INFO] === Epoch 1/10 开始 === iter=36000 | [MEM] OK | Process: 2.9GB RSS | System: 31% used, 43.9GB avail | GPU: 0.3GB alloc, 0.3GB reserved
+Epoch 1/10:  10%|█▉                  | 999/10302 [14:50<2:08:55,  1.20it/s, loss=1.4419, iter=37000][MEM] OK | Process: 4.2GB RSS | System: 39% used, 38.8GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 1/10:  19%|███▋               | 1999/10302 [28:42<1:54:55,  1.20it/s, loss=1.4231, iter=38000][MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.6GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 1/10:  29%|█████▌             | 2999/10302 [42:35<1:41:12,  1.20it/s, loss=1.4228, iter=39000][MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.6GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 1/10:  39%|███████▊            | 3999/10302 [56:28<1:27:11,  1.20it/s, loss=1.3716, iter=4e+4][MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.6GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 1/10 | Steps: 103 | Avg Loss: 205.7206 | L1: 0.2351 | VGG: 201.4 | Sync: 3.4812 | Best: 10000.0000
+Epoch 1/10:  49%|████████▏        | 4999/10302 [1:10:46<1:13:29,  1.20it/s, loss=1.3906, iter=41000]  [Epoch 1 Batch 5000/10302] recent_avg=1.3906 total=37.4517 recon_l2_loss:0.4467 recon_smooth:0.0155 recon_vgg_loss:145.0411 recon_l1_loss:0.1623 img_l1_sync:0.1573 sync:3.9840
+[MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.5GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 1/10:  58%|███████████        | 5999/10302 [1:24:40<59:28,  1.21it/s, loss=1.3899, iter=42000][MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.3GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 1/10:  68%|████████████▉      | 6999/10302 [1:38:46<46:50,  1.18it/s, loss=1.4473, iter=43000][MEM] OK | Process: 4.3GB RSS | System: 39% used, 38.9GB avail | GPU: 0.5GB alloc, 0.9GB reserved
+Epoch 1/10:  78%|██████████████▊    | 7999/10302 [1:52:58<32:36,  1.18it/s, loss=1.3626, iter=44000][MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.6GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 1/10:  87%|████████████████▌  | 8999/10302 [2:07:13<18:23,  1.18it/s, loss=1.3514, iter=45000][MEM] OK | Process: 4.3GB RSS | System: 38% used, 39.2GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 1/10 | Steps: 103 | Avg Loss: 205.1426 | L1: 0.2338 | VGG: 200.9 | Sync: 3.4599 | Best: 205.7206
+Epoch 1/10:  97%|██████████████████▍| 9999/10302 [2:22:01<04:22,  1.15it/s, loss=1.3820, iter=46000]  [Epoch 1 Batch 10000/10302] recent_avg=1.3820 total=36.5713 recon_l2_loss:0.5278 recon_smooth:0.0154 recon_vgg_loss:140.6633 recon_l1_loss:0.1491 img_l1_sync:0.1468 sync:4.7827
+[MEM] OK | Process: 4.3GB RSS | System: 39% used, 38.8GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 1/10: 100%|██████████████████| 10302/10302 [2:26:25<00:00,  1.17it/s, loss=1.3794, iter=46302]
+train_Epoch [0/10] done, Steps=2576, Avg l_g_total: 1.3210 img_l1_sync: 0.1537 recon_l1_loss: 0.1635 recon_l2_loss: 0.4617 recon_smooth: 0.0196 recon_vgg_loss: 1.0986 sync: 3.3869
+[Epoch 1] checkpoint saved: logs\./Audio2Lip/image_use_sync\20260702_1529\checkpoint\epoch_000\046302.pt
+[INFO] Epoch 1 结束 | [MEM] OK | Process: 4.3GB RSS | System: 33% used, 42.4GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+
+[INFO] === Epoch 2/10 开始 === iter=46302 | [MEM] OK | Process: 4.3GB RSS | System: 33% used, 42.4GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 2/10:   7%|█▎                  | 697/10302 [10:22<2:19:54,  1.14it/s, loss=1.0088, iter=46952][MEM] OK | Process: 4.4GB RSS | System: 40% used, 37.9GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 2/10:  16%|███▏               | 1697/10302 [24:39<1:59:33,  1.20it/s, loss=1.0127, iter=47952][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 2/10:  26%|████▉              | 2697/10302 [38:56<1:48:47,  1.17it/s, loss=1.0052, iter=48952][MEM] OK | Process: 4.4GB RSS | System: 38% used, 39.6GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 2/10:  36%|███████▏            | 3697/10302 [53:09<1:33:17,  1.18it/s, loss=1.0077, iter=5e+4][MEM] OK | Process: 4.4GB RSS | System: 37% used, 39.9GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 2/10 | Steps: 103 | Avg Loss: 205.6052 | L1: 0.2343 | VGG: 201.4 | Sync: 3.4632 | Best: 205.1426
+Epoch 2/10:  46%|███████▊         | 4697/10302 [1:07:45<1:18:05,  1.20it/s, loss=0.9967, iter=50952][MEM] OK | Process: 4.4GB RSS | System: 37% used, 40.4GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 2/10:  49%|████████▏        | 4999/10302 [1:12:03<1:15:24,  1.17it/s, loss=1.0131, iter=51302]  [Epoch 2 Batch 5000/10302] recent_avg=1.0131 total=0.9138 recon_l2_loss:0.2110 recon_smooth:0.0107 recon_vgg_loss:0.0000 recon_l1_loss:0.1333 img_l1_sync:0.1220 sync:3.1781
+Epoch 2/10:  55%|█████████▍       | 5697/10302 [1:21:56<1:04:55,  1.18it/s, loss=1.0035, iter=51952][MEM] OK | Process: 4.4GB RSS | System: 37% used, 40.0GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 2/10:  65%|████████████▎      | 6697/10302 [1:36:10<50:12,  1.20it/s, loss=1.0005, iter=52952][MEM] OK | Process: 4.4GB RSS | System: 37% used, 40.0GB avail | GPU: 0.5GB alloc, 0.9GB reserved
+Epoch 2/10:  75%|██████████████▏    | 7697/10302 [1:50:32<37:18,  1.16it/s, loss=1.0136, iter=53952][MEM] OK | Process: 4.4GB RSS | System: 38% used, 39.6GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 2/10:  84%|████████████████   | 8697/10302 [2:04:45<22:49,  1.17it/s, loss=1.0218, iter=54952][MEM] OK | Process: 4.4GB RSS | System: 37% used, 40.1GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+                                                                                                    [Eval] Epoch 2/10 | Steps: 103 | Avg Loss: 205.8589 | L1: 0.2347 | VGG: 201.6 | Sync: 3.4679 | Best: 205.1426
+Epoch 2/10:  94%|█████████████████▉ | 9697/10302 [2:19:24<08:33,  1.18it/s, loss=1.0146, iter=55952][MEM] OK | Process: 4.4GB RSS | System: 36% used, 40.7GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 2/10:  97%|██████████████████▍| 9999/10302 [2:23:43<04:14,  1.19it/s, loss=1.0289, iter=56302]  [Epoch 2 Batch 10000/10302] recent_avg=1.0289 total=0.9180 recon_l2_loss:0.3438 recon_smooth:0.0151 recon_vgg_loss:0.0000 recon_l1_loss:0.1452 img_l1_sync:0.1358 sync:3.0322
+Epoch 2/10: 100%|██████████████████| 10302/10302 [2:28:03<00:00,  1.16it/s, loss=0.9972, iter=56604]
+train_Epoch [1/10] done, Steps=2576, Avg l_g_total: 1.0085 img_l1_sync: 0.1535 recon_l1_loss: 0.1625 recon_l2_loss: 0.3197 recon_smooth: 0.0173 recon_vgg_loss: 0.0000 sync: 3.3808
+[Epoch 2] checkpoint saved: logs\./Audio2Lip/image_use_sync\20260702_1529\checkpoint\epoch_001\056604.pt
+[INFO] Epoch 2 结束 | [MEM] OK | Process: 4.4GB RSS | System: 30% used, 44.5GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+
+[INFO] === Epoch 3/10 开始 === iter=56604 | [MEM] OK | Process: 4.4GB RSS | System: 30% used, 44.5GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 3/10:   4%|▊                   | 395/10302 [06:01<2:16:52,  1.21it/s, loss=1.0119, iter=56954][MEM] OK | Process: 4.4GB RSS | System: 34% used, 42.4GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 3/10:  14%|██▌                | 1395/10302 [19:56<2:03:28,  1.20it/s, loss=0.9979, iter=57954][MEM] OK | Process: 4.4GB RSS | System: 39% used, 38.8GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 3/10:  23%|████▍              | 2395/10302 [34:07<1:55:44,  1.14it/s, loss=0.9911, iter=58954][MEM] OK | Process: 4.4GB RSS | System: 42% used, 36.9GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 3/10:  33%|██████▌             | 3395/10302 [48:12<1:41:29,  1.13it/s, loss=0.9940, iter=6e+4][MEM] OK | Process: 4.4GB RSS | System: 41% used, 37.6GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 3/10 | Steps: 103 | Avg Loss: 205.1813 | L1: 0.2339 | VGG: 201.0 | Sync: 3.4559 | Best: 205.1426
+Epoch 3/10:  43%|███████▎         | 4395/10302 [1:02:27<1:21:42,  1.20it/s, loss=1.0097, iter=60954][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 3/10:  49%|████████▏        | 4999/10302 [1:10:51<1:13:13,  1.21it/s, loss=1.3676, iter=61604]  [Epoch 3 Batch 5000/10302] recent_avg=1.3676 total=1.0430 recon_l2_loss:0.3325 recon_smooth:0.0249 recon_vgg_loss:0.0000 recon_l1_loss:0.1662 img_l1_sync:0.1597 sync:3.4889
+Epoch 3/10:  52%|████████▉        | 5395/10302 [1:16:18<1:07:50,  1.21it/s, loss=1.0024, iter=61954][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.3GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 3/10:  62%|███████████▊       | 6395/10302 [1:30:09<54:02,  1.21it/s, loss=1.0248, iter=62954][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.2GB avail | GPU: 0.5GB alloc, 0.9GB reserved
+Epoch 3/10:  72%|█████████████▋     | 7395/10302 [1:44:00<40:06,  1.21it/s, loss=1.0098, iter=63954][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.2GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 3/10:  81%|███████████████▍   | 8395/10302 [1:57:52<26:23,  1.20it/s, loss=0.9874, iter=64954][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 3/10 | Steps: 103 | Avg Loss: 204.5878 | L1: 0.2331 | VGG: 200.3 | Sync: 3.4755 | Best: 205.1426
+Epoch 3/10:  91%|█████████████████▎ | 9395/10302 [2:12:08<12:31,  1.21it/s, loss=1.0045, iter=65954][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 3/10:  97%|██████████████████▍| 9999/10302 [2:20:32<04:12,  1.20it/s, loss=1.3336, iter=66604]  [Epoch 3 Batch 10000/10302] recent_avg=1.3336 total=0.9369 recon_l2_loss:0.1881 recon_smooth:0.0120 recon_vgg_loss:0.0000 recon_l1_loss:0.1533 img_l1_sync:0.1513 sync:3.2430
+Epoch 3/10: 100%|██████████████████| 10302/10302 [2:24:43<00:00,  1.19it/s, loss=0.9859, iter=66906]
+train_Epoch [2/10] done, Steps=2576, Avg l_g_total: 1.2705 img_l1_sync: 0.1524 recon_l1_loss: 0.1610 recon_l2_loss: 0.2831 recon_smooth: 0.0156 recon_vgg_loss: 1.0880 sync: 3.3818
+[Epoch 3] checkpoint saved: logs\./Audio2Lip/image_use_sync\20260702_1529\checkpoint\epoch_002\066906.pt
+[INFO] Epoch 3 结束 | [MEM] OK | Process: 4.4GB RSS | System: 34% used, 41.7GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+
+[INFO] === Epoch 4/10 开始 === iter=66906 | [MEM] OK | Process: 4.4GB RSS | System: 34% used, 41.7GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:   1%|▏                    | 93/10302 [01:35<2:21:06,  1.21it/s, loss=1.0043, iter=66956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  11%|██                 | 1093/10302 [15:27<2:07:05,  1.21it/s, loss=0.9914, iter=67956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  20%|███▊               | 2093/10302 [29:19<1:53:33,  1.20it/s, loss=1.0082, iter=68956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  30%|██████              | 3093/10302 [43:11<1:39:57,  1.20it/s, loss=0.9752, iter=7e+4][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+                                                                                                    [Eval] Epoch 4/10 | Steps: 103 | Avg Loss: 205.7751 | L1: 0.2347 | VGG: 201.5 | Sync: 3.4545 | Best: 204.5878
+Epoch 4/10:  40%|███████▌           | 4093/10302 [57:25<1:25:35,  1.21it/s, loss=1.0058, iter=70956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.0GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  49%|████████▏        | 4999/10302 [1:10:00<1:13:21,  1.20it/s, loss=0.9891, iter=71906]  [Epoch 4 Batch 5000/10302] recent_avg=0.9891 total=0.8577 recon_l2_loss:0.1680 recon_smooth:0.0073 recon_vgg_loss:0.0000 recon_l1_loss:0.1470 img_l1_sync:0.1187 sync:2.9898
+Epoch 4/10:  49%|████████▍        | 5093/10302 [1:11:17<1:11:54,  1.21it/s, loss=0.9906, iter=71956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.0GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  59%|███████████▏       | 6093/10302 [1:25:10<58:13,  1.20it/s, loss=1.0020, iter=72956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 37.9GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  69%|█████████████      | 7093/10302 [1:39:01<44:19,  1.21it/s, loss=0.9864, iter=73956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.3GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  79%|██████████████▉    | 8093/10302 [1:52:53<30:40,  1.20it/s, loss=0.9956, iter=74956][MEM] OK | Process: 4.4GB RSS | System: 40% used, 38.1GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 4/10 | Steps: 103 | Avg Loss: 205.8949 | L1: 0.2351 | VGG: 201.7 | Sync: 3.4672 | Best: 204.5878
+Epoch 4/10:  88%|████████████████▊  | 9093/10302 [2:07:08<16:40,  1.21it/s, loss=0.9969, iter=75956][MEM] OK | Process: 4.4GB RSS | System: 44% used, 35.8GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10:  97%|██████████████████▍| 9999/10302 [2:19:43<04:11,  1.21it/s, loss=0.9902, iter=76906]  [Epoch 4 Batch 10000/10302] recent_avg=0.9902 total=0.8866 recon_l2_loss:0.1449 recon_smooth:0.0074 recon_vgg_loss:0.0000 recon_l1_loss:0.1319 img_l1_sync:0.1297 sync:3.1326
+Epoch 4/10:  98%|█████████████████▋| 10093/10302 [2:21:00<02:53,  1.21it/s, loss=0.9885, iter=76956][MEM] OK | Process: 4.4GB RSS | System: 44% used, 35.9GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 4/10: 100%|██████████████████| 10302/10302 [2:23:56<00:00,  1.19it/s, loss=0.9780, iter=77208]
+train_Epoch [3/10] done, Steps=2576, Avg l_g_total: 0.9910 img_l1_sync: 0.1541 recon_l1_loss: 0.1624 recon_l2_loss: 0.2607 recon_smooth: 0.0144 recon_vgg_loss: 0.0000 sync: 3.3723
+[Epoch 4] checkpoint saved: logs\./Audio2Lip/image_use_sync\20260702_1529\checkpoint\epoch_003\077208.pt
+[INFO] Epoch 4 结束 | [MEM] OK | Process: 4.4GB RSS | System: 38% used, 39.4GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+
+[INFO] === Epoch 5/10 开始 === iter=77208 | [MEM] OK | Process: 4.4GB RSS | System: 38% used, 39.4GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 5/10:   8%|█▌                  | 791/10302 [11:15<2:11:53,  1.20it/s, loss=0.9949, iter=77958][MEM] OK | Process: 4.4GB RSS | System: 44% used, 35.9GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 5/10:  17%|███▎               | 1791/10302 [25:07<1:58:01,  1.20it/s, loss=0.9716, iter=78958][MEM] OK | Process: 4.4GB RSS | System: 44% used, 35.8GB avail | GPU: 0.5GB alloc, 0.7GB reserved
+Epoch 5/10:  27%|█████▍              | 2791/10302 [38:58<1:43:44,  1.21it/s, loss=0.9895, iter=8e+4][MEM] OK | Process: 4.4GB RSS | System: 44% used, 35.8GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+                                                                                                    [Eval] Epoch 5/10 | Steps: 103 | Avg Loss: 205.5678 | L1: 0.2348 | VGG: 201.4 | Sync: 3.4619 | Best: 204.5878
+Epoch 5/10:  37%|██████▉            | 3791/10302 [53:12<1:29:52,  1.21it/s, loss=0.9873, iter=80958][MEM] OK | Process: 4.4GB RSS | System: 44% used, 35.8GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 5/10:  47%|███████▉         | 4791/10302 [1:07:05<1:16:40,  1.20it/s, loss=0.9888, iter=81958][MEM] OK | Process: 4.4GB RSS | System: 44% used, 36.0GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 5/10:  49%|████████▏        | 4999/10302 [1:10:00<1:13:25,  1.20it/s, loss=1.3459, iter=82208]  [Epoch 5 Batch 5000/10302] recent_avg=1.3459 total=0.8935 recon_l2_loss:0.2236 recon_smooth:0.0116 recon_vgg_loss:0.0000 recon_l1_loss:0.1519 img_l1_sync:0.1518 sync:3.0351
+Epoch 5/10:  56%|█████████▌       | 5791/10302 [1:20:57<1:02:29,  1.20it/s, loss=0.9843, iter=82958][MEM] OK | Process: 4.4GB RSS | System: 44% used, 36.0GB avail | GPU: 0.5GB alloc, 0.8GB reserved
+Epoch 5/10:  60%|███████████▍       | 6171/10302 [1:26:13<56:59,  1.21it/s, loss=1.3345, iter=83358]Windows fatal exception: access violation

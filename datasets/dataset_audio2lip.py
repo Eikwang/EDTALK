@@ -64,9 +64,12 @@ _lmdb_env_cache = {}
 def _get_lmdb_env(lmdb_path):
     """获取图像 LMDB env，单例模式"""
     if lmdb_path not in _lmdb_env_cache:
+        # Windows 优化：减少 max_readers，避免内存映射限制
+        # Windows 上 LMDB 内存映射有额外开销，32 个 reader 可能导致虚拟内存耗尽
+        max_readers = 16 if os.name == 'nt' else 32
         _lmdb_env_cache[lmdb_path] = lmdb.open(
             lmdb_path,
-            max_readers=32,
+            max_readers=max_readers,
             readonly=True,
             lock=False,
             readahead=False,
@@ -82,9 +85,11 @@ _feat_lmdb_env_cache = {}
 def _get_feat_lmdb_env(lmdb_path):
     """获取特征 LMDB env，单例模式 (与图像 LMDB 独立缓存)"""
     if lmdb_path not in _feat_lmdb_env_cache:
+        # Windows 优化：减少 max_readers，避免内存映射限制
+        max_readers = 16 if os.name == 'nt' else 32
         _feat_lmdb_env_cache[lmdb_path] = lmdb.open(
             lmdb_path,
-            max_readers=32,
+            max_readers=max_readers,
             readonly=True,
             lock=False,
             readahead=False,

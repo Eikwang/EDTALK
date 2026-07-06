@@ -68,6 +68,11 @@ def crop_bbox_batch_cudnn(feats, bbox, bbox_to_feats, HH, WW=None):
     N, C, H, W = feats.size()
     B = bbox.size(0)
     if WW is None: WW = HH
+
+    if N == B and bbox_to_feats.data.equal(torch.arange(N, device=bbox_to_feats.device)):
+        crops = crop_bbox(feats, bbox, HH, WW, backend='cudnn')
+        return crops
+
     dtype = feats.data.type()
 
     feats_flat, bbox_flat, all_idx = [], [], []

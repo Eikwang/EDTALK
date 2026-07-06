@@ -463,7 +463,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume_ckpt", type=str, default='ckpts/EDTalk_lip_pose.pt')
     parser.add_argument("--datapath", type=str, required=True,
                         help='Dataset directory (must contain count/ subdirectory with frame images)')
-    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--warmup_iters", type=int, default=500, help='LR warmup 步数')
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--display_freq", type=int, default=500, help='控制台输出和预览图生成间隔 (步)')

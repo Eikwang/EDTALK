@@ -11,37 +11,31 @@ class Direction(nn.Module):
         self.weight = nn.Parameter(torch.randn(512, lip_dim+pose_dim))
 
     def forward(self, input):
-        # input: (bs*t) x 512
-
         weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)
         if Q.dtype != torch.float32:
-            Q = torch.tensor(Q, dtype=torch.float32)
+            Q = Q.to(torch.float32)
         if input is None:
             return Q
         else:
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
+            input_diag = torch.diag_embed(input)
             if input_diag.dtype != torch.float32:
-                input_diag = torch.tensor(input_diag, dtype=torch.float32)
+                input_diag = input_diag.to(torch.float32)
             out = torch.matmul(input_diag, Q.T)
             out = torch.sum(out, dim=1)
-
             return out
+
     def get_shared_out(self, input):
-        # input: (bs*t) x 512
-
         weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
-
+        Q, R = torch.linalg.qr(weight)
+        if Q.dtype != torch.float32:
+            Q = Q.to(torch.float32)
         if input is None:
             return Q
         else:
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
-            out = torch.matmul(input_diag, Q.T)  # torch.Size([1, 20, 512])
+            input_diag = torch.diag_embed(input)
+            out = torch.matmul(input_diag, Q.T)
             return out
-            # out = torch.sum(out, dim=1)
-
-            # return out
     def get_lip_latent(self, out):
         lip_latent = torch.sum(out[:,:self.lip_dim], dim=1)
         return lip_latent
@@ -57,37 +51,31 @@ class Pose_Direction(nn.Module):
         self.weight = nn.Parameter(torch.randn(512, pose_dim))
 
     def forward(self, input):
-        # input: (bs*t) x 512
-
         weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)
         if Q.dtype != torch.float32:
-            Q = torch.tensor(Q, dtype=torch.float32)
+            Q = Q.to(torch.float32)
         if input is None:
             return Q
         else:
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
+            input_diag = torch.diag_embed(input)
             if input_diag.dtype != torch.float32:
-                input_diag = torch.tensor(input_diag, dtype=torch.float32)
+                input_diag = input_diag.to(torch.float32)
             out = torch.matmul(input_diag, Q.T)
             out = torch.sum(out, dim=1)
-
             return out
+
     def get_shared_out(self, input):
-        # input: (bs*t) x 512
-
         weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
-
+        Q, R = torch.linalg.qr(weight)
+        if Q.dtype != torch.float32:
+            Q = Q.to(torch.float32)
         if input is None:
             return Q
         else:
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
-            out = torch.matmul(input_diag, Q.T)  # torch.Size([1, 20, 512])
+            input_diag = torch.diag_embed(input)
+            out = torch.matmul(input_diag, Q.T)
             return out
-            # out = torch.sum(out, dim=1)
-
-            # return out
     def get_lip_latent(self, out):
         lip_latent = torch.sum(out[:,:self.lip_dim], dim=1)
         return lip_latent
@@ -103,35 +91,28 @@ class Lip_Direction(nn.Module):
         self.weight = nn.Parameter(torch.randn(512, lip_dim))
 
     def forward(self, input, pose_weight):
-        # input: (bs*t) x 512
         weight = torch.cat([self.weight, pose_weight], -1)
         weight = weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+        Q, R = torch.linalg.qr(weight)
         if Q.dtype != torch.float32:
-            Q = torch.tensor(Q, dtype=torch.float32)
+            Q = Q.to(torch.float32)
         if input is None:
             return Q
         else:
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
+            input_diag = torch.diag_embed(input)
             out = torch.matmul(input_diag, Q.T)
             out = torch.sum(out, dim=1)
-
             return out
+
     def get_shared_out(self, input):
-        # input: (bs*t) x 512
-
         weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
-
+        Q, R = torch.linalg.qr(weight)
         if input is None:
             return Q
         else:
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
-            out = torch.matmul(input_diag, Q.T)  # torch.Size([1, 20, 512])
+            input_diag = torch.diag_embed(input)
+            out = torch.matmul(input_diag, Q.T)
             return out
-            # out = torch.sum(out, dim=1)
-
-            # return out
     def get_lip_latent(self, out):
         lip_latent = torch.sum(out[:,:self.lip_dim], dim=1)
         return lip_latent
