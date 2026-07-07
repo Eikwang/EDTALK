@@ -40,7 +40,7 @@ parser.add_argument('--summary_steps', type=int, default=600,
 # dataset params
 parser.add_argument('--image_size', type=int, default=64,
                     help='size of cropped images')
-parser.add_argument('--ids', type=int, default=22,
+parser.add_argument('--ids', type=int, default=100,
                     help='number of identities for training')
 parser.add_argument('--correction_ratio', type=float, default=0.5,
                     help='ratio of training pairs forced to target gaze (0,0)')

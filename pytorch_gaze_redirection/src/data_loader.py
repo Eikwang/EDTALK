@@ -1,9 +1,56 @@
 import os
+import random
 import torch
 import numpy as np
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from PIL import Image
 import torchvision.transforms as transforms
+
+
+class BinocularPairSampler(Sampler):
+    """确保每个 batch 中同一人的左右眼成对出现。
+
+    每两个连续索引构成一个 (L, R) 对，DataLoader 按 batch_size 分组后，
+    每个 batch 自然包含 batch_size//2 个 L-R 对，使 binocular_loss 稳定生效。
+    """
+
+    def __init__(self, labels, sides, batch_size):
+        label_to_lr = {}
+        for i, (label, side) in enumerate(zip(labels, sides)):
+            if label not in label_to_lr:
+                label_to_lr[label] = {'L': [], 'R': []}
+            label_to_lr[label][side].append(i)
+
+        self.valid_labels = [
+            l for l in label_to_lr
+            if label_to_lr[l]['L'] and label_to_lr[l]['R']
+        ]
+        self.label_to_lr = label_to_lr
+        self.batch_size = batch_size
+        total_pairs = sum(
+            min(len(label_to_lr[l]['L']), len(label_to_lr[l]['R']))
+            for l in self.valid_labels
+        )
+        self._length = (total_pairs * 2 // batch_size) * batch_size
+
+    def __iter__(self):
+        label_list = list(self.valid_labels)
+        random.shuffle(label_list)
+
+        indices = []
+        li = 0
+        while len(indices) < self._length:
+            label = label_list[li % len(label_list)]
+            lr = self.label_to_lr[label]
+            l_idx = random.choice(lr['L'])
+            r_idx = random.choice(lr['R'])
+            indices.extend([l_idx, r_idx])
+            li += 1
+
+        return iter(indices[:self._length])
+
+    def __len__(self):
+        return self._length
 
 
 class GazeDataset(Dataset):
@@ -128,7 +175,7 @@ class ImageData(object):
 
             idx = int(key.split('_')[0])
             flip = 1
-            if key.split('_')[-1] == 'R': # Check if it's the right eye
+            if key.split('_')[-1] == 'L':
                 flip = -1
 
             for f_r in file_list: # For each photo of a key (e.g. 0010_0P_R)
@@ -181,5 +228,22 @@ class ImageData(object):
             self.train_angles_g[idx_corr] = [0.0, 0.0]
 
         correction_count = sum([1 for ag in self.train_angles_g if ag == [0.0, 0.0]])
+
+        if len(self.test_images) == 0 and len(self.train_images) > 0:
+            test_ratio = 0.1
+            num_test = max(1, int(len(self.train_images) * test_ratio))
+            indices = list(range(len(self.train_images)))
+            random.shuffle(indices)
+            test_indices = set(indices[:num_test])
+            for i in sorted(test_indices, reverse=True):
+                self.test_images.append(self.train_images.pop(i))
+                self.test_angles_r.append(self.train_angles_r.pop(i))
+                self.test_labels.append(self.train_labels.pop(i))
+                self.test_images_t.append(self.train_images_t.pop(i))
+                self.test_angles_g.append(self.train_angles_g.pop(i))
+                self.test_sides.append(self.train_sides.pop(i))
+            print(f'No test data (ids >= max identity). Moved {num_test} samples from train to test.')
+
+        num_train = len(self.train_images)
         print(f'\nFinished preprocessing the dataset... correction pairs: {correction_count}/{num_train}')
         print(f'train pairs: {num_train}, test pairs: {len(self.test_images)}')

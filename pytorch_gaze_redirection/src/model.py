@@ -7,7 +7,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from src.archs import Discriminator, Generator, VGG16
-from src.data_loader import ImageData, GazeDataset
+from src.data_loader import ImageData, GazeDataset, BinocularPairSampler
 
 from torchvision.utils import save_image
 
@@ -97,18 +97,25 @@ class Model(nn.Module):
             augment=False
         )
 
-        num_workers = 2
+        # num_workers=0: Windows spawn pickles the entire _cache (all images)
+        # to each worker process, causing memory pressure and worker crashes
+        # after several epochs. Since images are preloaded in-memory, single-
+        # process data loading is fast enough and eliminates this instability.
+        num_workers = 0
         pin_memory = True
+        train_sampler = BinocularPairSampler(
+            image_data_class.train_labels,
+            image_data_class.train_sides,
+            batch_size=hps.batch_size
+        )
         train_loader = DataLoader(train_dataset, batch_size=hps.batch_size,
-                                  shuffle=True, num_workers=num_workers,
-                                  drop_last=True, pin_memory=pin_memory,
-                                  persistent_workers=True, prefetch_factor=2)
+                                  sampler=train_sampler, num_workers=num_workers,
+                                  drop_last=True, pin_memory=pin_memory)
         test_loader = DataLoader(test_dataset, batch_size=hps.batch_size,
                                  shuffle=False, num_workers=num_workers,
-                                 drop_last=False, pin_memory=pin_memory,
-                                 persistent_workers=True, prefetch_factor=2)
+                                 drop_last=False, pin_memory=pin_memory)
 
-        return train_loader, test_loader, train_dataset_num
+        return train_loader, test_loader, len(train_sampler)
     
     def adv_loss(self, images_r, images_g, angles_r, angles_g):
 
@@ -148,7 +155,7 @@ class Model(nn.Module):
         reg_d_loss = F.mse_loss(angles_r, reg_real)
         reg_g_loss = F.mse_loss(angles_g, reg_fake)
 
-        return adv_d_loss, adv_g_loss, reg_d_loss, reg_g_loss, gp
+        return adv_d_loss, adv_g_loss, reg_d_loss, reg_g_loss, gp, reg_fake
 
     def feat_loss(self, image_g, image_t):
 
@@ -168,15 +175,10 @@ class Model(nn.Module):
         image_t_norm = (image_t + 1.0) / 2.0
         image_t_norm = (image_t_norm - imagenet_mean) / imagenet_std
 
-        # Force fp32 for the entire perceptual loss computation.
-        # VGG features can be large (e.g. conv2 up to ~140), and the Gram
-        # matrix bmm overflows in fp16 AMP. VGG parameters are frozen, so
-        # gradients flow back to the generator without updating VGG.
-        with torch.amp.autocast('cuda', enabled=False):
-            _, end_points_image_g = self.vgg(image_g_norm.float())
-            _, end_points_image_t = self.vgg(image_t_norm.float())
-            c_loss = content_loss(end_points_image_g, end_points_image_t, content_layers)
-            s_loss = style_loss(end_points_image_g, end_points_image_t, style_layers)
+        _, end_points_image_g = self.vgg(image_g_norm)
+        _, end_points_image_t = self.vgg(image_t_norm)
+        c_loss = content_loss(end_points_image_g, end_points_image_t, content_layers)
+        s_loss = style_loss(end_points_image_g, end_points_image_t, style_layers)
 
         return c_loss, s_loss
 
@@ -186,7 +188,7 @@ class Model(nn.Module):
 
         # regression losses and adversarial losses
         (self.adv_d_loss, self.adv_g_loss, self.reg_d_loss,
-        self.reg_g_loss, self.gp) = self.adv_loss(images_r, images_g, angles_r, angles_g)
+        self.reg_g_loss, self.gp, _) = self.adv_loss(images_r, images_g, angles_r, angles_g)
 
         if (self.it + 1) % 600 == 0:
             print(f"adv_d_loss = {self.adv_d_loss:<10.5f}")
@@ -210,49 +212,30 @@ class Model(nn.Module):
 
         # regression losses and adversarial losses
         (self.adv_d_loss, self.adv_g_loss, self.reg_d_loss,
-        self.reg_g_loss, self.gp) = self.adv_loss(images_r, images_g, angles_r, angles_g)
+        self.reg_g_loss, self.gp, reg_fake) = self.adv_loss(images_r, images_g, angles_r, angles_g)
 
-        # Binocular consistency loss: penalize large differences in horizontal gaze
-        # between left and right eye pairs within the same batch.
-        self.binocular_loss = torch.tensor(0.0, device=images_r.device)
-        if hasattr(self, 'sides') and self.sides is not None:
-            # sides is a list of 'L'/'R' strings for each sample in the batch
-            # Try to pair samples with the same label (same identity/head_pose)
-            labels = self.labels if hasattr(self, 'labels') else None
-            if labels is not None:
-                # Build a mapping from label to list of (side, angle_g) tuples
-                from collections import defaultdict
-                label_to_samples = defaultdict(list)
-                for i in range(len(labels)):
-                    label_to_samples[labels[i].item()].append((i, self.sides[i]))
-                
-                # For each label with both L and R samples, compute consistency loss
-                for label, samples in label_to_samples.items():
-                    l_samples = [s for s in samples if s[1] == 'L']
-                    r_samples = [s for s in samples if s[1] == 'R']
-                    if l_samples and r_samples:
-                        # Average target angles for left and right eyes
-                        l_angles = angles_g[l_samples[0][0]]  # Use first L sample
-                        r_angles = angles_g[r_samples[0][0]]  # Use first R sample
-                        # Penalize difference in horizontal gaze (index 0)
-                        h_diff = torch.abs(l_angles[0] - r_angles[0])
-                        self.binocular_loss = self.binocular_loss + h_diff
-                
-                # Average over number of pairs
-                if len(label_to_samples) > 0:
-                    self.binocular_loss = self.binocular_loss / len(label_to_samples)
+        # Binocular consistency loss (vectorized).
+        # BinocularPairSampler guarantees [L, R, L, R, ...] alternating order,
+        # so even indices are L (person's right eye, flip=-1) and odd indices
+        # are R (person's left eye, no flip). For the same gaze direction,
+        # L's h prediction = -h and R's h prediction = +h, so their sum -> 0.
+        self.binocular_loss = torch.zeros(1, device=images_r.device)
+        if reg_fake.size(0) >= 2 and reg_fake.size(0) % 2 == 0:
+            l_preds = reg_fake[0::2]
+            r_preds = reg_fake[1::2]
+            self.binocular_loss = torch.mean(torch.abs(l_preds[:, 0] + r_preds[:, 0]))
 
         if (self.it + 1) % 600 == 0:
             print(f"adv_g_loss = {self.adv_g_loss:<10.5f}")
             print(f"reg_g_loss = {self.reg_g_loss:<10.5f}")
             print(f"recon_loss = {self.recon_loss:<10.5f}")
             print(f"feat_loss = {self.s_loss + self.c_loss:<10.5f}")
-            print(f"binocular_loss = {self.binocular_loss:<10.5f}")
+            print(f"binocular_loss = {self.binocular_loss.item():<10.5f}")
             print(" ")
 
         return G_ADV_WEIGHT * self.adv_g_loss + G_REG_WEIGHT * self.reg_g_loss + G_RECON_WEIGHT * self.recon_loss + \
                                         G_FEAT_WEIGHT * (self.s_loss + self.c_loss) + \
-                                        2.0 * self.binocular_loss
+                                        5.0 * self.binocular_loss
 
     def test_d_loss(self, images_r, angles_r, angles_g):
         with torch.no_grad():
@@ -318,8 +301,6 @@ class Model(nn.Module):
         self.d_op.zero_grad()
         self.g_op.zero_grad()
 
-        self.scaler = torch.amp.GradScaler('cuda')
-
         current_model_path = os.path.join(hps.log_dir, "current_model.ckpt")
         if conti:
             checkpoint = torch.load(current_model_path)
@@ -345,38 +326,46 @@ class Model(nn.Module):
         last_d_test_loss = float('inf')
         last_g_test_loss = float('inf')
 
+        has_test_data = len(test_iter.dataset) > 0 if hasattr(test_iter, 'dataset') else False
+
         try:
             for epoch in range(num_epoch):
                 self.epoch = epoch
 
-                for it, (train_batch, test_batch) in enumerate(tqdm(zip(train_iter, cycle(test_iter)), total=num_iter, desc=f"Epoch: {epoch + 1}/{num_epoch}")):
+                if has_test_data:
+                    batch_iter = zip(train_iter, cycle(test_iter))
+                else:
+                    batch_iter = ((batch, None) for batch in train_iter)
+
+                for it, (train_batch, test_batch) in enumerate(tqdm(batch_iter, total=num_iter, desc=f"Epoch: {epoch + 1}/{num_epoch}")):
                     self.it = it
 
-                    train_batch = [t.to(device, non_blocking=True) for t in train_batch]
-                    test_batch = [t.to(device, non_blocking=True) for t in test_batch]
+                    # Move tensors to device; sides (tuple of str) has no .to()
+                    tensors = [t for t in train_batch if isinstance(t, torch.Tensor)]
+                    sides = [t for t in train_batch if not isinstance(t, torch.Tensor)]
+                    train_batch_moved = [t.to(device, non_blocking=True) for t in tensors] + sides
+                    self.x_r, self.angles_r, self.labels, self.x_t, self.angles_g, self.sides = train_batch_moved
 
-                    self.x_r, self.angles_r, self.labels, self.x_t, self.angles_g, self.sides = train_batch
-                    self.x_test_r, self.angles_test_r, self.labels_test, self.x_test_t, self.angles_test_g, self.sides_test = test_batch
+                    if test_batch is not None:
+                        tensors_t = [t for t in test_batch if isinstance(t, torch.Tensor)]
+                        sides_t = [t for t in test_batch if not isinstance(t, torch.Tensor)]
+                        test_batch_moved = [t.to(device, non_blocking=True) for t in tensors_t] + sides_t
+                        self.x_test_r, self.angles_test_r, self.labels_test, self.x_test_t, self.angles_test_g, self.sides_test = test_batch_moved
 
                     try:
                         self.d_op.zero_grad()
-                        with torch.amp.autocast('cuda'):
-                            d_loss = self.d_loss_calculator(self.x_r, self.angles_r, self.angles_g)
-                        self.scaler.scale(d_loss).backward()
+                        d_loss = self.d_loss_calculator(self.x_r, self.angles_r, self.angles_g)
+                        d_loss.backward()
 
                         if (it + 1) % frequency == 0:
-                            self.scaler.unscale_(self.d_op)
                             torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-                            self.scaler.step(self.d_op)
+                            self.d_op.step()
 
                             self.g_op.zero_grad()
-                            with torch.amp.autocast('cuda'):
-                                g_loss = self.g_loss_calculator(self.x_r, self.angles_r, self.x_t, self.angles_g)
-                            self.scaler.scale(g_loss).backward()
-                            self.scaler.unscale_(self.g_op)
+                            g_loss = self.g_loss_calculator(self.x_r, self.angles_r, self.x_t, self.angles_g)
+                            g_loss.backward()
                             torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                            self.scaler.step(self.g_op)
-                            self.scaler.update()
+                            self.g_op.step()
 
                     except torch.cuda.OutOfMemoryError as e:
                         tqdm.write(f"GPU OOM at epoch {epoch+1} step {it+1}: {e}")
@@ -392,20 +381,25 @@ class Model(nn.Module):
                     if (it + 1) % hps.summary_steps == 0:
                         self.global_step = epoch * num_iter + it
 
-                        d_test_loss = self.test_d_loss(self.x_test_r, self.angles_test_r, self.angles_test_g)
-                        transformed_d_test_loss = torch.exp(d_test_loss / 100)
-                        g_test_loss = self.test_g_loss(self.x_test_r, self.angles_test_r, self.x_test_t, self.angles_test_g)
-                        transformed_g_test_loss = torch.exp(g_test_loss / 100)
+                        if has_test_data and test_batch is not None:
+                            d_test_loss = self.test_d_loss(self.x_test_r, self.angles_test_r, self.angles_test_g)
+                            transformed_d_test_loss = torch.exp(d_test_loss / 100)
+                            g_test_loss = self.test_g_loss(self.x_test_r, self.angles_test_r, self.x_test_t, self.angles_test_g)
+                            transformed_g_test_loss = torch.exp(g_test_loss / 100)
 
-                        tqdm.write(f"generator test loss: {transformed_g_test_loss:<10.2f}, discriminator test loss: {transformed_d_test_loss:<10.2f}")
+                            tqdm.write(f"generator test loss: {transformed_g_test_loss:<10.2f}, discriminator test loss: {transformed_d_test_loss:<10.2f}")
 
-                        challenger_loss = (transformed_g_test_loss + transformed_d_test_loss * (transformed_g_test_loss + transformed_d_test_loss))
-                        if challenger_loss < best_model_loss:
-                            best_model_loss = challenger_loss
-                            tqdm.write(f". ݁₊ ⊹ . ݁ ⟡ ݁ . ⊹ ₊ ݁.New lowest loss at step: {self.global_step}. ݁₊ ⊹ . ݁ ⟡ ݁ . ⊹ ₊ ݁.")
+                            challenger_loss = (transformed_g_test_loss + transformed_d_test_loss * (transformed_g_test_loss + transformed_d_test_loss))
+                            if challenger_loss < best_model_loss:
+                                best_model_loss = challenger_loss
+                                tqdm.write(f". ݁₊ ⊹ . ݁ ⟡ ݁ . ⊹ ₊ ݁.New lowest loss at step: {self.global_step}. ݁₊ ⊹ . ݁ ⟡ ݁ . ⊹ ₊ ݁.")
 
-                        last_d_test_loss = transformed_d_test_loss.item()
-                        last_g_test_loss = transformed_g_test_loss.item()
+                            last_d_test_loss = transformed_d_test_loss.item()
+                            last_g_test_loss = transformed_g_test_loss.item()
+
+                            del d_test_loss, transformed_d_test_loss, g_test_loss, transformed_g_test_loss, challenger_loss
+                        else:
+                            tqdm.write(f"Step {self.global_step}: no test data, skipping test evaluation.")
 
                         torch.save({
                                 'current_generator': self.generator.state_dict(),
@@ -414,7 +408,6 @@ class Model(nn.Module):
                                 'optimizer_discriminator': self.d_op.state_dict()
                             }, current_model_path)
 
-                        del d_test_loss, transformed_d_test_loss, g_test_loss, transformed_g_test_loss, challenger_loss
                         torch.cuda.empty_cache()
 
                 # Adjust learning rate at the end of each epoch
@@ -459,15 +452,16 @@ class Model(nn.Module):
             picture_eyes_patch = picture_eyes_patch.to(device)
 
             '''========== Gaze Adjustment =========='''
-            # Training data_loader flips right eye h_angle: h_angle = flip * raw_h / 15
-            # where flip=-1 for right eye, flip=1 for left eye.
-            # To match training coordinate system, eval must apply the same flip.
+            # Dataset L/R is image-side: L = image left = person's right eye,
+            # R = image right = person's left eye.
+            # Training flip: L gets flip=-1, R gets flip=1 (no flip).
+            # eyes_catch order: index 0 = person's left eye (=dataset R, no flip),
+            #                   index 1 = person's right eye (=dataset L, flip=-1).
             gaze_angles = torch.zeros(len(picture_eyes_patch), 2, device=device)
             for i in range(len(picture_eyes_patch)):
-                if i % 2 == 1:  # right eye (odd index)
-                    # Apply flip=-1 to horizontal angle to match training
+                if i % 2 == 1:  # person's right eye (=dataset L, flip=-1)
                     gaze_angles[i] = torch.tensor([0.0 * -1, 0.0], device=device)
-                else:  # left eye
+                else:  # person's left eye (=dataset R, no flip)
                     gaze_angles[i] = torch.tensor([0.0, 0.0], device=device)
             '''========== Gaze Adjustment =========='''
 
