@@ -28,9 +28,9 @@ D_REG_WEIGHT = 2
 
 #G's hyperparameter
 G_ADV_WEIGHT = 1
-G_REG_WEIGHT = 5
-G_RECON_WEIGHT = 1
-G_FEAT_WEIGHT = 1500
+G_REG_WEIGHT = 10
+G_RECON_WEIGHT = 10
+G_FEAT_WEIGHT = 1000
 
 AUGMENT = True
 
@@ -215,15 +215,14 @@ class Model(nn.Module):
         self.reg_g_loss, self.gp, reg_fake) = self.adv_loss(images_r, images_g, angles_r, angles_g)
 
         # Binocular consistency loss (vectorized).
-        # BinocularPairSampler guarantees [L, R, L, R, ...] alternating order,
-        # so even indices are L (person's right eye, flip=-1) and odd indices
-        # are R (person's left eye, no flip). For the same gaze direction,
-        # L's h prediction = -h and R's h prediction = +h, so their sum -> 0.
+        # BinocularPairSampler guarantees [L, R, L, R, ...] alternating order.
+        # Plan-1: L and R both use flip=-1 + R image flipped, so same coordinate
+        # system. Same gaze direction => L_h_pred == R_h_pred => diff -> 0.
         self.binocular_loss = torch.zeros(1, device=images_r.device)
         if reg_fake.size(0) >= 2 and reg_fake.size(0) % 2 == 0:
             l_preds = reg_fake[0::2]
             r_preds = reg_fake[1::2]
-            self.binocular_loss = torch.mean(torch.abs(l_preds[:, 0] + r_preds[:, 0]))
+            self.binocular_loss = torch.mean(torch.abs(l_preds[:, 0] - r_preds[:, 0]))
 
         if (self.it + 1) % 600 == 0:
             print(f"adv_g_loss = {self.adv_g_loss:<10.5f}")
@@ -235,7 +234,7 @@ class Model(nn.Module):
 
         return G_ADV_WEIGHT * self.adv_g_loss + G_REG_WEIGHT * self.reg_g_loss + G_RECON_WEIGHT * self.recon_loss + \
                                         G_FEAT_WEIGHT * (self.s_loss + self.c_loss) + \
-                                        5.0 * self.binocular_loss
+                                        20.0 * self.binocular_loss
 
     def test_d_loss(self, images_r, angles_r, angles_g):
         with torch.no_grad():
@@ -448,31 +447,44 @@ class Model(nn.Module):
 
             picture_eyes_patch, eyes_position, size = eyes_catch(hps, file_name) # picture_eyes_patch.shape = [eyes' number, 3, 64, 64]
 
+            if picture_eyes_patch is None:
+                print(f"No face detected in {file_name}, skipping.")
+                continue
+
             # Move input data to device
             picture_eyes_patch = picture_eyes_patch.to(device)
 
             '''========== Gaze Adjustment =========='''
-            # Dataset L/R is image-side: L = image left = person's right eye,
-            # R = image right = person's left eye.
-            # Training flip: L gets flip=-1, R gets flip=1 (no flip).
-            # eyes_catch order: index 0 = person's left eye (=dataset R, no flip),
-            #                   index 1 = person's right eye (=dataset L, flip=-1).
+            # Plan-1: unified coordinate system (flip=-1 for both L and R).
+            # Training: R images are horizontally flipped to match L appearance
+            # (nose bridge right). Generator only learns one mapping.
+            # Eval: flip R input -> Generator -> flip R output back.
+            # eyes_catch: index 0 (even) = image left = person's right eye = dataset L
+            #            index 1 (odd)  = image right = person's left eye = dataset R
             gaze_angles = torch.zeros(len(picture_eyes_patch), 2, device=device)
-            for i in range(len(picture_eyes_patch)):
-                if i % 2 == 1:  # person's right eye (=dataset L, flip=-1)
-                    gaze_angles[i] = torch.tensor([0.0 * -1, 0.0], device=device)
-                else:  # person's left eye (=dataset R, no flip)
-                    gaze_angles[i] = torch.tensor([0.0, 0.0], device=device)
-            '''========== Gaze Adjustment =========='''
+
+            patch_in = picture_eyes_patch.clone()
+            for i in range(1, len(patch_in), 2):
+                patch_in[i] = torch.flip(patch_in[i], dims=[-1])
 
             with torch.no_grad():
-                generated_image = self.generator(picture_eyes_patch, gaze_angles) # generated_image.shape = [number, 3, 64, 64]
-                
+                generated_image = self.generator(patch_in, gaze_angles)
+
+                for i in range(1, len(generated_image), 2):
+                    generated_image[i] = torch.flip(generated_image[i], dims=[-1])
+
                 print(file_name)
                 test_gan, test_reg = self.discriminator(picture_eyes_patch)
                 print(f"original: gan = {test_gan}, reg = {test_reg}")
-                test_gan, test_reg = self.discriminator(generated_image)
+
+                eval_disc_in = generated_image.clone()
+                for i in range(1, len(eval_disc_in), 2):
+                    eval_disc_in[i] = torch.flip(eval_disc_in[i], dims=[-1])
+                test_gan, test_reg = self.discriminator(eval_disc_in)
+                for i in range(1, len(test_reg), 2):
+                    test_reg[i, 0] = -test_reg[i, 0]
                 print(f"generated: gan = {test_gan}, reg = {test_reg}")
+            '''========== Gaze Adjustment =========='''
             
             # Move generated images back to CPU for saving
             generated_image = generated_image.cpu()

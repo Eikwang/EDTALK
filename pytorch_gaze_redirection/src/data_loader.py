@@ -83,9 +83,14 @@ class GazeDataset(Dataset):
         img_t_arr = self._cache[self._img_t_keys[idx]]
 
         image = self.image_data_class.transform(Image.fromarray(img_arr))
+        image_t = self.image_data_class.transform(Image.fromarray(img_t_arr))
+
+        if self.sides[idx] == 'R':
+            image = torch.flip(image, dims=[-1])
+            image_t = torch.flip(image_t, dims=[-1])
+
         if self.augment:
             image = self.image_data_class.augmentation(image)
-        image_t = self.image_data_class.transform(Image.fromarray(img_t_arr))
 
         return (
             image,
@@ -93,7 +98,7 @@ class GazeDataset(Dataset):
             torch.tensor(self.labels[idx], dtype=torch.float32),
             image_t,
             torch.tensor(self.angles_g[idx], dtype=torch.float32),
-            self.sides[idx]  # 'L' or 'R'
+            self.sides[idx]
         )
 
 
@@ -174,9 +179,7 @@ class ImageData(object):
                 continue
 
             idx = int(key.split('_')[0])
-            flip = 1
-            if key.split('_')[-1] == 'L':
-                flip = -1
+            flip = -1
 
             for f_r in file_list: # For each photo of a key (e.g. 0010_0P_R)
                 file_path = os.path.join(self.data_path, f_r)

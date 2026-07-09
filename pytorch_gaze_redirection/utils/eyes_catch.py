@@ -36,7 +36,7 @@ def eyes_catch(hps, file_name):
     if os.path.isfile(file_path) and os.path.splitext(file_name)[1].lower() in valid_extensions:
         try:
             # Load image file
-            image = Image.open(file_path)
+            image = Image.open(file_path).convert('RGB')
             
             # Convert PIL.Image object to numpy ndarray
             img = np.array(image)
@@ -44,6 +44,7 @@ def eyes_catch(hps, file_name):
         
         except Exception as e:
             print(f"Error processing {file_name}: {e}")
+            dets = []
 
     '''----------crop eyes patch----------'''
 
@@ -121,6 +122,9 @@ def eyes_catch(hps, file_name):
         eyes_position.append([right_eye_x1, right_eye_y1])
 
     # Convert the list to a Tensor
+    if len(picture_eyes_patch) == 0:
+        return None, None, None
+
     picture_eyes_patch = torch.stack(picture_eyes_patch)
 
     return picture_eyes_patch, eyes_position, size
