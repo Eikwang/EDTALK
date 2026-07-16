@@ -10,11 +10,16 @@ class Direction(nn.Module):
         self.pose_dim = pose_dim
         self.weight = nn.Parameter(torch.randn(512, lip_dim+pose_dim))
 
+    def _compute_Q(self):
+        with torch.no_grad():
+            weight = self.weight + 1e-8
+            Q, R = torch.linalg.qr(weight)
+            if Q.dtype != torch.float32:
+                Q = Q.to(torch.float32)
+        return Q
+
     def forward(self, input):
-        weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)
-        if Q.dtype != torch.float32:
-            Q = Q.to(torch.float32)
+        Q = self._compute_Q()
         if input is None:
             return Q
         else:
@@ -26,10 +31,7 @@ class Direction(nn.Module):
             return out
 
     def get_shared_out(self, input):
-        weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)
-        if Q.dtype != torch.float32:
-            Q = Q.to(torch.float32)
+        Q = self._compute_Q()
         if input is None:
             return Q
         else:
@@ -50,11 +52,16 @@ class Pose_Direction(nn.Module):
         self.pose_dim = pose_dim
         self.weight = nn.Parameter(torch.randn(512, pose_dim))
 
+    def _compute_Q(self):
+        with torch.no_grad():
+            weight = self.weight + 1e-8
+            Q, R = torch.linalg.qr(weight)
+            if Q.dtype != torch.float32:
+                Q = Q.to(torch.float32)
+        return Q
+
     def forward(self, input):
-        weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)
-        if Q.dtype != torch.float32:
-            Q = Q.to(torch.float32)
+        Q = self._compute_Q()
         if input is None:
             return Q
         else:
@@ -66,10 +73,7 @@ class Pose_Direction(nn.Module):
             return out
 
     def get_shared_out(self, input):
-        weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)
-        if Q.dtype != torch.float32:
-            Q = Q.to(torch.float32)
+        Q = self._compute_Q()
         if input is None:
             return Q
         else:
@@ -90,12 +94,20 @@ class Lip_Direction(nn.Module):
         self.lip_dim = lip_dim
         self.weight = nn.Parameter(torch.randn(512, lip_dim))
 
+    def _compute_Q(self, pose_weight=None):
+        with torch.no_grad():
+            if pose_weight is not None:
+                weight = torch.cat([self.weight, pose_weight], -1)
+            else:
+                weight = self.weight
+            weight = weight + 1e-8
+            Q, R = torch.linalg.qr(weight)
+            if Q.dtype != torch.float32:
+                Q = Q.to(torch.float32)
+        return Q
+
     def forward(self, input, pose_weight):
-        weight = torch.cat([self.weight, pose_weight], -1)
-        weight = weight + 1e-8
-        Q, R = torch.linalg.qr(weight)
-        if Q.dtype != torch.float32:
-            Q = Q.to(torch.float32)
+        Q = self._compute_Q(pose_weight)
         if input is None:
             return Q
         else:
@@ -105,8 +117,7 @@ class Lip_Direction(nn.Module):
             return out
 
     def get_shared_out(self, input):
-        weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)
+        Q = self._compute_Q()
         if input is None:
             return Q
         else:

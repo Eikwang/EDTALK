@@ -32,12 +32,16 @@ G_REG_WEIGHT = 10
 G_RECON_WEIGHT = 10
 G_FEAT_WEIGHT = 1000
 
+# Plan-2: binocular convergence angle (2m distance)
+# L eye target h = -CONVERGENCE_H, R eye target h = +CONVERGENCE_H
+CONVERGENCE_H = 0.05
+
 AUGMENT = True
 
 class Model(nn.Module):
     def __init__(self, params):
         super(Model, self).__init__()
-        self.generator = Generator(style_dim=2)
+        self.generator = Generator(style_dim=3)
         self.discriminator = Discriminator(params)
 
         if params.vgg_path:
@@ -82,6 +86,7 @@ class Model(nn.Module):
             image_data_class.train_images_t,
             image_data_class.train_angles_g,
             image_data_class.train_sides,
+            image_data_class.train_is_correction,
             image_data_class,
             augment=AUGMENT
         )
@@ -93,6 +98,7 @@ class Model(nn.Module):
             image_data_class.test_images_t,
             image_data_class.test_angles_g,
             image_data_class.test_sides,
+            image_data_class.test_is_correction,
             image_data_class,
             augment=False
         )
@@ -151,9 +157,9 @@ class Model(nn.Module):
         # Generator Loss
         adv_g_loss = -torch.mean(gan_fake)
 
-        # Regression Loss
-        reg_d_loss = F.mse_loss(angles_r, reg_real)
-        reg_g_loss = F.mse_loss(angles_g, reg_fake)
+        # Regression Loss (D reg output is 2D [h,v], angles are 3D [h,v,side])
+        reg_d_loss = F.mse_loss(angles_r[:, :2], reg_real)
+        reg_g_loss = F.mse_loss(angles_g[:, :2], reg_fake)
 
         return adv_d_loss, adv_g_loss, reg_d_loss, reg_g_loss, gp, reg_fake
 
@@ -216,13 +222,19 @@ class Model(nn.Module):
 
         # Binocular consistency loss (vectorized).
         # BinocularPairSampler guarantees [L, R, L, R, ...] alternating order.
-        # Plan-1: L and R both use flip=-1 + R image flipped, so same coordinate
-        # system. Same gaze direction => L_h_pred == R_h_pred => diff -> 0.
+        # Plan-2: only correction pairs are constrained.
+        # L target h = -conv, R target h = +conv => L_h - R_h = -2*conv
+        # Constraint: |L_h_pred - R_h_pred + 2*CONVERGENCE_H| -> 0
         self.binocular_loss = torch.zeros(1, device=images_r.device)
         if reg_fake.size(0) >= 2 and reg_fake.size(0) % 2 == 0:
             l_preds = reg_fake[0::2]
             r_preds = reg_fake[1::2]
-            self.binocular_loss = torch.mean(torch.abs(l_preds[:, 0] - r_preds[:, 0]))
+            l_corr = self.is_correction[0::2]
+            r_corr = self.is_correction[1::2]
+            both_corr = (l_corr > 0.5) & (r_corr > 0.5)
+            if both_corr.any():
+                diff = l_preds[:, 0] - r_preds[:, 0] + 2 * CONVERGENCE_H
+                self.binocular_loss = torch.mean(torch.abs(diff[both_corr]))
 
         if (self.it + 1) % 600 == 0:
             print(f"adv_g_loss = {self.adv_g_loss:<10.5f}")
@@ -242,7 +254,7 @@ class Model(nn.Module):
             gan_real, reg_real = self.discriminator(images_r)
             gan_fake, reg_fake = self.discriminator(images_g)
             adv_d_loss = -torch.mean(gan_real) + torch.mean(gan_fake)
-            reg_d_loss = F.mse_loss(angles_r, reg_real)
+            reg_d_loss = F.mse_loss(angles_r[:, :2], reg_real)
             return D_ADV_WEIGHT * adv_d_loss + D_REG_WEIGHT * reg_d_loss
 
     def test_g_loss(self, images_r, angles_r, images_t, angles_g):
@@ -253,7 +265,7 @@ class Model(nn.Module):
             c_loss, s_loss = self.feat_loss(images_g, images_t)
             gan_fake, reg_fake = self.discriminator(images_g)
             adv_g_loss = -torch.mean(gan_fake)
-            reg_g_loss = F.mse_loss(angles_g, reg_fake)
+            reg_g_loss = F.mse_loss(angles_g[:, :2], reg_fake)
             return (G_ADV_WEIGHT * adv_g_loss + G_REG_WEIGHT * reg_g_loss +
                     G_RECON_WEIGHT * recon_loss + G_FEAT_WEIGHT * (s_loss + c_loss))
     
@@ -339,17 +351,22 @@ class Model(nn.Module):
                 for it, (train_batch, test_batch) in enumerate(tqdm(batch_iter, total=num_iter, desc=f"Epoch: {epoch + 1}/{num_epoch}")):
                     self.it = it
 
-                    # Move tensors to device; sides (tuple of str) has no .to()
-                    tensors = [t for t in train_batch if isinstance(t, torch.Tensor)]
-                    sides = [t for t in train_batch if not isinstance(t, torch.Tensor)]
-                    train_batch_moved = [t.to(device, non_blocking=True) for t in tensors] + sides
-                    self.x_r, self.angles_r, self.labels, self.x_t, self.angles_g, self.sides = train_batch_moved
+                    try:
+                        # Move tensors to device; sides (tuple of str) has no .to()
+                        tensors = [t for t in train_batch if isinstance(t, torch.Tensor)]
+                        sides = [t for t in train_batch if not isinstance(t, torch.Tensor)]
+                        train_batch_moved = [t.to(device, non_blocking=True) for t in tensors] + sides
+                        self.x_r, self.angles_r, self.labels, self.x_t, self.angles_g, self.is_correction, self.sides = train_batch_moved
 
-                    if test_batch is not None:
-                        tensors_t = [t for t in test_batch if isinstance(t, torch.Tensor)]
-                        sides_t = [t for t in test_batch if not isinstance(t, torch.Tensor)]
-                        test_batch_moved = [t.to(device, non_blocking=True) for t in tensors_t] + sides_t
-                        self.x_test_r, self.angles_test_r, self.labels_test, self.x_test_t, self.angles_test_g, self.sides_test = test_batch_moved
+                        if test_batch is not None:
+                            tensors_t = [t for t in test_batch if isinstance(t, torch.Tensor)]
+                            sides_t = [t for t in test_batch if not isinstance(t, torch.Tensor)]
+                            test_batch_moved = [t.to(device, non_blocking=True) for t in tensors_t] + sides_t
+                            self.x_test_r, self.angles_test_r, self.labels_test, self.x_test_t, self.angles_test_g, _, self.sides_test = test_batch_moved
+                    except (TypeError, RuntimeError) as e:
+                        tqdm.write(f"DataLoader error at epoch {epoch+1} step {it+1}: {e}")
+                        torch.cuda.empty_cache()
+                        continue
 
                     try:
                         self.d_op.zero_grad()
@@ -370,8 +387,8 @@ class Model(nn.Module):
                         tqdm.write(f"GPU OOM at epoch {epoch+1} step {it+1}: {e}")
                         torch.cuda.empty_cache()
                         continue
-                    except RuntimeError as e:
-                        tqdm.write(f"CUDA error at epoch {epoch+1} step {it+1}: {e}")
+                    except (RuntimeError, TypeError) as e:
+                        tqdm.write(f"CUDA/JIT error at epoch {epoch+1} step {it+1}: {e}")
                         if 'illegal memory access' in str(e) or 'device-side assert' in str(e):
                             raise
                         torch.cuda.empty_cache()
@@ -455,34 +472,26 @@ class Model(nn.Module):
             picture_eyes_patch = picture_eyes_patch.to(device)
 
             '''========== Gaze Adjustment =========='''
-            # Plan-1: unified coordinate system (flip=-1 for both L and R).
-            # Training: R images are horizontally flipped to match L appearance
-            # (nose bridge right). Generator only learns one mapping.
-            # Eval: flip R input -> Generator -> flip R output back.
+            # Plan-2: no flipping. Generator receives [h, v, side] directly.
+            # L eye (even index): h=-conv, side=-1 (pupil right = inward)
+            # R eye (odd index):  h=+conv, side=+1 (pupil left = inward)
             # eyes_catch: index 0 (even) = image left = person's right eye = dataset L
             #            index 1 (odd)  = image right = person's left eye = dataset R
-            gaze_angles = torch.zeros(len(picture_eyes_patch), 2, device=device)
-
-            patch_in = picture_eyes_patch.clone()
-            for i in range(1, len(patch_in), 2):
-                patch_in[i] = torch.flip(patch_in[i], dims=[-1])
+            gaze_angles = torch.zeros(len(picture_eyes_patch), 3, device=device)
+            for i in range(len(picture_eyes_patch)):
+                if i % 2 == 0:  # L eye
+                    gaze_angles[i] = torch.tensor([-CONVERGENCE_H, 0.0, -1.0], device=device)
+                else:  # R eye
+                    gaze_angles[i] = torch.tensor([CONVERGENCE_H, 0.0, 1.0], device=device)
 
             with torch.no_grad():
-                generated_image = self.generator(patch_in, gaze_angles)
-
-                for i in range(1, len(generated_image), 2):
-                    generated_image[i] = torch.flip(generated_image[i], dims=[-1])
+                generated_image = self.generator(picture_eyes_patch, gaze_angles)
 
                 print(file_name)
                 test_gan, test_reg = self.discriminator(picture_eyes_patch)
                 print(f"original: gan = {test_gan}, reg = {test_reg}")
 
-                eval_disc_in = generated_image.clone()
-                for i in range(1, len(eval_disc_in), 2):
-                    eval_disc_in[i] = torch.flip(eval_disc_in[i], dims=[-1])
-                test_gan, test_reg = self.discriminator(eval_disc_in)
-                for i in range(1, len(test_reg), 2):
-                    test_reg[i, 0] = -test_reg[i, 0]
+                test_gan, test_reg = self.discriminator(generated_image)
                 print(f"generated: gan = {test_gan}, reg = {test_reg}")
             '''========== Gaze Adjustment =========='''
             

@@ -35,7 +35,7 @@ def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, 
     w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w).repeat(minor, 1, 1, 1)
     out = F.conv2d(out, w, groups=minor)
 
-    return out[:, :, ::down_y, ::down_x]
+    return out[:, :, ::down_y, ::down_x].contiguous()
 
 
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):

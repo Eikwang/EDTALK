@@ -1,11 +1,9 @@
 tensorboard
 av
 numba
+numpy
 tqdm
 librosa
 imageio-ffmpeg
 moviepy
-onnxruntime-gpu
-gfpgan
-basicsr
-numpy==1.26.4
+dlib

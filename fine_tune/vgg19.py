@@ -19,11 +19,9 @@ class ImagePyramide(torch.nn.Module):
         self.downs = nn.ModuleDict(downs)
 
     def forward(self, x):
-
         out_dict = {}
         for scale, down_module in self.downs.items():
             out_dict['prediction_' + str(scale).replace('-', '.')] = down_module(x)
-
         return out_dict
 
 
@@ -36,7 +34,6 @@ class Vgg19(torch.nn.Module):
         super(Vgg19, self).__init__()
 
         vgg_model = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
-        # vgg_model.load_state_dict(torch.load('./vgg19-dcbb9e9d.pth'))
         vgg_pretrained_features = vgg_model.features
 
         self.slice1 = torch.nn.Sequential()
@@ -65,7 +62,6 @@ class Vgg19(torch.nn.Module):
                 param.requires_grad = False
 
     def forward(self, X):
-
         X = X.clamp(-1, 1)
         X = X / 2 + 0.5
         X = (X - self.mean) / self.std
@@ -75,7 +71,6 @@ class Vgg19(torch.nn.Module):
         h_relu4 = self.slice4(h_relu3)
         h_relu5 = self.slice5(h_relu4)
         out = [h_relu1, h_relu2, h_relu3, h_relu4, h_relu5]
-
         return out
 
 
@@ -91,18 +86,23 @@ class VGGLoss(nn.Module):
         self.weights = (10, 10, 10, 10, 10)
 
     def forward(self, img_recon, img_real):
-
-        # vgg loss
-        pyramid_real = self.pyramid(img_real)
+        # recon path: needs gradients for G backward
         pyramid_recon = self.pyramid(img_recon)
+
+        # real path: no gradients needed (target), compute with no_grad
+        # to reduce computation graph size and peak VRAM by ~1.35GB
+        with torch.no_grad():
+            pyramid_real = self.pyramid(img_real)
 
         vgg_loss = 0
         for scale in self.scales:
             recon_vgg = self.vgg(pyramid_recon['prediction_' + str(scale)])
-            real_vgg = self.vgg(pyramid_real['prediction_' + str(scale)])
+
+            with torch.no_grad():
+                real_vgg = self.vgg(pyramid_real['prediction_' + str(scale)])
 
             for i, weight in enumerate(self.weights):
-                value = torch.abs(recon_vgg[i] - real_vgg[i].detach()).mean()
+                value = torch.abs(recon_vgg[i] - real_vgg[i]).mean()
                 vgg_loss += value * self.weights[i]
 
         return vgg_loss

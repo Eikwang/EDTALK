@@ -100,7 +100,7 @@ class Discriminator(nn.Module):
         return x_gan, x_reg
 
 class Generator(nn.Module):
-    def __init__(self, style_dim=2):
+    def __init__(self, style_dim=3):
         super(Generator, self).__init__()
         self.style_dim = style_dim
         self.dropout = 0.15

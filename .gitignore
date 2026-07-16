@@ -47,7 +47,10 @@ pytorch_gaze_redirection/eyespatch_dataset/
 pytorch_gaze_redirection/logs/
 pytorch_gaze_redirection/products/
 pytorch_gaze_redirection-bak/
-
+MiniRAG-main/
+runtime312/
+pytorch_gaze_redirection\eyespatch_dataset/
+nul
 
 # open-mem: Auto-generated folder context files.
 # Uncomment to exclude from version control (recommended for large projects):

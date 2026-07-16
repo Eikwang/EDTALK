@@ -54,14 +54,18 @@ class BinocularPairSampler(Sampler):
 
 
 class GazeDataset(Dataset):
-    """按需加载图像的 Dataset，带解码缓存避免重复磁盘IO。"""
+    """按需加载图像的 Dataset，带解码缓存避免重复磁盘IO。
+
+    Plan-2: 不翻转 R 图，angles 为 3D [h, v, side]，新增 is_correction 标记。
+    """
 
     def __init__(self, images, angles_r, labels, images_t, angles_g, sides,
-                 image_data_class, augment):
+                 is_correction, image_data_class, augment):
         self.angles_r = angles_r
         self.labels = labels
         self.angles_g = angles_g
         self.sides = sides
+        self.is_correction = is_correction
         self.image_data_class = image_data_class
         self.augment = augment
 
@@ -79,15 +83,17 @@ class GazeDataset(Dataset):
         return len(self._img_keys)
 
     def __getitem__(self, idx):
-        img_arr = self._cache[self._img_keys[idx]]
-        img_t_arr = self._cache[self._img_t_keys[idx]]
+        try:
+            img_arr = self._cache[self._img_keys[idx]]
+            img_t_arr = self._cache[self._img_t_keys[idx]]
 
-        image = self.image_data_class.transform(Image.fromarray(img_arr))
-        image_t = self.image_data_class.transform(Image.fromarray(img_t_arr))
-
-        if self.sides[idx] == 'R':
-            image = torch.flip(image, dims=[-1])
-            image_t = torch.flip(image_t, dims=[-1])
+            image = self.image_data_class.transform(Image.fromarray(img_arr))
+            image_t = self.image_data_class.transform(Image.fromarray(img_t_arr))
+        except (TypeError, RuntimeError):
+            img_arr = self._cache[self._img_keys[idx]]
+            img_t_arr = self._cache[self._img_t_keys[idx]]
+            image = self.image_data_class.transform(Image.fromarray(img_arr))
+            image_t = self.image_data_class.transform(Image.fromarray(img_t_arr))
 
         if self.augment:
             image = self.image_data_class.augmentation(image)
@@ -98,6 +104,7 @@ class GazeDataset(Dataset):
             torch.tensor(self.labels[idx], dtype=torch.float32),
             image_t,
             torch.tensor(self.angles_g[idx], dtype=torch.float32),
+            torch.tensor(self.is_correction[idx], dtype=torch.float32),
             self.sides[idx]
         )
 
@@ -142,6 +149,7 @@ class ImageData(object):
         self.train_images_t = []
         self.train_angles_g = []
         self.train_sides = []  # 'L' or 'R'
+        self.train_is_correction = []  # Plan-2: True/False per sample
 
         self.test_images = []
         self.test_angles_r = []
@@ -149,6 +157,7 @@ class ImageData(object):
         self.test_images_t = []
         self.test_angles_g = []
         self.test_sides = []  # 'L' or 'R'
+        self.test_is_correction = []  # Plan-2: always False for test
 
     def image_processing(
         self,
@@ -192,23 +201,29 @@ class ImageData(object):
                     v_angle_g = float(f_g.split('_')[-3].split('V')[0]) / 10.0
 
                     side_info = key.split('_')[-1]  # 'L' or 'R'
+                    side_val = -1.0 if side_info == 'L' else 1.0
                     if idx <= self.ids: # Training set
                         self.train_images.append(file_path)
-                        self.train_angles_r.append([h_angle_r, v_angle_r])
+                        self.train_angles_r.append([h_angle_r, v_angle_r, side_val])
                         self.train_labels.append(idx - 1)
                         self.train_images_t.append(file_path_t)
-                        self.train_angles_g.append([h_angle_g, v_angle_g])
+                        self.train_angles_g.append([h_angle_g, v_angle_g, side_val])
                         self.train_sides.append(side_info)
+                        self.train_is_correction.append(False)
                     else: # Test set
                         self.test_images.append(file_path)
-                        self.test_angles_r.append([h_angle_r, v_angle_r])
+                        self.test_angles_r.append([h_angle_r, v_angle_r, side_val])
                         self.test_labels.append(idx - 1)
                         self.test_images_t.append(file_path_t)
-                        self.test_angles_g.append([h_angle_g, v_angle_g])
+                        self.test_angles_g.append([h_angle_g, v_angle_g, side_val])
                         self.test_sides.append(side_info)
+                        self.test_is_correction.append(False)
 
-        # Correction mode: force target gaze to (0, 0) for a subset of training pairs.
-        # This teaches the model to redirect arbitrary gaze back to center.
+        # Correction mode: force target gaze to convergence angle for a subset of training pairs.
+        # Plan-2: L eye -> h=+conv (pupil right/inward), R eye -> h=-conv (pupil left/inward)
+        # flip=-1 => h = -H/15, so L conv H>0 => h<0, R conv H<0 => h>0
+        # conv_h = side_val * CONVERGENCE_H (L: -conv, R: +conv)
+        CONVERGENCE_H = 0.05
         num_train = len(self.train_images)
         num_correction = int(num_train * self.correction_ratio)
         # Select evenly distributed samples to avoid bias toward early identities.
@@ -228,9 +243,12 @@ class ImageData(object):
                 continue
 
             self.train_images_t[idx_corr] = target_path
-            self.train_angles_g[idx_corr] = [0.0, 0.0]
+            side_val = -1.0 if side == 'L' else 1.0
+            conv_h = side_val * CONVERGENCE_H
+            self.train_angles_g[idx_corr] = [conv_h, 0.0, side_val]
+            self.train_is_correction[idx_corr] = True
 
-        correction_count = sum([1 for ag in self.train_angles_g if ag == [0.0, 0.0]])
+        correction_count = sum(self.train_is_correction)
 
         if len(self.test_images) == 0 and len(self.train_images) > 0:
             test_ratio = 0.1
@@ -245,6 +263,7 @@ class ImageData(object):
                 self.test_images_t.append(self.train_images_t.pop(i))
                 self.test_angles_g.append(self.train_angles_g.pop(i))
                 self.test_sides.append(self.train_sides.pop(i))
+                self.test_is_correction.append(self.train_is_correction.pop(i))
             print(f'No test data (ids >= max identity). Moved {num_test} samples from train to test.')
 
         num_train = len(self.train_images)

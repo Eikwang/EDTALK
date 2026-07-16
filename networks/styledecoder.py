@@ -40,7 +40,7 @@ def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, 
     out = F.conv2d(out, w, groups=minor)
     # out = out.permute(0, 2, 3, 1)
 
-    return out[:, :, ::down_y, ::down_x]
+    return out[:, :, ::down_y, ::down_x].contiguous()
 
 
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
