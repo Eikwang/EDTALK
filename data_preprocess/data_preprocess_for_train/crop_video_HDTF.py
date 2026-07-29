@@ -18,6 +18,13 @@ import tempfile
 import shutil
 from functools import partial
 
+# 从 imageio-ffmpeg 获取 ffmpeg 路径（无需系统安装 FFMPEG）
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG_PATH = 'ffmpeg'
+
 # ============================================================
 # S3FD 人脸检测器 (参考 crop_head_video.py 的高效实现)
 # ============================================================
@@ -260,7 +267,7 @@ def _merge_audio_to_video(source_video, output_video, temp_suffix='.tmp.mp4'):
 
     try:
         cmd = [
-            'ffmpeg', '-y',
+            FFMPEG_PATH, '-y',
             '-i', temp_path,
             '-i', source_video,
             '-map', '0:v',           # 取临时视频的视频轨道
@@ -281,7 +288,7 @@ def _merge_audio_to_video(source_video, output_video, temp_suffix='.tmp.mp4'):
             os.remove(temp_path)
 
     except FileNotFoundError:
-        print("[WARN] ffmpeg not found, video saved without audio")
+        print("[WARN] imageio-ffmpeg not available, video saved without audio")
         os.rename(temp_path, output_video)
     except Exception as e:
         print(f"[WARN] Audio merge error ({e}), video saved without audio")

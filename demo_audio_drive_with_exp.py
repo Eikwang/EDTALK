@@ -47,6 +47,13 @@ from tqdm import tqdm
 from torchvision import transforms
 import torch.nn.functional as F
 
+# 从 imageio-ffmpeg 获取 ffmpeg 路径（无需系统安装 FFMPEG）
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG_PATH = 'ffmpeg'
+
 
 # =========================================================================
 # 图像加载与预处理
@@ -214,7 +221,7 @@ def compile_video_from_pngs(temp_dir, total_frames, fps, save_path):
     temp_mp4 = save_path.replace('.mp4', '_no_audio.mp4')
 
     cmd = [
-        'ffmpeg', '-y',
+        FFMPEG_PATH, '-y',
         '-framerate', str(fps),
         '-i', pattern,
         '-c:v', 'libx264',
@@ -234,7 +241,7 @@ def compile_video_from_pngs(temp_dir, total_frames, fps, save_path):
 def merge_audio(video_no_audio, audio_path, save_path):
     """把音频 mux 到视频中"""
     cmd = [
-        'ffmpeg', '-y',
+        FFMPEG_PATH, '-y',
         '-i', video_no_audio,
         '-i', audio_path,
         '-vcodec', 'copy',

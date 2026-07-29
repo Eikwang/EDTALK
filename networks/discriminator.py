@@ -241,7 +241,10 @@ class Discriminator(nn.Module):
         out = self.convs(input)
         batch, channel, height, width = out.shape
 
-        group = min(batch, self.stddev_group)
+        # 找到 ≤ stddev_group 的最大 group 值, 确保 batch 能被 group 整除
+        group = self.stddev_group
+        while batch % group != 0 and group > 1:
+            group -= 1
         stddev = out.view(group, -1, self.stddev_feat, channel // self.stddev_feat, height, width)
         stddev = torch.sqrt(stddev.var(0, unbiased=False) + 1e-8)
         stddev = stddev.mean([2, 3, 4], keepdims=True).squeeze(2)

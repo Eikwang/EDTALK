@@ -12,6 +12,14 @@ from networks.utils import check_package_installed
 from moviepy import VideoFileClip, AudioFileClip
 import av
 from fractions import Fraction
+import subprocess
+
+# 尝试从 imageio-ffmpeg 获取 ffmpeg 路径（无需系统安装）
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG_PATH = 'ffmpeg'  # 回退到系统 PATH
 
 def load_image(filename, size):
     img = Image.open(filename).convert('RGB')
@@ -240,8 +248,14 @@ class Demo(nn.Module):
             self.video_reader.close()
             
             temp_path = self.save_path.replace('.mp4','_temp.mp4')
-            cmd = r'ffmpeg -y -i "%s" -i "%s" -vcodec copy "%s"' % (temp_path, self.audio_path, self.save_path)
-            os.system(cmd)
+            # 使用 subprocess.run 替代 os.system，更安全可靠
+            subprocess.run([
+                FFMPEG_PATH, '-y',
+                '-i', temp_path,
+                '-i', self.audio_path,
+                '-vcodec', 'copy',
+                self.save_path
+            ], check=True)
             os.remove(temp_path)
 
             if self.args.face_sr and check_package_installed('gfpgan'):

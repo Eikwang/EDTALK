@@ -40,7 +40,7 @@ import torch
 
 warnings.filterwarnings('ignore')
 
-predictor = dlib.shape_predictor('data_preprocess/shape_predictor_68_face_landmarks.dat')
+predictor = dlib.shape_predictor('ckpts/shape_predictor_68_face_landmarks.dat')
 template = np.load('data_preprocess/M003_template.npy').astype(np.float32)
 
 CROP_MARGIN = 2.0   # source-crop-to-face ratio (independent of pad_ratio)

@@ -342,10 +342,7 @@ def main(args):
                 
                 # update generator
                 G_losses, recon, l_g_total = trainer.gen_update(
-                    audio_features, lip_features, pose_features, identity_img, target_img, bbox,
-                    accumulation_steps=args.accumulation_steps,
-                    step_optimizer=step_optimizer,
-                    compute_vgg=compute_vgg
+                    audio_features, lip_features, pose_features, identity_img, target_img, bbox
                 )
 
                 # update discriminator
@@ -425,7 +422,7 @@ def main(args):
                             audio_features, lip_features, pose_features, identity_img, target_img, bbox = \
                                         audio_features.cuda(), lip_features.cuda(), pose_features.cuda(), identity_img.cuda(), target_img.cuda(), bbox.cuda()
                             
-                            G_losses, recon, l_g_total = trainer.sample(audio_features, lip_features, pose_features, identity_img, target_img, bbox, compute_vgg=True)
+                            G_losses, recon, l_g_total = trainer.sample(audio_features, lip_features, pose_features, identity_img, target_img, bbox)
                             curloss += l_g_total.detach().item()
                             eval_steps += 1
                             
@@ -596,13 +593,15 @@ if __name__ == "__main__":
     # training params
     parser = argparse.ArgumentParser()
     parser.add_argument("--iter", type=int, default=800000)
-    parser.add_argument("--epoch", type=int, default=50)
+    parser.add_argument("--epoch", type=int, default=5,
+                        help="训练 epoch 数 (微调推荐 3-5, 过多会导致过拟合和口型崩坏)")
     parser.add_argument("--size", type=int, default=256)
     
     parser.add_argument("--d_reg_every", type=int, default=16)
     parser.add_argument("--g_reg_every", type=int, default=4)
     
-    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--lr", type=float, default=0.0001,
+                        help="学习率 (微调推荐 0.00005-0.0001, 原默认 0.001 对微调过高会导致口型崩坏)")
     parser.add_argument("--channel_multiplier", type=int, default=1)
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--display_freq", type=int, default=1)
@@ -624,13 +623,13 @@ if __name__ == "__main__":
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
     parser.add_argument("--distributed", action='store_true', help="Enable distributed training")
     parser.add_argument("--eval_iter", type=int, default=5000, help="local rank for distributed training")
-    parser.add_argument("--sync_weight", type=int, default=0, help="SyncNet loss weight (0=disabled, need syncnet_ckpt)")
+    parser.add_argument("--sync_weight", type=float, default=0.03,
+                        help="SyncNet loss weight (0=disabled, 微调推荐 0.03-0.1, 需配合 syncnet_ckpt 使用)")
     parser.add_argument("--syncnet_ckpt", type=str, default=None, help="Path to SyncNet pre-trained checkpoint (e.g. ckpts/EDTalk.pt)")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--dis_weight", type=int, default=0, help="GAN 判别器权重 (0=禁用)。微调推荐关闭：小数据集 GAN 易崩溃，且 d_optim 链路未启用时 dis 仅向 audio2lip 注入噪声梯度")
     parser.add_argument("--vis_num", type=int, default=10, help="local rank for distributed training")
     parser.add_argument("--save_freq", type=int, default=1000)
-    parser.add_argument("--train_generator", type=bool, default=False, help="local rank for distributed training")
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--audio2lip_ckpt", type=str, default=None)
     parser.add_argument("--accumulation_steps", type=int, default=4, help="梯度累积步数（单卡显存不足时使用，等效 batch_size = batch_size * accumulation_steps）")
@@ -640,8 +639,10 @@ if __name__ == "__main__":
                         help="将所有特征 preload_features 预加载到内存 (小数据集微调推荐, 大数据集慎用)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 进程数 (0=主线程加载, 默认4)")
-    parser.add_argument("--vgg_sparse_freq", type=int, default=0,
+    parser.add_argument("--vgg_sparse_freq", type=int, default=50,
                         help="VGG 稀疏计算频率 (0=每 iter 都算, N=每 N iter 算一次。微调推荐 500, 可节省 ~80%% VGG 计算)")
+    parser.add_argument("--train_generator", action='store_true',
+                        help="是否训练 Generator 的 Decoder 部分 (默认 False, 仅训练 audio2lip; True 时同时微调 Decoder)")
 
     opts = parser.parse_args()
 

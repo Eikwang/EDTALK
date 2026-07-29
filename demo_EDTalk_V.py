@@ -12,6 +12,14 @@ from torchvision import transforms
 import torch.nn.functional as F
 from networks.utils import check_package_installed
 from moviepy import VideoFileClip, AudioFileClip
+import subprocess
+
+# 从 imageio-ffmpeg 获取 ffmpeg 路径（无需系统安装 FFMPEG）
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG_PATH = 'ffmpeg'
 
 def load_image(filename, size):
     img = Image.open(filename).convert('RGB')
@@ -118,8 +126,7 @@ class Demo(nn.Module):
             
             temp_path = self.save_path.replace('.mp4','_temp.mp4')
             save_video(vid_target_recon, temp_path, self.fps)
-            cmd = r'ffmpeg -y -i "%s" -i "%s" -vcodec copy "%s"' % (temp_path, self.audio_path, self.save_path)
-            os.system(cmd)
+            subprocess.run([FFMPEG_PATH, '-y', '-i', temp_path, '-i', self.audio_path, '-vcodec', 'copy', self.save_path], check=True)
             os.remove(temp_path)
 
             if args.face_sr and check_package_installed('gfpgan'):

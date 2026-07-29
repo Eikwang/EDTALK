@@ -1,5 +1,12 @@
-import argparse
 import os
+
+# 抑制 TensorFlow / oneDNN / absl 启动日志：被 torchvision 等依赖间接导入，
+# 会在训练过程中反复打印 oneDNN port.cc 警告，污染进度输出。
+# 必须在任何第三方 import (torch/torchvision) 之前设置，否则 TF C++ 层已初始化，日志已发出。
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')      # 仅保留 FATAL，屏蔽 INFO/WARN
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')     # 关闭 oneDNN 自定义算子提示
+
+import argparse
 import platform
 import multiprocessing
 import sys
@@ -91,7 +98,7 @@ def main(rank, world_size, args):
             batch_size=args.batch_size // world_size,
             sampler=data.distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True),
             pin_memory=True,
-            drop_last=False,
+            drop_last=True,
         )
         loader_test = data.DataLoader(
             dataset_test,
@@ -99,7 +106,7 @@ def main(rank, world_size, args):
             batch_size=4,
             sampler=data.distributed.DistributedSampler(dataset_test, num_replicas=world_size, rank=rank, shuffle=False),
             pin_memory=True,
-            drop_last=False,
+            drop_last=True,
         )
     else:
         loader = data.DataLoader(
@@ -108,7 +115,7 @@ def main(rank, world_size, args):
             batch_size=args.batch_size,
             shuffle=True,
             pin_memory=True if args.num_workers > 0 else False,
-            drop_last=False,
+            drop_last=True,
         )
         loader_test = data.DataLoader(
             dataset_test,
@@ -116,7 +123,7 @@ def main(rank, world_size, args):
             batch_size=4,
             shuffle=False,
             pin_memory=True if args.num_workers > 0 else False,
-            drop_last=False,
+            drop_last=True,
         )
 
     loader = sample_data(loader)
@@ -223,17 +230,24 @@ if __name__ == "__main__":
                         help='Dataset directory (must contain count/ subdirectory with frame images)')
     parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--start_iter", type=int, default=0)
-    parser.add_argument("--display_freq", type=int, default=200)
+    parser.add_argument("--display_freq", type=int, default=1000)
     parser.add_argument("--save_freq", type=int, default=5000,
                         help='检查点保存间隔 (步), 建议设为 2000-5000 以减少崩溃丢失')
-    parser.add_argument("--wddm_sync_interval", type=int, default=100,
+    parser.add_argument("--wddm_sync_interval", type=int, default=500,
                         help='WDDM 防护: 每 N 步 synchronize+empty_cache (0=禁用, Windows 建议 100)')
     parser.add_argument("--exp_path", type=str, default='/data/ts/checkpoints/EDTalk/fine_tune/')
     parser.add_argument("--exp_name", type=str, default='Obama')
     parser.add_argument("--addr", type=str, default='localhost')
     parser.add_argument("--port", type=str, default='12345')
-    parser.add_argument("--num_workers", type=int, default=0,
+    parser.add_argument("--num_workers", type=int, default=2,
                         help='DataLoader worker 进程数 (0=主线程加载)')
+    # Mask 正则化参数 (解决背景变形问题)
+    parser.add_argument("--mask_reg_weight", type=float, default=0.1,
+                        help='Mask 正则化权重 (默认 0.1, 用于约束背景区域 mask→1, 防止背景变形)')
+    parser.add_argument("--head_ratio", type=float, default=0.6,
+                        help='头部区域占图像高度的比例 (默认 0.6, 即图像底部 60% 为头部区域; 仅在固定矩形模式下生效)')
+    parser.add_argument("--use_landmark", action='store_true',
+                        help='使用 dlib landmark 检测动态定位头部区域 (更精确, 但需要额外依赖; 未安装时自动回退到固定矩形模式)')
     # deprecated params (backward compat, ignored)
     parser.add_argument("--warmup_iters", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--val_freq", type=int, default=0, help=argparse.SUPPRESS)
@@ -247,8 +261,6 @@ if __name__ == "__main__":
     parser.add_argument("--cross_weight", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--lip_space_weight", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--pose_space_weight", type=float, default=0.0, help=argparse.SUPPRESS)
-    parser.add_argument("--mask_reg_weight", type=float, default=0.0, help=argparse.SUPPRESS)
-    parser.add_argument("--mask_mouth_ratio", type=float, default=0.4, help=argparse.SUPPRESS)
     parser.add_argument("--beta1", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--d_weight_decay", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--r1_batch_size", type=int, default=4, help=argparse.SUPPRESS)

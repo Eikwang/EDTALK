@@ -11,6 +11,13 @@ import numpy as np
 import warnings, json
 warnings.filterwarnings("ignore")
 
+# 从 imageio-ffmpeg 获取 ffmpeg 路径（无需系统安装 FFMPEG）
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except ImportError:
+    FFMPEG_PATH = 'ffmpeg'
+
 def extract_bbox(frame, fa):
     if max(frame.shape[0], frame.shape[1]) > 640:
         scale_factor =  max(frame.shape[0], frame.shape[1]) / 640.0
@@ -69,7 +76,7 @@ def compute_bbox(start, end, fps, tube_bbox, frame_shape, inp,outp, image_shape,
 
     scale = f'{image_shape[0]}:{image_shape[1]}'
 
-    return f'ffmpeg -i {inp} -ss {start} -t {time} -filter:v "crop={w}:{h}:{left}:{top}, scale={scale}" {outp} -r 25 -y'
+    return f'{FFMPEG_PATH} -i {inp} -ss {start} -t {time} -filter:v "crop={w}:{h}:{left}:{top}, scale={scale}" {outp} -r 25 -y'
 
 
 def compute_bbox_trajectories(trajectories, fps, frame_shape, args):

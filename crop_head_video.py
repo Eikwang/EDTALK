@@ -1,28 +1,13 @@
 import os
 import sys
-import json
 import argparse
-import math
 import warnings
 import cv2
 import numpy as np
-from PIL import Image
-from rembg import remove, new_session
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
-import multiprocessing as mp
-from functools import partial
 import queue
-import onnxruntime as ort
-
-# 检查 onnxruntime 能否正确加载 CUDA
-_available_providers = ort.get_available_providers()
-if 'CUDAExecutionProvider' in _available_providers:
-    print(f"[INFO] ONNX Runtime CUDA 可用，版本: {ort.__version__}")
-else:
-    print(f"[WARN] ONNX Runtime CUDA 不可用，可用: {_available_providers}")
-
+import dlib
 warnings.filterwarnings("ignore")
 
 
@@ -110,6 +95,52 @@ def detect_face(detector_info, frame, min_face_size=30, max_detect_size=640):
 def detect_faces_batch(detector_info, frames, min_face_size=30, max_detect_size=640):
     """批量检测人脸 (逐帧调用，PriorBox 已缓存)"""
     return [detect_face(detector_info, f, min_face_size, max_detect_size) for f in frames]
+
+
+# ============================================================
+# dlib 面部关键点检测 (68 landmarks)
+# ============================================================
+
+def _get_landmark_predictor(model_path=None):
+    """加载 dlib 68 点面部关键点检测器"""
+    if model_path is None:
+        model_path = os.path.join(_PROJECT_ROOT, 'ckpts', 'shape_predictor_68_face_landmarks.dat')
+    if not os.path.exists(model_path):
+        print(f'[WARN] dlib landmark model not found: {model_path}, landmark detection disabled.')
+        return None
+    try:
+        predictor = dlib.shape_predictor(str(model_path))
+        print(f'[INFO] dlib landmark predictor loaded: {model_path}')
+        return predictor
+    except Exception as e:
+        print(f'[WARN] Failed to load dlib landmark predictor: {e}')
+        return None
+
+
+def detect_landmarks(predictor, frame, face_bbox):
+    """检测单帧 68 个面部关键点
+
+    Args:
+        predictor: dlib shape_predictor 对象
+        frame: BGR 图像（原始分辨率）
+        face_bbox: (x1, y1, w, h) 人脸 bbox（原始帧坐标）
+
+    Returns:
+        (68, 2) float32 数组，每行为 (x, y)；失败返回 None
+    """
+    if predictor is None:
+        return None
+    x1, y1, w, h = face_bbox
+    rect = dlib.rectangle(int(x1), int(y1), int(x1 + w), int(y1 + h))
+    try:
+        shape = predictor(frame, rect)
+        pts = np.zeros((68, 2), dtype=np.float32)
+        for i in range(68):
+            pts[i, 0] = shape.part(i).x
+            pts[i, 1] = shape.part(i).y
+        return pts
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -245,98 +276,6 @@ def crop_and_resize(frame, crop_info, output_size=256, do_resize=True):
 
 
 # ============================================================
-# GFPGAN 面部增强
-# ============================================================
-
-class CropFaceEnhancer:
-    """局部面部区域增强：仅增强人脸所在区域，保留背景"""
-
-    def __init__(self, model_path=None, strength=0.4):
-        self.strength = max(0.0, min(1.0, float(strength)))
-        self.session = None
-        providers = ['CPUExecutionProvider']  # 防御性编程：提前初始化默认值
-
-        if model_path is None:
-            model_path = os.path.join(_PROJECT_ROOT, 'gfpgan-1024.onnx')
-
-        if not os.path.exists(model_path):
-            print(f'[WARN] GFPGAN model not found: {model_path}, face enhancement disabled.')
-            return
-
-        try:
-            import onnxruntime as ort
-            ort.set_default_logger_severity(3)
-        except Exception as e:
-            print(f'[WARN] onnxruntime not available: {e}, face enhancement disabled.')
-            return
-
-        try:
-            if 'CUDAExecutionProvider' in ort.get_available_providers():
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-            self.session = ort.InferenceSession(model_path, providers=providers)
-            self.input_name = self.session.get_inputs()[0].name
-            print(f'[INFO] GFPGAN loaded: {model_path}, strength={self.strength}, providers={providers}')
-        except Exception as e:
-            print(f'[WARN] Failed to load GFPGAN: {e}, face enhancement disabled.')
-            self.session = None
-
-    def enhance(self, img, face_bbox=None):
-        """
-        Args:
-            img: 256×256 BGR ndarray
-            face_bbox: [x, y, w, h] 在 img 坐标系中的人脸 bbox
-        """
-        if self.session is None or self.strength == 0.0:
-            return img
-        if face_bbox is None:
-            return img
-
-        h, w = img.shape[:2]
-        fx, fy, fw, fh = [float(v) for v in face_bbox]
-
-        expand = 0.5
-        cx, cy = fx + fw / 2.0, fy + fh / 2.0
-        new_fw = fw * (1 + expand)
-        new_fh = fh * (1 + expand)
-        ex = int(max(0, cx - new_fw / 2))
-        ey = int(max(0, cy - new_fh / 2))
-        ex2 = int(min(w, cx + new_fw / 2))
-        ey2 = int(min(h, cy + new_fh / 2))
-
-        face_region = img[ey:ey2, ex:ex2]
-        if face_region.size == 0:
-            return img
-        region_h, region_w = face_region.shape[:2]
-
-        face_512 = cv2.resize(face_region, (512, 512), interpolation=cv2.INTER_CUBIC)
-        rgb = cv2.cvtColor(face_512, cv2.COLOR_BGR2RGB)
-        rgb = rgb.astype(np.float32) / 255.0
-        rgb = (rgb - 0.5) / 0.5
-        rgb = rgb.transpose(2, 0, 1)[np.newaxis]
-
-        output = self.session.run(None, {self.input_name: rgb})[0]
-        output = (output[0].transpose(1, 2, 0) * 0.5 + 0.5) * 255.0
-        output = np.clip(output, 0, 255).astype(np.uint8)
-        output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
-        output = cv2.resize(output, (region_w, region_h), interpolation=cv2.INTER_AREA)
-
-        mask = np.zeros((region_h, region_w), dtype=np.float32)
-        center = (region_w // 2, region_h // 2)
-        axes = (region_w // 2, region_h // 2)
-        cv2.ellipse(mask, center, axes, 0, 0, 360, (1.0,), -1)
-        mask = cv2.GaussianBlur(mask, (51, 51), 0)
-        mask = mask[:, :, np.newaxis]
-
-        blended = (face_region.astype(np.float32) * (1 - self.strength * mask) +
-                   output.astype(np.float32) * (self.strength * mask))
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
-
-        result = img.copy()
-        result[ey:ey2, ex:ex2] = blended
-        return result
-
-
-# ============================================================
 # 帧迭代器
 # ============================================================
 
@@ -373,147 +312,80 @@ def iter_frames(input_path):
         return _gen(), total
 
 
-_thread_local = threading.local()
+def extract_frames(video_path, output_dir, longest_edge=1920, quality=95):
+    """从视频拆帧并缩放最长边到指定长度，保存为 JPEG
 
-def _get_worker_session(model_dir):
-    """获取当前线程专属的 rembg session (绕过 rembg 的 new_session Bug)"""
-    if not hasattr(_thread_local, "session"):
-        os.environ["U2NET_HOME"] = model_dir
-        thread_name = threading.current_thread().name  # 提前定义，避免 except 中未定义
-
-        # 1. 让 U2netSession 自动下载模型（如果不存在）
-        from rembg.sessions.u2net import U2netSession
-        model_path = U2netSession.download_models()
-
-        # 2. 手动配置 SessionOptions
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-        opts.log_severity_level = 3
-
-        # 3. 智能选择 Providers (GPU 优先)
-        available_providers = ort.get_available_providers()
-        if 'CUDAExecutionProvider' in available_providers:
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        else:
-            providers = ['CPUExecutionProvider']
-
-        try:
-            # 4. 直接使用原生 ort.InferenceSession 加载模型
-            inner_session = ort.InferenceSession(
-                model_path,
-                sess_options=opts,
-                providers=providers
-            )
-
-            # 5. 实例化 rembg 的 U2netSession 并注入我们自定义的 inner_session
-            _thread_local.session = U2netSession("u2net", ort.SessionOptions())
-            _thread_local.session.inner_session = inner_session
-
-            # 仅在线程 0 打印一次加载成功信息
-            if "worker_0" in thread_name or thread_name == "MainThread":
-                print(f"\n[INFO] 工作线程 {thread_name} 成功加载 U2Net，使用: {providers}")
-
-        except Exception as e:
-            print(f"\n[ERROR] 工作线程 {thread_name} 加载 U2Net 失败: {type(e).__name__}: {e}")
-            _thread_local.session = None
-
-    return _thread_local.session
-
-# ============================================================
-# 全局函数：用于多线程处理（必须放在全局作用域）
-# ============================================================
-def _process_single_frame_global(args):
+    Args:
+        video_path: 视频文件路径
+        output_dir: 输出目录（序列帧保存位置）
+        longest_edge: 最长边目标长度（默认 1920）
+        quality: JPEG 保存质量 1-100（默认 95，视觉无损）
+    Returns:
+        实际处理的帧数
     """
-    在工作进程中执行：裁切 + 抠图 + 缩放 + 写入
-    必须是全局函数才能被 ProcessPoolExecutor pickle
-    """
-    frame, crop_info, frame_idx, output_dir, output_size, output_ext, imwrite_params, model_dir, face_result, enable_rembg = args
-    
-    import os
-    import cv2
-    import numpy as np
-    from PIL import Image
-    try:
-        # === 步骤 1: 裁切面部（不缩放，用于高分辨率抠图）===
-        fh, fw = frame.shape[:2]
-        x1 = max(0, int(round(crop_info['crop_x'])))
-        y1 = max(0, int(round(crop_info['crop_y'])))
-        x2 = min(fw, int(round(crop_info['crop_x'] + crop_info['crop_size'])))
-        y2 = min(fh, int(round(crop_info['crop_y'] + crop_info['crop_size'])))
-        cropped = frame[y1:y2, x1:x2]
-        if cropped.size == 0:
-            cropped = frame
-        
-        # === 步骤 2: 抠图（在原始裁切尺寸上进行，使用GPU）===
-        # 使用线程本地 session，避免多线程共享导致的 CUDA 冲突
-        if enable_rembg:
-            try:
-                session = _get_worker_session(model_dir)
-                if session is not None:
-                    frame_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(frame_rgb)
+    os.makedirs(output_dir, exist_ok=True)
 
-                    # 调用 rembg 抠图
-                    pil_img_no_bg = remove(
-                        pil_img,
-                        session=session,
-                        alpha_matting=False,
-                        alpha_matting_foreground_threshold=240,
-                        alpha_matting_background_threshold=10,
-                        alpha_matting_erode_size=3,
-                    )
+    # 续传：扫描已有帧
+    start_idx = 0
+    if os.path.isdir(output_dir):
+        for f in os.listdir(output_dir):
+            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                try:
+                    idx = int(os.path.splitext(f)[0])
+                    if idx >= start_idx:
+                        start_idx = idx + 1
+                except ValueError:
+                    pass
 
-                    # 替换为纯白背景
-                    if isinstance(pil_img_no_bg, Image.Image):
-                        img_size = pil_img_no_bg.size
-                    else:
-                        img_size = (cropped.shape[1], cropped.shape[0])
-                    white_bg = Image.new("RGBA", img_size, (255, 255, 255, 255))
-                    if isinstance(pil_img_no_bg, Image.Image) and pil_img_no_bg.mode == 'RGBA':
-                        final_img = Image.alpha_composite(white_bg, pil_img_no_bg).convert("RGB")
-                    else:
-                        if isinstance(pil_img_no_bg, Image.Image):
-                            final_img = pil_img_no_bg.convert("RGB")
-                        elif isinstance(pil_img_no_bg, np.ndarray):
-                            final_img = Image.fromarray(pil_img_no_bg).convert("RGB")
-                        else:
-                            final_img = Image.fromarray(np.array(pil_img_no_bg)).convert("RGB")
-                    cropped = cv2.cvtColor(np.array(final_img), cv2.COLOR_RGB2BGR)
-                else:
-                    # 如果 session 为 None，说明模型加载彻底失败了
-                    if frame_idx % 100 == 0:  # 避免刷屏，每100帧提示一次
-                        print(f"\n[WARN] 帧 {frame_idx}: rembg session 加载失败，跳过抠图。请检查 onnxruntime-gpu 是否正确安装。")
-            except Exception as e:
-                # 【关键修改】：打印出真实的错误原因，不再静默 pass！
-                print(f"\n[ERROR] 帧 {frame_idx} 抠图失败: {type(e).__name__}: {e}")
-                # 发生错误时，cropped 保持原样，继续往下走（保证程序不中断）
-        
-        # === 步骤 3: 缩放到目标尺寸（使用 INTER_CUBIC）===
-        resized = cv2.resize(cropped, (output_size, output_size), interpolation=cv2.INTER_CUBIC)
-        
-        # === 步骤 4: 写入 ===
-        out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
-        cv2.imwrite(out_path, resized, imwrite_params)
-        
-        return frame_idx, crop_info, face_result
-    except Exception as e:
-        print(f"\n[ERROR] 帧 {frame_idx} 处理失败: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, None, None
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f'[ERROR] Cannot open video: {video_path}')
+        return 0
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if start_idx > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_idx)
+
+    imwrite_params = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+
+    pbar = tqdm(
+        total=total if total > 0 else None,
+        desc='拆帧', unit='帧',
+        mininterval=2.0, miniters=50, ncols=90,
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+    )
+
+    idx = start_idx
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        h, w = frame.shape[:2]
+        if max(w, h) > longest_edge:
+            scale = longest_edge / max(w, h)
+            frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
+        out_path = os.path.join(output_dir, f'{idx}.jpg')
+        cv2.imwrite(out_path, frame, imwrite_params)
+        idx += 1
+        pbar.update(1)
+
+    cap.release()
+    pbar.close()
+    return idx - start_idx
 
 
-def process(input_path, output_dir, output_size=256, output_format='png',
+def process(input_path, output_dir, output_size=256, output_format='jpg',
             pad_ratio_range=(1.05, 1.3), min_face_size=30,
-            enhance=False, gfpgan_model_path=None, enhance_strength=0.4,
             num_workers=4, device='cuda', s3fd_conf_th=0.5,
-            max_detect_size=640, detect_interval=1, enable_rembg=True):
+            max_detect_size=640, detect_interval=1,
+            landmark_model=None, enable_landmark=True):
 
     os.makedirs(output_dir, exist_ok=True)
     output_ext = output_format.lower()
     if output_ext not in ('png', 'jpg', 'jpeg'):
-        output_ext = 'png'
+        output_ext = 'jpg'
 
     # 扫描输出目录中已有的图像文件，获取最大序号
     start_idx = 0
@@ -542,30 +414,13 @@ def process(input_path, output_dir, output_size=256, output_format='png',
     detector_info = _get_face_detector(device=device, s3fd_conf_th=s3fd_conf_th)
     det_device = detector_info[2]
 
-    # 初始化 Rembg 抠图模型（仅在启用时）
-    global _model_dir
-    _model_dir = os.path.join(_PROJECT_ROOT, "ckpts", "rembg")
-    os.makedirs(_model_dir, exist_ok=True)
-    os.environ["U2NET_HOME"] = _model_dir
-    if enable_rembg:
-        print("正在加载 Rembg 抠图模型 (首次运行可能需要下载)...")
-        # 预加载一个 session 确保模型可用
-        _get_worker_session(_model_dir)
-    else:
-        print("[INFO] 抠图已禁用，使用快速裁切模式")
+    # 加载 dlib 关键点检测器
+    landmark_predictor = _get_landmark_predictor(landmark_model) if enable_landmark else None
 
     # 初始化跟踪器
     tracker = HeadTracker(
         pad_ratio_range=pad_ratio_range,
     )
-
-    # 初始化增强器
-    enhancer = None
-    if enhance:
-        enhancer = CropFaceEnhancer(gfpgan_model_path, strength=enhance_strength)
-        enhancer_loaded = enhancer is not None and enhancer.session is not None
-    else:
-        enhancer_loaded = False
 
     # metadata
     metadata = {
@@ -574,23 +429,12 @@ def process(input_path, output_dir, output_size=256, output_format='png',
         'output_format': output_ext,
         'pad_ratio_range': list(pad_ratio_range),
         'min_face_size': min_face_size,
-        'enhanced': enhancer_loaded,
-        'enhance_strength': enhance_strength if enhance else 0.0,
         'num_workers': num_workers,
         'device': det_device,
         'frames': [],
     }
 
     # ========== 核心优化：检测与写入解耦 ==========
-    # 关闭抠图时：裁切+resize<2ms，瓶颈100%在S3FD检测
-    # 策略：主线程只做检测+裁切，写入线程池只做I/O
-    
-    # 当 enable_rembg=True 时，抠图耗时(50-200ms/帧)，需要更多写入线程
-    # 当 enable_rembg=False 时，裁切极快，只需1-2个写入线程做磁盘I/O
-    effective_workers = max(1, num_workers) if enable_rembg else 2
-
-    write_executor = ThreadPoolExecutor(max_workers=effective_workers)
-    
     # 写入队列：主线程放入裁切好的数据，写入线程消费
     write_queue = queue.Queue(maxsize=256)
     write_error_count = 0
@@ -629,6 +473,7 @@ def process(input_path, output_dir, output_size=256, output_format='png',
     frame_idx = start_idx
     face_hit = 0
     last_face_result = None
+    landmarks_list = []
 
     import torch
 
@@ -675,17 +520,16 @@ def process(input_path, output_dir, output_size=256, output_format='png',
             
             crop_info['frame_idx'] = frame_idx
             
-            # 裁切 + resize（极轻量，<2ms）
-            if enable_rembg:
-                # 开启抠图：提交到线程池做裁切+抠图+resize
-                task = (warmup_frame, crop_info, frame_idx, output_dir, output_size,
-                        output_ext, imwrite_params, _model_dir, face_result, enable_rembg)
-                write_executor.submit(_process_single_frame_global, task)
+            if face_result is not None:
+                fx1, fy1, fw, fh, _ = face_result
+                lms = detect_landmarks(landmark_predictor, warmup_frame, (fx1, fy1, fw, fh))
             else:
-                # 关闭抠图：直接裁切+resize，丢给写入线程
-                resized, _ = crop_and_resize(warmup_frame, crop_info, output_size)
-                out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
-                write_queue.put((resized, out_path, imwrite_params))
+                lms = None
+            landmarks_list.append(lms if lms is not None else np.full((68, 2), np.nan, dtype=np.float32))
+            
+            resized, _ = crop_and_resize(warmup_frame, crop_info, output_size)
+            out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
+            write_queue.put((resized, out_path, imwrite_params))
             
             _append_meta(metadata, crop_info, face_result, frame_idx)
             frame_idx += 1
@@ -727,31 +571,25 @@ def process(input_path, output_dir, output_size=256, output_format='png',
             
             crop_info['frame_idx'] = frame_idx
             
-            # 裁切 + 写入
-            if enable_rembg:
-                task = (frame, crop_info, frame_idx, output_dir, output_size,
-                        output_ext, imwrite_params, _model_dir, face_result, enable_rembg)
-                write_executor.submit(_process_single_frame_global, task)
+            if face_result is not None:
+                fx1, fy1, fw, fh, _ = face_result
+                lms = detect_landmarks(landmark_predictor, frame, (fx1, fy1, fw, fh))
             else:
-                resized, _ = crop_and_resize(frame, crop_info, output_size)
-                out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
-                write_queue.put((resized, out_path, imwrite_params))
+                lms = None
+            landmarks_list.append(lms if lms is not None else np.full((68, 2), np.nan, dtype=np.float32))
+            
+            resized, _ = crop_and_resize(frame, crop_info, output_size)
+            out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
+            write_queue.put((resized, out_path, imwrite_params))
             
             _append_meta(metadata, crop_info, face_result, frame_idx)
             frame_idx += 1
             pbar.update(1)
 
     finally:
-        # 通知写入线程结束
         write_queue.put(None)
         write_queue.join()
         writer_thread.join()
-        
-        # 关闭写入线程池（抠图模式用）
-        if enable_rembg:
-            pbar.set_description('写入中')
-            write_executor.shutdown(wait=True)
-        
         pbar.close()
 
     if write_error_count > 0:
@@ -759,10 +597,40 @@ def process(input_path, output_dir, output_size=256, output_format='png',
 
     metadata['frame_count'] = len(metadata['frames'])
 
-    # 保存 metadata
-    meta_path = os.path.join(output_dir, 'metadata.json')
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    # 保存 metadata 为 npy 到 <dataset_dir>/metadata/<video_name>.npy
+    video_stem = os.path.splitext(os.path.basename(input_path))[0]
+    dataset_dir = os.path.dirname(os.path.dirname(input_path))
+    meta_dir = os.path.join(dataset_dir, 'metadata')
+    os.makedirs(meta_dir, exist_ok=True)
+    meta_path = os.path.join(meta_dir, f'{video_stem}.npy')
+
+    dtype = np.dtype([
+        ('frame_idx', 'i4'), ('crop_x', 'f4'), ('crop_y', 'f4'),
+        ('crop_size', 'f4'), ('scale_factor', 'f4'),
+        ('face_detected', '?'), ('pad_ratio', 'f4'),
+        ('face_bbox_x', 'f4'), ('face_bbox_y', 'f4'),
+        ('face_bbox_w', 'f4'), ('face_bbox_h', 'f4'),
+    ])
+    records = []
+    for m in metadata['frames']:
+        fb = m.get('face_bbox', {})
+        records.append((
+            m['frame_idx'], m['crop_x'], m['crop_y'],
+            m['crop_size'], m['scale_factor'],
+            m['face_detected'], m['pad_ratio'],
+            fb.get('x', np.nan), fb.get('y', np.nan),
+            fb.get('w', np.nan), fb.get('h', np.nan),
+        ))
+    arr = np.array(records, dtype=dtype)
+    np.save(meta_path, arr)
+
+    # 保存 facemark 为 npy 到 <dataset_dir>/facemark/<video_name>.npy
+    if len(landmarks_list) > 0:
+        landmarks_arr = np.stack(landmarks_list, axis=0).astype(np.float32)
+        facemark_dir = os.path.join(dataset_dir, 'facemark')
+        os.makedirs(facemark_dir, exist_ok=True)
+        facemark_path = os.path.join(facemark_dir, f'{video_stem}.npy')
+        np.save(facemark_path, landmarks_arr)
 
     # 总结输出
     summary = (
@@ -808,7 +676,7 @@ def _append_meta(metadata, crop_info, face_result, frame_idx):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Face detection + crop to sequence frames (with optional GFPGAN enhancement)'
+        description='Face detection + crop to sequence frames'
     )
     parser.add_argument('input', type=str,
                         help='Input dataset directory (must contain original_videos/ subdirectory)')
@@ -816,9 +684,9 @@ if __name__ == '__main__':
                         help='Output directory (default: <dataset_dir>/count/)')
     parser.add_argument('--output_size', type=int, default=256,
                         help='Output image size N*N (default: 256)')
-    parser.add_argument('--output_format', type=str, default='png',
+    parser.add_argument('--output_format', type=str, default='jpg',
                         choices=['png', 'jpg'],
-                        help='Output image format (default: png)')
+                        help='Output image format (default: jpg)')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of worker threads for I/O (default: 4)')
 
@@ -840,19 +708,17 @@ if __name__ == '__main__':
     parser.add_argument('--min_face_size', type=int, default=30,
                         help='Minimum face size in pixels (default: 30)')
 
-    # 面部增强（默认关闭）
-    parser.add_argument('--enhance', action='store_true', default=False,
-                        help='Enable GFPGAN face enhancement (default: off)')
-    parser.add_argument('--gfpgan_model', type=str, default=None,
-                        help='Path to GFPGAN ONNX model (default: <project_root>/gfpgan-1024.onnx)')
-    parser.add_argument('--enhance_strength', type=float, default=0.4,
-                        help='Enhancement strength 0.0~1.0 (default: 0.4, only used with --enhance)')
+    # 关键点检测参数
+    parser.add_argument('--landmark_model', type=str, default=None,
+                        help='Path to dlib shape_predictor model (default: <project_root>/ckpts/shape_predictor_68_face_landmarks.dat)')
+    parser.add_argument('--no-landmark', action='store_true', default=False,
+                        help='Disable facial landmark detection')
 
-    # 抠图参数
-    parser.add_argument('--rembg', action='store_true', default=True,
-                        help='Enable background removal with rembg (default: on)')
-    parser.add_argument('--no-rembg', action='store_false', dest='rembg',
-                        help='Disable background removal')
+    # 拆帧参数
+    parser.add_argument('--longest_edge', type=int, default=1920,
+                        help='Target longest edge length for frame extraction (default: 1920)')
+    parser.add_argument('--extract_quality', type=int, default=95,
+                        help='JPEG quality for extracted frames 1-100 (default: 95, visually lossless)')
 
     opt = parser.parse_args()
 
@@ -892,37 +758,41 @@ if __name__ == '__main__':
           f'Output: {os.path.basename(opt.output_dir)}'
           f' | {opt.output_size}x{opt.output_size} {opt.output_format.upper()}'
           f' | device={opt.device} | workers={opt.num_workers}'
-          f' | rembg={"ON" if opt.rembg else "OFF"}'
-          f' | enhance={"ON" if opt.enhance else "off"}')
+          f' | longest_edge={opt.longest_edge}')
 
     # 遍历每个视频文件进行处理
     for video_file in video_files:
         video_path = os.path.join(original_videos_dir, video_file)
         video_name = os.path.splitext(video_file)[0]
 
-        # 每个视频的输出子目录: <output_dir>/<video_name>/
-        video_output_dir = os.path.join(opt.output_dir, video_name)
-
+        # 第一步：拆帧并缩放最长边到 longest_edge
+        orifra_dir = os.path.join(dataset_dir, 'orifra', video_name)
         print(f'\n{"="*60}')
-        print(f'Processing: {video_file} -> {video_name}/')
+        print(f'[Step 1] 拆帧: {video_file} -> orifra/{video_name}/ (longest_edge={opt.longest_edge})')
+        print(f'{"="*60}')
+        n_extracted = extract_frames(video_path, orifra_dir, longest_edge=opt.longest_edge, quality=opt.extract_quality)
+        print(f'拆帧完成: {n_extracted} 帧')
+
+        # 第二步：面部裁切 + 关键点
+        video_output_dir = os.path.join(opt.output_dir, video_name)
+        print(f'\n{"="*60}')
+        print(f'[Step 2] 裁切 + 关键点: orifra/{video_name}/ -> {video_name}/')
         print(f'{"="*60}')
 
         process(
-            input_path=video_path,
+            input_path=orifra_dir,
             output_dir=video_output_dir,
             output_size=opt.output_size,
             output_format=opt.output_format,
             pad_ratio_range=(opt.pad_ratio_min, opt.pad_ratio_max),
             min_face_size=opt.min_face_size,
-            enhance=opt.enhance,
-            gfpgan_model_path=opt.gfpgan_model,
-            enhance_strength=opt.enhance_strength,
             num_workers=opt.num_workers,
             device=opt.device,
             s3fd_conf_th=opt.s3fd_conf_th,
             max_detect_size=opt.max_detect_size,
             detect_interval=opt.detect_interval,
-            enable_rembg=opt.rembg,
+            landmark_model=opt.landmark_model,
+            enable_landmark=not opt.no_landmark,
         )
 
     print(f'\n{"="*60}')
