@@ -62,6 +62,13 @@ class MouthCompositor:
         # EMA-smoothed facemark (in 256x256 space), persists across frames
         self._smoothed_facemark: np.ndarray | None = None
 
+        # Mask cache: avoid recomputing expensive distance transforms every frame
+        # The mask changes slowly (landmarks shift ~2-5px between frames at 25fps),
+        # so we only recompute when landmarks move beyond a tolerance threshold.
+        self._cached_mask: np.ndarray | None = None
+        self._cached_mask_facemark: np.ndarray | None = None
+        self._mask_cache_tolerance: float = 3.0  # pixels — recompute if any landmark moves more than this
+
     def composite(self, orifra_frame: np.ndarray, rendered_frame_256: np.ndarray,
                   facemark: np.ndarray, meta: np.ndarray) -> np.ndarray:
         """Composite mouth region from rendered frame onto original frame.
@@ -106,8 +113,19 @@ class MouthCompositor:
         # --- EMA smooth facemark to prevent edge flickering ---
         facemark_256 = self._smooth_landmarks(facemark_256)
 
-        # --- Create landmark-guided mask ---
-        mask_256 = self._create_mouth_mask(256, 256, facemark_256)
+        # --- Create landmark-guided mask (cached — recompute only when landmarks shift) ---
+        if self._cached_mask is not None and self._cached_mask_facemark is not None:
+            max_shift = np.max(np.abs(facemark_256 - self._cached_mask_facemark))
+            if max_shift < self._mask_cache_tolerance:
+                mask_256 = self._cached_mask
+            else:
+                mask_256 = self._create_mouth_mask(256, 256, facemark_256)
+                self._cached_mask = mask_256
+                self._cached_mask_facemark = facemark_256.copy()
+        else:
+            mask_256 = self._create_mouth_mask(256, 256, facemark_256)
+            self._cached_mask = mask_256
+            self._cached_mask_facemark = facemark_256.copy()
 
         # --- Resize rendered and mask to orifra crop scale ---
         crop_size_int = int(round(crop_size))
