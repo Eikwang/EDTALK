@@ -366,30 +366,45 @@ class RenderLoop:
 
         if lip_result is None:
             # No audio data — idle mode
+            t0 = time.perf_counter()
             character_data.ensure_loaded(self._frame_index)
             orifra, cropped, meta, facemark = character_data.get_frame(self._frame_index)
+            t1 = time.perf_counter()
             alpha_D_lip = self._get_idle_lip_coeff()
+            t2 = time.perf_counter()
 
             rendered_np = None
             if self.model_manager is not None and cropped is not None and alpha_D_lip is not None:
                 rendered = self.model_manager.infer_frame(cropped, alpha_D_lip, cropped)
+                t3 = time.perf_counter()
                 rendered_np = rendered.clamp(-1, 1).cpu()
                 rendered_np = (rendered_np[0] * 127.5 + 127.5).permute(1, 2, 0).to(torch.uint8).numpy()
                 rendered_np = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
+            else:
+                t3 = time.perf_counter()
 
             # [DISABLED] Face repair bypassed for sync testing
             # if self.face_repair is not None and rendered_np is not None:
             #     rendered_np = self.face_repair.repair(rendered_np)
 
+            t4 = time.perf_counter()
             if self.compositor is not None and rendered_np is not None and facemark is not None:
                 composited = self.compositor.composite(orifra, rendered_np, facemark, meta)
             else:
                 composited = orifra
+            t5 = time.perf_counter()
 
             if self.unity_capture is not None:
                 success = self.unity_capture.send_frame(composited)
                 if not success:
                     print(f"[RenderLoop] Failed to send frame {self._frame_index}")
+            t6 = time.perf_counter()
+
+            # Print timing breakdown every30 frames
+            if self._frame_index <= 5 or self._frame_index % 30 == 0:
+                print(f"[TIMING] load={ (t1-t0)*1000:.1f}ms lip={ (t2-t1)*1000:.1f}ms "
+                      f"gen={ (t3-t2)*1000:.1f}ms post={ (t4-t3)*1000:.1f}ms "
+                      f"comp={ (t5-t4)*1000:.1f}ms send={ (t6-t5)*1000:.1f}ms")
 
             self._frame_index += 1
             self._debug_idle_frames += 1
@@ -399,14 +414,10 @@ class RenderLoop:
         alpha_D_lip, lip_idx = lip_result
         self._last_rendered_lip_idx = lip_idx
 
-        # Use lip_idx to select video frame (matching demo pipeline).
-        # Demo: vid_idx = i % total_video_frames where i = lip coefficient index.
-        # This ensures video frame and lip coefficient are always aligned,
-        # even when the video cycles (e.g., 432 frames = 17.28s but audio = 35s).
-        # Using global _frame_index would be wrong because it includes idle frames
-        # and doesn't correspond to the lip coefficient timeline.
+        t0 = time.perf_counter()
         character_data.ensure_loaded(lip_idx)
         orifra, cropped, meta, facemark = character_data.get_frame(lip_idx)
+        t1 = time.perf_counter()
 
         self._debug_real_frames += 1
 
@@ -416,24 +427,35 @@ class RenderLoop:
             pose_img_drive = cropped
 
             rendered = self.model_manager.infer_frame(img_source, alpha_D_lip, pose_img_drive)
+            t2 = time.perf_counter()
 
             rendered_np = rendered.clamp(-1, 1).cpu()
             rendered_np = (rendered_np[0] * 127.5 + 127.5).permute(1, 2, 0).to(torch.uint8).numpy()
             rendered_np = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
+        else:
+            t2 = time.perf_counter()
 
         # [DISABLED] Face repair bypassed for sync testing
         # if self.face_repair is not None and rendered_np is not None:
         #     rendered_np = self.face_repair.repair(rendered_np)
 
+        t3 = time.perf_counter()
         if self.compositor is not None and rendered_np is not None and facemark is not None:
             composited = self.compositor.composite(orifra, rendered_np, facemark, meta)
         else:
             composited = orifra
+        t4 = time.perf_counter()
 
         if self.unity_capture is not None:
             success = self.unity_capture.send_frame(composited)
             if not success:
                 print(f"[RenderLoop] Failed to send frame {self._frame_index}")
+        t5 = time.perf_counter()
+
+        if self._frame_index <= 5 or self._frame_index % 30 == 0:
+            print(f"[TIMING:audio] load={ (t1-t0)*1000:.1f}ms "
+                  f"gen={ (t2-t1)*1000:.1f}ms post={ (t3-t2)*1000:.1f}ms "
+                  f"comp={ (t4-t3)*1000:.1f}ms send={ (t5-t4)*1000:.1f}ms")
 
         self._frame_index += 1
         return 1
