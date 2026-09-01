@@ -71,8 +71,18 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
+        default=500,
         help="Frames per preload batch (default: 100, window = 2 × batch_size)"
+    )
+    parser.add_argument(
+        "--no-face-repair",
+        action="store_true",
+        help="Disable face repair post-processing"
+    )
+    parser.add_argument(
+        "--gaze-correction",
+        action="store_true",
+        help="Enable gaze correction (placeholder)"
     )
     parser.add_argument(
         "--host",
@@ -130,14 +140,21 @@ def setup_service(config: Config, no_unitycapture: bool = False):
     audio_buffer = AudioBuffer(max_buffer_seconds=0)
     audio_processor = AudioProcessor()
 
-    # 4. Initialize face repair
-    print("\n[4/6] Initializing face repair...")
-    face_repair = FaceRepair(model_path='realtime_serve/weights/facefix256.onnx',
-                             alpha=0.7, use_cuda=True)
+    # 4. Initialize face repair (conditional)
+    face_repair = None
+    if config.face_repair_enabled:
+        print("\n[4/7] Initializing face repair...")
+        face_repair = FaceRepair(model_path='realtime_serve/weights/facefix256.onnx',
+                                 alpha=0.7, use_cuda=True)
+    else:
+        print("\n[4/7] Face repair disabled")
 
     # 5. Initialize compositor
-    print("\n[5/6] Initializing mouth compositor...")
+    print("\n[5/7] Initializing mouth compositor...")
     compositor = MouthCompositor(blur_px=7, landmark_smooth=0.3)
+
+    # Link compositor to character data for mask precomputation
+    character_data.set_compositor(compositor)
 
     # 6. Initialize UnityCapture sender (optional)
     print("\n[6/7] Initializing UnityCapture sender...")
@@ -200,7 +217,9 @@ def main():
         character_dir=args.character_dir,
         target_fps=args.target_fps,
         cap_num=args.cap_num,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        face_repair_enabled=not args.no_face_repair,
+        gaze_correction_enabled=args.gaze_correction
     )
 
     # Setup service components

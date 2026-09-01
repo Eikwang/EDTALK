@@ -69,8 +69,27 @@ class MouthCompositor:
         self._cached_mask_facemark: np.ndarray | None = None
         self._mask_cache_tolerance: float = 3.0  # pixels — recompute if any landmark moves more than this
 
+    def generate_mask(self, facemark_256: np.ndarray) -> np.ndarray:
+        """Generate a mouth mask from facemark landmarks (for precomputation).
+
+        This is the standalone mask generation step, separated from composite()
+        so it can be called during batch preloading.
+
+        Args:
+            facemark_256: (68, 2) float32 landmarks in 256x256 space
+
+        Returns:
+            Mask (256, 256) float32 in range [0, 1], or None if facemark is invalid
+        """
+        if facemark_256 is None or np.any(np.isnan(facemark_256)):
+            return None
+
+        facemark_256 = self._smooth_landmarks(facemark_256)
+        return self._create_mouth_mask(256, 256, facemark_256)
+
     def composite(self, orifra_frame: np.ndarray, rendered_frame_256: np.ndarray,
-                  facemark: np.ndarray, meta: np.ndarray) -> np.ndarray:
+                  facemark: np.ndarray, meta: np.ndarray,
+                  precomputed_mask: np.ndarray | None = None) -> np.ndarray:
         """Composite mouth region from rendered frame onto original frame.
 
         Optimized: operates only on the crop region, not the full frame.
@@ -110,22 +129,24 @@ class MouthCompositor:
         if np.any(np.isnan(facemark_256)):
             return orifra_frame
 
-        # --- EMA smooth facemark to prevent edge flickering ---
-        facemark_256 = self._smooth_landmarks(facemark_256)
-
-        # --- Create landmark-guided mask (cached — recompute only when landmarks shift) ---
-        if self._cached_mask is not None and self._cached_mask_facemark is not None:
-            max_shift = np.max(np.abs(facemark_256 - self._cached_mask_facemark))
-            if max_shift < self._mask_cache_tolerance:
-                mask_256 = self._cached_mask
+        # --- Get or generate mask ---
+        if precomputed_mask is not None:
+            mask_256 = precomputed_mask
+        else:
+            # Fallback: generate mask from facemark (legacy path)
+            facemark_256 = self._smooth_landmarks(facemark_256)
+            if self._cached_mask is not None and self._cached_mask_facemark is not None:
+                max_shift = np.max(np.abs(facemark_256 - self._cached_mask_facemark))
+                if max_shift < self._mask_cache_tolerance:
+                    mask_256 = self._cached_mask
+                else:
+                    mask_256 = self._create_mouth_mask(256, 256, facemark_256)
+                    self._cached_mask = mask_256
+                    self._cached_mask_facemark = facemark_256.copy()
             else:
                 mask_256 = self._create_mouth_mask(256, 256, facemark_256)
                 self._cached_mask = mask_256
                 self._cached_mask_facemark = facemark_256.copy()
-        else:
-            mask_256 = self._create_mouth_mask(256, 256, facemark_256)
-            self._cached_mask = mask_256
-            self._cached_mask_facemark = facemark_256.copy()
 
         # --- Resize rendered and mask to orifra crop scale ---
         crop_size_int = int(round(crop_size))

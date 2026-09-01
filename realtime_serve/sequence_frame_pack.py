@@ -46,20 +46,24 @@ class BatchPreloader:
     BATCH_SIZE = 100   # frames per batch
     NUM_BATCHES = 2    # window = current + next
 
-    def __init__(self, segment_cache: dict, device: str = 'cuda'):
+    def __init__(self, segment_cache: dict, device: str = 'cuda',
+                 compositor=None):
         """Initialize BatchPreloader.
 
         Args:
             segment_cache: Reference to CharacterDataPack._segment_cache
             device: Device for crop tensors
+            compositor: MouthCompositor instance for mask precomputation
         """
         self._segment_cache = segment_cache
         self._device = device
+        self._compositor = compositor
 
         # Batch buffers: [batch_slot][frame_offset] = data
         # Two slots for double-buffering
         self._orifra_bufs: List[Optional[List[np.ndarray]]] = [None, None]
         self._crop_bufs: List[Optional[torch.Tensor]] = [None, None]  # [B, 3, 256, 256]
+        self._mask_bufs: List[Optional[List[np.ndarray]]] = [None, None]  # precomputed masks
 
         # Each batch's start frame index
         self._batch_starts: List[int] = [-1, -1]
@@ -89,12 +93,15 @@ class BatchPreloader:
         self._segment = segment
         self._orifra_bufs = [None, None]
         self._crop_bufs = [None, None]
+        self._mask_bufs = [None, None]
         self._batch_starts = [-1, -1]
         self._current_slot = 0
         self._preload_target_start = -1
 
     def _load_batch_sync(self, slot: int, start_idx: int, segment: str):
         """Load a batch of frames into the specified slot (blocking).
+
+        Also precomputes mouth masks from facemark data if compositor is available.
 
         Args:
             slot: Buffer slot (0 or 1)
@@ -107,6 +114,9 @@ class BatchPreloader:
 
         orifra_list = []
         crop_list = []
+        mask_list = []
+
+        facemark_data = data.get('facemark')  # (total_frames, 68, 2)
 
         for i in range(count):
             idx = (start_idx + i) % total
@@ -126,12 +136,21 @@ class BatchPreloader:
             crop_tensor = (crop_tensor - 0.5) * 2.0  # normalize to [-1, 1]
             crop_list.append(crop_tensor)
 
+            # Precompute mask from facemark
+            if facemark_data is not None and self._compositor is not None:
+                fm = facemark_data[idx]  # (68, 2)
+                mask = self._compositor.generate_mask(fm)
+                mask_list.append(mask)
+            else:
+                mask_list.append(None)
+
         # Stack crop tensors and move to GPU in one transfer
         crop_batch = torch.stack(crop_list, dim=0).to(self._device)  # [B, 3, 256, 256]
 
         with self._preload_lock:
             self._orifra_bufs[slot] = orifra_list
             self._crop_bufs[slot] = crop_batch
+            self._mask_bufs[slot] = mask_list
             self._batch_starts[slot] = start_idx
 
     def _preload_worker(self, slot: int, start_idx: int, segment: str):
@@ -246,6 +265,25 @@ class BatchPreloader:
             return None
         return batch[offset:offset+1]  # [1, 3, 256, 256]
 
+    def get_mask(self, frame_idx: int) -> Optional[np.ndarray]:
+        """Get precomputed mouth mask from preloaded buffer.
+
+        Args:
+            frame_idx: Frame index
+
+        Returns:
+            mask (256, 256) float32, or None if not available
+        """
+        slot = self._current_slot
+        start = self._batch_starts[slot]
+        if start < 0 or not (start <= frame_idx < start + self.BATCH_SIZE):
+            return None
+        offset = frame_idx - start
+        masks = self._mask_bufs[slot]
+        if masks is None or offset >= len(masks):
+            return None
+        return masks[offset]
+
     @property
     def is_preloading(self) -> bool:
         """Whether a background preload is in progress."""
@@ -321,6 +359,14 @@ class CharacterDataPack:
         print(f'  -> Available segments: {self.segments}')
         print(f'  -> Current segment: {self.current_segment}')
         print(f'  -> Batch preload enabled (batch_size={batch_size}, window={batch_size*2})')
+
+    def set_compositor(self, compositor):
+        """Set the compositor for mask precomputation.
+
+        Call this after MouthCompositor is created to enable mask precomputation
+        during batch loading.
+        """
+        self._preloader._compositor = compositor
 
     def _get_segment_paths(self, segment: str) -> dict:
         """Get paths for a specific segment."""
@@ -457,11 +503,12 @@ class CharacterDataPack:
             idx: Frame index (can be any integer, will be modulo total_frames)
 
         Returns:
-            Tuple of (orifra, cropped, meta, facemark)
+            Tuple of (orifra, cropped, meta, facemark, mask)
                 - orifra: (H, W, 3) BGR uint8 numpy array
                 - cropped: [1, 3, 256, 256] float tensor in [-1, 1]
                 - meta: Single metadata entry (structured array)
                 - facemark: (68, 2) float32 numpy array
+                - mask: (256, 256) float32 precomputed mouth mask, or None
         """
         data = self._segment_cache[self.current_segment]
         actual = idx % data['total_frames']
@@ -481,11 +528,14 @@ class CharacterDataPack:
             tensor = (tensor - 0.5) * 2.0
             cropped = tensor.unsqueeze(0).to(self.device)
 
+        # Get precomputed mask from buffer
+        mask = self._preloader.get_mask(actual)
+
         # Already in memory
         meta = data['metadata'][actual]
         facemark = data['facemark'][actual]
 
-        return (orifra, cropped, meta, facemark)
+        return (orifra, cropped, meta, facemark, mask)
 
     @property
     def total_frames(self) -> int:

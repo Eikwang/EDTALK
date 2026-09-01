@@ -16,6 +16,8 @@ class Config:
     target_fps: int = 25
     cap_num: int = 0
     batch_size: int = 100  # frames per preload batch (window = 2 × batch_size)
+    face_repair_enabled: bool = True  # enable face repair post-processing
+    gaze_correction_enabled: bool = False  # enable gaze correction (placeholder)
 
     def __post_init__(self):
         """Validate paths after initialization."""

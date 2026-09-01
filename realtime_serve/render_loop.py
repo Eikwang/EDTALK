@@ -368,7 +368,7 @@ class RenderLoop:
             # No audio data — idle mode
             t0 = time.perf_counter()
             character_data.ensure_loaded(self._frame_index)
-            orifra, cropped, meta, facemark = character_data.get_frame(self._frame_index)
+            orifra, cropped, meta, facemark, pre_mask = character_data.get_frame(self._frame_index)
             t1 = time.perf_counter()
             alpha_D_lip = self._get_idle_lip_coeff()
             t2 = time.perf_counter()
@@ -385,13 +385,13 @@ class RenderLoop:
             else:
                 t3 = time.perf_counter()
 
-            # [DISABLED] Face repair bypassed for sync testing
-            # if self.face_repair is not None and rendered_np is not None:
-            #     rendered_np = self.face_repair.repair(rendered_np)
+            if self.face_repair is not None and rendered_np is not None:
+                rendered_np = self.face_repair.repair(rendered_np)
 
             t4 = time.perf_counter()
             if self.compositor is not None and rendered_np is not None and facemark is not None:
-                composited = self.compositor.composite(orifra, rendered_np, facemark, meta)
+                composited = self.compositor.composite(orifra, rendered_np, facemark, meta,
+                                                       precomputed_mask=pre_mask)
             else:
                 composited = orifra
             t5 = time.perf_counter()
@@ -418,7 +418,7 @@ class RenderLoop:
 
         t0 = time.perf_counter()
         character_data.ensure_loaded(lip_idx)
-        orifra, cropped, meta, facemark = character_data.get_frame(lip_idx)
+        orifra, cropped, meta, facemark, pre_mask = character_data.get_frame(lip_idx)
         t1 = time.perf_counter()
 
         self._debug_real_frames += 1
@@ -437,13 +437,13 @@ class RenderLoop:
         else:
             t2 = time.perf_counter()
 
-        # [DISABLED] Face repair bypassed for sync testing
-        # if self.face_repair is not None and rendered_np is not None:
-        #     rendered_np = self.face_repair.repair(rendered_np)
+        if self.face_repair is not None and rendered_np is not None:
+            rendered_np = self.face_repair.repair(rendered_np)
 
         t3 = time.perf_counter()
         if self.compositor is not None and rendered_np is not None and facemark is not None:
-            composited = self.compositor.composite(orifra, rendered_np, facemark, meta)
+            composited = self.compositor.composite(orifra, rendered_np, facemark, meta,
+                                                   precomputed_mask=pre_mask)
         else:
             composited = orifra
         t4 = time.perf_counter()
