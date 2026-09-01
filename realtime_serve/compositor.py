@@ -148,54 +148,43 @@ class MouthCompositor:
                 self._cached_mask = mask_256
                 self._cached_mask_facemark = facemark_256.copy()
 
-        # --- Resize rendered and mask to orifra crop scale ---
+        # --- Blend at 256x256 first, then resize result (much faster) ---
+        # Instead of resizing rendered+mask to 1268x1268 and blending there (1.6M px float32),
+        # we blend at 256x256 (65K px float32) and resize the composited result.
         crop_size_int = int(round(crop_size))
         if crop_size_int <= 0:
             return orifra_frame
 
-        rendered_resized = cv2.resize(rendered_frame_256, (crop_size_int, crop_size_int),
-                                      interpolation=cv2.INTER_LINEAR)
-        mask_resized = cv2.resize(mask_256, (crop_size_int, crop_size_int),
-                                  interpolation=cv2.INTER_LINEAR)
-
-        # --- Compute crop region bounds ---
+        # Extract ori crop at original resolution (for resize target)
         x1 = int(round(crop_x))
         y1 = int(round(crop_y))
         x2 = x1 + crop_size_int
         y2 = y1 + crop_size_int
 
-        # Clamp to frame boundaries
         x1_c = max(0, x1)
         y1_c = max(0, y1)
         x2_c = min(orifra_frame.shape[1], x2)
         y2_c = min(orifra_frame.shape[0], y2)
 
-        # Corresponding region in resized images
-        rx1 = x1_c - x1
-        ry1 = y1_c - y1
-        rx2 = rx1 + (x2_c - x1_c)
-        ry2 = ry1 + (y2_c - y1_c)
-
-        if rx2 <= rx1 or ry2 <= ry1:
+        # Resize ori crop to 256x256 (for blending at low resolution)
+        crop_w = x2_c - x1_c
+        crop_h = y2_c - y1_c
+        if crop_w <= 0 or crop_h <= 0:
             return orifra_frame
 
-        local_mask = mask_resized[ry1:ry2, rx1:rx2]
+        ori_crop_256 = cv2.resize(orifra_frame[y1_c:y2_c, x1_c:x2_c],
+                                  (256, 256), interpolation=cv2.INTER_LINEAR)
 
-        # Skip if mask is all zero
-        if np.max(local_mask) < 1e-6:
-            return orifra_frame
+        # Blend at 256x256 (only 65K pixels × 3ch float32 — very fast)
+        mask_3ch = np.stack([mask_256] * 3, axis=-1)
+        blended_256 = (rendered_frame_256.astype(np.float32) * mask_3ch +
+                       ori_crop_256.astype(np.float32) * (1.0 - mask_3ch))
+        blended_256 = blended_256.astype(np.uint8)
 
-        # Extract only the crop region from orifra (small slice, not full frame copy)
-        target_region = orifra_frame[y1_c:y2_c, x1_c:x2_c].copy()
-        rendered_region = rendered_resized[ry1:ry2, rx1:rx2]
-
-        # Blend: rendered * mask + orifra * (1 - mask)
-        mask_3ch = np.stack([local_mask] * 3, axis=-1)
-        blended = (rendered_region.astype(np.float32) * mask_3ch +
-                   target_region.astype(np.float32) * (1.0 - mask_3ch))
-
-        # Assign back to crop region of original frame (no full-frame copy needed)
-        orifra_frame[y1_c:y2_c, x1_c:x2_c] = blended.astype(np.uint8)
+        # Resize composited result back to ori crop size and assign
+        blended_full = cv2.resize(blended_256, (crop_w, crop_h),
+                                  interpolation=cv2.INTER_LINEAR)
+        orifra_frame[y1_c:y2_c, x1_c:x2_c] = blended_full
 
         return orifra_frame
 
