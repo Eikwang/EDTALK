@@ -236,6 +236,15 @@ class RenderLoop:
         self._debug_audio_chunks += 1
         self._idle_lip_cache_valid = False
 
+        # Pad audio to match video segment length to prevent lip exhaustion
+        with self._segment_lock:
+            video_total = self._character_data.total_frames if self._character_data else 0
+        if video_total > 0:
+            expected_samples = int(video_total / self.target_fps *16000)
+            if len(pcm_float) < expected_samples:
+                pcm_float = np.pad(pcm_float, (0, expected_samples - len(pcm_float)),
+                                   mode='constant', constant_values=0.0)
+
         # Run Audio2Lip on full audio (same as demo)
         mel_input, bs, T = self.audio_processor.pcm_to_mel(pcm_float)
 
@@ -310,14 +319,9 @@ class RenderLoop:
             if frame_idx < 0:
                 frame_idx = 0
             if frame_idx >= self._total_lip_frames:
-                # Audio segment finished
-                print(f"[RenderLoop] Lip coefficients exhausted: elapsed={elapsed:.3f}s, "
-                      f"frame_idx={frame_idx}, total={self._total_lip_frames}, "
-                      f"lip_duration={self._total_lip_frames/self.target_fps:.3f}s")
-                self._lip_coeffs = None
-                self._total_lip_frames = 0
-                self._audio_start_time = 0.0
-                return None
+                # Audio finished — hold last lip position instead of switching to idle
+                last_idx = self._total_lip_frames - 1
+                return (self._lip_coeffs[last_idx:last_idx+1], last_idx)
 
             return (self._lip_coeffs[frame_idx:frame_idx+1], frame_idx)
 
@@ -415,6 +419,12 @@ class RenderLoop:
         # --- Render frame with audio-synced lip coefficient ---
         alpha_D_lip, lip_idx = lip_result
         self._last_rendered_lip_idx = lip_idx
+
+        # Clamp lip_idx to valid segment range to prevent segment wrap
+        with self._segment_lock:
+            total = self._character_data.total_frames if self._character_data else 0
+        if total > 0 and lip_idx >= total:
+            lip_idx = lip_idx % total
 
         t0 = time.perf_counter()
         character_data.ensure_loaded(lip_idx)

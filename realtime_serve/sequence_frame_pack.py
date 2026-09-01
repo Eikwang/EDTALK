@@ -64,6 +64,7 @@ class BatchPreloader:
         self._orifra_bufs: List[Optional[List[np.ndarray]]] = [None, None]
         self._crop_bufs: List[Optional[torch.Tensor]] = [None, None]  # [B, 3, 256, 256]
         self._mask_bufs: List[Optional[List[np.ndarray]]] = [None, None]  # precomputed masks
+        self._facemark_bufs: List[Optional[List[np.ndarray]]] = [None, None]  # stored facemark for mask recompute
 
         # Each batch's start frame index
         self._batch_starts: List[int] = [-1, -1]
@@ -94,6 +95,7 @@ class BatchPreloader:
         self._orifra_bufs = [None, None]
         self._crop_bufs = [None, None]
         self._mask_bufs = [None, None]
+        self._facemark_bufs = [None, None]
         self._batch_starts = [-1, -1]
         self._current_slot = 0
         self._preload_target_start = -1
@@ -115,6 +117,7 @@ class BatchPreloader:
         orifra_list = []
         crop_list = []
         mask_list = []
+        facemark_list = []
 
         facemark_data = data.get('facemark')  # (total_frames, 68, 2)
 
@@ -144,6 +147,12 @@ class BatchPreloader:
             else:
                 mask_list.append(None)
 
+            # Store facemark for later mask recomputation
+            if facemark_data is not None:
+                facemark_list.append(facemark_data[idx])
+            else:
+                facemark_list.append(None)
+
         # Stack crop tensors and move to GPU in one transfer
         crop_batch = torch.stack(crop_list, dim=0).to(self._device)  # [B, 3, 256, 256]
 
@@ -151,6 +160,7 @@ class BatchPreloader:
             self._orifra_bufs[slot] = orifra_list
             self._crop_bufs[slot] = crop_batch
             self._mask_bufs[slot] = mask_list
+            self._facemark_bufs[slot] = facemark_list
             self._batch_starts[slot] = start_idx
 
     def _preload_worker(self, slot: int, start_idx: int, segment: str):
@@ -284,6 +294,27 @@ class BatchPreloader:
             return None
         return masks[offset]
 
+    def recompute_current_masks(self):
+        """Recompute masks for the currently loaded batch using the compositor.
+
+        Call this after setting the compositor to generate masks for
+        frames that were loaded before the compositor was available.
+        """
+        if self._compositor is None:
+            return
+        slot = self._current_slot
+        facemark_data = self._facemark_bufs[slot]
+        if facemark_data is None:
+            return
+        mask_list = []
+        for fm in facemark_data:
+            if fm is not None:
+                mask = self._compositor.generate_mask(fm)
+                mask_list.append(mask)
+            else:
+                mask_list.append(None)
+        self._mask_bufs[slot] = mask_list
+
     @property
     def is_preloading(self) -> bool:
         """Whether a background preload is in progress."""
@@ -367,6 +398,8 @@ class CharacterDataPack:
         during batch loading.
         """
         self._preloader._compositor = compositor
+        # Recompute masks for already-loaded frames
+        self._preloader.recompute_current_masks()
 
     def _get_segment_paths(self, segment: str) -> dict:
         """Get paths for a specific segment."""
