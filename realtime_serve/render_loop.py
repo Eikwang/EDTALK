@@ -377,11 +377,11 @@ class RenderLoop:
             if self.model_manager is not None and cropped is not None and alpha_D_lip is not None:
                 rendered = self.model_manager.infer_frame(cropped, alpha_D_lip, cropped)
                 t3 = time.perf_counter()
-                # Do scaling on GPU before .cpu() to minimize CPU work after sync
+                # Do ALL processing on GPU before .cpu() to minimize CPU work after sync
                 rendered_np = rendered.clamp(-1, 1)
-                rendered_np = (rendered_np[0] * 127.5 + 127.5).to(torch.uint8).cpu()
-                rendered_np = rendered_np.permute(1, 2, 0).numpy()
-                rendered_np = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
+                rendered_np = (rendered_np[0] * 127.5 + 127.5).to(torch.uint8)
+                rendered_np = rendered_np[[2, 1, 0], :, :]  # RGB→BGR on GPU
+                rendered_np = rendered_np.permute(1, 2, 0).cpu().numpy()
             else:
                 t3 = time.perf_counter()
 
@@ -431,9 +431,10 @@ class RenderLoop:
             rendered = self.model_manager.infer_frame(img_source, alpha_D_lip, pose_img_drive)
             t2 = time.perf_counter()
 
-            rendered_np = rendered.clamp(-1, 1).cpu()
-            rendered_np = (rendered_np[0] * 127.5 + 127.5).permute(1, 2, 0).to(torch.uint8).numpy()
-            rendered_np = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
+            rendered_np = rendered.clamp(-1, 1)
+            rendered_np = (rendered_np[0] * 127.5 + 127.5).to(torch.uint8)
+            rendered_np = rendered_np[[2, 1, 0], :, :]  # RGB→BGR on GPU
+            rendered_np = rendered_np.permute(1, 2, 0).cpu().numpy()
         else:
             t2 = time.perf_counter()
 
