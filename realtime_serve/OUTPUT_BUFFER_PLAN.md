@@ -786,3 +786,89 @@ resend 仍恰一次、timeBeginPeriod 冒烟。已更新测试计划产物。
 | D9 | ENG | 端到端序列号不变式 = 合并门禁 | Mechanical | P1 | 唯一卖点必须可验证 | — |
 | D10 | ALL | **缓冲深度/是否 seq 重写/实施顺序** | **USER CHALLENGE** | — | CEO 声部+ENG 推论挑战用户原案顺序与深度 | — |
 | D11 | ALL | buffer-size 默认 50 vs 浅缓冲默认 | Taste→门 | — | 与 D10 绑定 | — |
+| D12 | 门 | **裁决：方案 B（分阶路线）**——T0 实测+根因三件套+浅 FIFO；seq 重写移入二阶段待命 | 用户裁决 | — | 用户在最终门选择 B | A、C |
+
+---
+
+# 最终门裁决（Phase 4 CLOSED）
+
+**用户裁决：方案 B（分阶路线）。**
+
+## 裁决后的架构定案（阶段 1）
+
+```
+API ─▶ RenderLoop(生产,不限速) ─put─▶ FrameBuffer(默认8帧,环形预分配) ─get─▶ OutputStreamer(唯一时钟) ─▶ UnityCaptureSender(同步sink)
+ │                                      ▲                                    │
+ ▼                                      └── flush: 新音频push/段切换时        ├─ 段首帧→audio_start回调
+ AudioPlayer                                              ┌───────────────────┘
+   ▲                                                      ▼
+   └────────────────── push_pcm（pop 到段首帧时刻）      vcam.send / 空则重发
+```
+
+**唇同步机制（阶段 1，无 seq 重写）**：保留墙钟唇选择——它有帧级自愈性
+（丢帧后下一帧自动追上当前音频位置）。缓冲深度补偿挂在现有扣减点：
+```python
+elapsed = self._get_audio_elapsed() - self._output_latency() - self._buffer_latency_s()
+# _buffer_latency_s() = 当前稳态深度 / target_fps（约 0.32s @ 8帧）
+```
+生产侧前视补偿：帧将在 now + depth/fps 上屏，video_idx / lip elapsed 按
+显示时刻计算。浅缓冲下偏移 ≤0.32s << 现有 1s 宽限期 → F12 类问题不存在。
+
+## 阶段 1 任务清单（最终）
+
+- [ ] **T0 (P1)** — timeBeginPeriod(1)/timeEndPeriod 配对 + 语音模式产能与
+  停顿分布实测（p50/p95/p99/最长停顿、回填期 p99 send，≥10min）→ 报告落盘
+- [ ] **T0b (P1)** — 根因三件套：face_repair ONNX 预热/IOBinding（消 60 帧周期
+  16ms 尖峰）+ GPU→CPU 与 compositor CUDA stream 拆锁（消 batch 边界 19fps
+  下探）（PERFORMANCE_REPORT.md:177-179）
+- [ ] **T1 (P1)** — FrameBuffer：浅缓冲默认 8 帧（≤300 校验、F8）、环形预分配
+  （F5）、flush（保留 5 帧 reserve，F9）、close 唤醒（F18）
+- [ ] **T1b (P1)** — OutputStreamer：唯一 pacing 时钟（时钟驱动 tick，F13）、
+  **无条件存在**（--no-unitycapture 时 pop 后丢弃，F7）、段首帧 audio_start
+  回调、空 tick 重发+underrun 计数（恢复 ≥1 帧即续，重武装 ≤4 帧，F14）、
+  回填限速 ≤2×target_fps（F16）、preroll 进度行（F10）
+- [ ] **T2 (P1, 缩减)** — render_loop：去生产 pacing；缓冲深度前视补偿
+  （挂 _output_latency() 扣减点）；flush 触发（新音频 push + 段切换，F15-lite）；
+  停止序接线（buffer.close() 先行，F18）。**无 seq 重写、视频时钟不变**
+- [ ] **T3 (P1)** — unity_capture：移除内部线程与 latest-wins → 同步 sink
+- [ ] **T5 (P2)** — --buffer-frames（默认 8，写明单位/内存换算）+ --preroll-frames
+  （默认 4，≤buffer 校验）+ timeBeginPeriod 失败警告 + **7 处文档更新** +
+  启动 banner（语义变更+内存+延迟回显）
+- [ ] **T6 (P2)** — /status：production_fps/output_fps/buffer_depth/underruns/
+  preroll_state/缓冲满告警；旧 fps=output_fps 别名一版（F11）
+- [ ] **T7 (P2, 缓行)** — 漂移校正暂缓：浅缓冲+墙钟自愈下 2s 测量周期的校正
+  弊大于利（ENG 1.4 振荡风险）；若 T0 报告显示长时漂移显著再启用
+- [ ] **T8 (P1)** — 测试：FIFO/背压/flush/close 唤醒/pacing/underrun 恢复/
+  audio_start 恰一次/无摄像头路径/preroll 校验拒绝 + 墙钟唇同步端到端测试
+  （合并门禁）+ 既有 t5/t6 改造
+- [ ] **T9 (P2)** — realtime_serve/RUNBOOK.md：欠载/缓冲满处置、preroll 捷径、
+  参数单位表
+
+## 二阶段待命（T0 数据触发）
+
+序列号重写 + 深缓冲完整方案（本文件 F1-F20 + 序列号设计即为施工图）。
+触发条件（满足其一）：① T0 实测语音模式持续 <25fps（缓冲无法弥补产能缺口）；
+② 阶段 1 上线一周后 underrun 统计显示 p99 停顿 >0.3s 且根因不可再修；
+③ 需求升级为 >1s 抖动吸收。
+
+## TODOS（跨阶段汇总）
+
+- E3 自适应 preroll（需运行遥测）
+- E4 帧时间直方图 metrics（需运行遥测）
+- Generator 批量推理 / TensorRT/fp16（模型层，T0 数据后决策优先级）
+- 二阶段：序列号重写+深缓冲（触发条件如上）
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/autoplan` Phase 1 | 范围与战略 | 1 | issues_open→closed | 9 声部发现（3 critical 证据核实）；6 项修正 F1-F6 |
+| Codex Review | 未运行 | Codex CLI 未安装 | 0 | unavailable | 降级为 Claude 子代理 [subagent-only] |
+| Eng Review | `/autoplan` Phase 3 | 架构与测试（必需门） | 1 | issues_open→closed | 2 critical + 4 high；F12-F20；测试门禁确立 |
+| Design Review | 跳过 | 无 UI 范围 | 0 | skipped | — |
+| DX Review | `/autoplan` Phase 2.5 | 开发者体验 | 1 | 7.4→8.9/10 | 16 发现（4 高）；F7-F11、T5 七处文档 |
+
+- **CROSS-MODEL:** 三阶段独立命中同一主题（flush 空窗/重武装风险 ×3、无摄像头路径 ×2、内存总账 ×2）——高置信信号
+- **VERDICT:** CEO + ENG + DX CLEARED（经最终门裁决方案 B 后全部发现已处置）— ready to implement
+
+NO UNRESOLVED DECISIONS
