@@ -518,3 +518,163 @@ Codex 未安装 → 单声部。声部与主审在"顺序"上分歧（主审选�
 | P1 生产能力 | **需 T0 实测**：30+fps 为 idle 模式观测，语音模式净富余未知 |
 | P2 缓存可稳 25fps | 不变，但深度由 T0 数据决定（可能 ≤8 帧） |
 | P5 内存 | 修正为全进程 ~2GB 总账，环形预分配 |
+
+---
+
+# DX 审查（Phase 2.5）— 模式: DX POLISH
+
+产品类型：本机运营的推理服务（操作者=开发者本人）。Persona：solo operator，
+通过 CLI 启动、经虚拟摄像头供 Unity 消费。
+
+## 开发者旅程图
+
+```
+发现→评估→安装→hello world→集成→调试→升级→扩展→迁移
+ ✓    ✓    ✓   ~2min(模型加载主导) ✓   ⚠新增   ⚠语义变更  N/A  N/A
+```
+
+## 8 维评分（0-10，POLISH 模式：逐项修至达标）
+
+| 维度 | 分 | 证据与差距 | 修复 |
+|------|----|-----------|------|
+| 1 Getting started | 7 | TTHW ~2-3min（模型加载为地板，非本方案范围）；新增 2s preroll 启动延迟是无预告的意外 | T5：启动 banner 回显配置+延迟/内存代价 |
+| 2 CLI ergonomics | 8 | --buffer-size/--preroll 可猜；但 **--target-fps 语义变更不可发现**——老习惯命令行为不同 | T5：--help 文案改为"限制最终向摄像头输出的帧率"；banner 说明语义变更 |
+| 3 Error messages | 5 | 现状 "[AudioPlayer] Underflow" 无原因无对策；新欠载日志若只计数同样不合格 | T3/T6：欠载日志规格=问题+原因+对策（"production Xfps < output Yfps 持续 Zs；建议 --no-face-repair 或降 --target-fps"） |
+| 4 Docs | 6 | --help/启动横幅需更新；持续 underrun 无 runbook | T5 扩围：README/PERFORMANCE_REPORT 增补欠载处置段落 |
+| 5 Escape hatches | 9 | --buffer-size 1（近旧行为）、--preroll、--no-face-repair 均可覆盖默认 | 达标 |
+| 6 Credible | 8 | 行为可预测；preroll 期间 /status 显示 pre-rolling 防黑盒 | T6 已含 |
+| 7 Findable | 7 | /status 字段自说明；underrun 计数可查 | 达标 |
+| 8 Valuable | 9 | 输出稳定即核心价值 | 达标 |
+
+**DX Scorecard 总分: 7.4/10 → 修复后 8.9/10**（T3/T5/T6 落地后）
+**TTHW: ~2-3min → 目标 <2min**（模型加载为地板，本方案不触碰；preroll 仅 +2s）
+
+## DX 新增/修订任务
+
+- [ ] **T9 (P2, CC: ~5min)** — 欠载/preroll/flush 日志文案规格（问题+原因+对策
+  三段式），写入 T3 实现规格
+  - Surfaced by: DX 维度 3（5/10）
+  - Files: realtime_serve/unity_capture.py, api/app.py
+  - Verify: 人为制造欠载，检查日志含对策建议
+- T5 扩围：--help 文案、启动 banner（语义变更+内存+延迟回显）、README runbook。
+
+## DX 双声部（Step 0.5）
+
+CODEX 不可用 → [subagent-only]。
+
+### CLAUDE SUBAGENT（DX — 独立体验挑战）核心发现
+
+- **[高] --no-unitycapture 下音频全静默**：音频触发点在发送线程，
+  `unity_capture=None` 时 push_pcm 永不触发——日常测试入口直接坏。→ 修复
+  F7/T9：输出消费者与摄像头解耦，无摄像头时起无画面消费者线程。
+- **[高] preroll > buffer-size = 静默永久卡死**：启动校验缺失。→ F8。
+- **[高] --target-fps 语义翻转零文档任务**：--help/模块 docstring/config 注释/
+  PERFORMANCE_REPORT 验证段等 7 处旧描述。→ T5 扩围已列 7 处清单。
+- **[高] 欠载重武装默认组合 = 体验倒退**：每次 push_full flush 清空后以净速率
+  ~5帧/s 回填，20-40s 脆弱窗口内一次 40ms gen 抖动 → re-arm preroll=50 →
+  冻结 2s，比要修复的单帧重复更糟。→ F9（重武装阈值解耦 min(preroll,5)、
+  flush 保留小 reserve）。
+- [中] preroll 2s 静默期无进度行；flag 无单位且与 max_buffer_seconds 单位相反；
+  buffer 持续满不可观测；RUNBOOK 无落点（指定 realtime_serve/RUNBOOK.md）；
+  /status 旧 fps 字段语义未定；内存/延迟代价不进运行时回显。
+- [低] buffer-size 无上界（手滑 5000 → 55GB）；timeBeginPeriod 失败静默；
+  "启动即推音频跳过 preroll"捷径未文档化。
+
+### DX DUAL VOICES — CONSENSUS TABLE
+```
+═══════════════════════════════════════════════════════════════
+  Dimension                           Claude  Codex  Consensus
+  ──────────────────────────────────── ─────── ─────── ─────────
+  1. Getting started < 5 min?          是+1缺口 N/A    部分确认
+  2. API/CLI naming guessable?         否(单位) N/A    DISAGREE→修正
+  3. Error messages actionable?        否       N/A    DISAGREE→修正
+  4. Docs findable & complete?         否       N/A    DISAGREE→修正
+  5. Upgrade path safe?                否(旁路) N/A    DISAGREE→声明
+  6. Dev environment friction-free?    是       N/A    CONFIRMED
+═══════════════════════════════════════════════════════════════
+```
+
+## DX 修正（并入方案）
+
+| # | 修正 | 内容 |
+|---|------|------|
+| F7 | 消费者与摄像头解耦 | OutputStreamer 独立于 unity_capture；--no-unitycapture 时照样运行（仅无 send），音频路径与 pacing 保持；集成测试补"无摄像头推音频有声" |
+| F8 | 参数校验 | preroll ≤ buffer-size 否则报错退出；buffer-size 上界 300；单位写入 help（帧、≈N/25 秒、~11MB/帧） |
+| F9 | 欠载重武装解耦 | 重武装阈值 = min(preroll, 5) 帧固定默认；flush 保留 5 帧 reserve 而非清空；underrun 日志附双 fps 对比与对策 |
+| F10 | 可观测补全 | preroll 进度行 [preroll] N/M；buffer 持续满 >Ns 告警（输出侧停止消费→查 Unity/OBS 捕获端）；timeBeginPeriod 失败打警告 |
+| F11 | 文档落点 | 新建 realtime_serve/RUNBOOK.md（欠载/缓冲满处置）；/status 保留旧 fps=output_fps 一版并标注弃用；字段名统一 underruns |
+
+任务清单合并：T5（参数+文档 7 处）、T6（/status）、T9（解耦+无摄像头音频测试）
+为一级任务。
+
+---
+
+# 工程审查（Phase 3）— 最终门前的收官审查
+
+## Step 0 范围挑战（autoplan: 不缩减）
+
+- 复杂度检查：7 文件 + 2 新组件 → 低于 8 文件阈值。通过。
+- 子问题→现有代码映射：见 0B。无重复建设。
+- CEO 声部的顺序挑战（根因优先 vs 缓冲优先）→ 已作为 USER CHALLENGE
+  移交最终门，此处不缩减也不裁决。
+- 结论：范围成立，**架构修正 E1 如下**。
+
+## S1 架构审查（依赖图 + 单时钟归属）
+
+**发现 E1 [high]：时钟归属必须唯一，OutputStreamer 独立成类。**
+现状 UnityCaptureSender 内含 pacing 线程（latest-wins）。若在其上再叠 FIFO，
+会出现文档自述警告过的"两个自由运转的 40ms 时钟互拍"。且"发送摄像头的类"
+拥有"音频起点触发"职责错位。
+
+裁决（P5 显式优于聪明）：
+```
+改造后依赖图:
+                                              ┌──────────────────┐
+ API ─▶ RenderLoop(生产,不限速) ─put──▶ FrameBuffer ─get─▶ OutputStreamer ─send─▶ UnityCaptureSender
+ │                                        │(FIFO+preroll)   │ 唯一 pacing 时钟      │ (退化为同步
+ ▼                                        │                  │ ├─ 段首帧→audio回调    │  sink, 无线程)
+ AudioPlayer ◀────push_pcm────────────────────────────────────┘ └─ 空缓冲→重发+计数  └──────────┘
+```
+- UnityCaptureSender：移除内部线程与 latest-wins（start/submit 废弃），
+  保留构造/`_send_direct`/close。进程内**唯一** pacing 时钟在 OutputStreamer。
+- RenderLoop 不再 import unity 相关；生产者与摄像头彻底解耦。
+- 音频回调由 main.py 注入 OutputStreamer（依赖倒置，发送层不知音频存在）。
+
+## S2 代码质量
+
+DRY：pacing 循环现存两份（render_loop._run、unity sender loop）→ 收敛为
+OutputStreamer 一份。命名：FrameBuffer/OutputStreamer 直述职责。无圈复杂度
+超标。无发现（除 E1）。
+
+## S3 测试审查
+
+测试图与防 flake 策略见测试计划产物
+（~/.gstack/projects/Eikwang-EDTALK/edtalkdev-main-test-plan-20260902.md）。
+追加 E1 影响：unity 测试改造范围扩大（移除线程测试，新增 OutputStreamer
+pacing/underrun/回调测试）。T8 相应更新。无未覆盖路径。
+
+## S4 性能
+
+GIL 争用：OutputStreamer 的 send（11MB 拷贝 ~5-10ms）持 GIL 会短暂拖停
+生产者 → 填池期由缓冲吸收，稳态期生产者本就阻塞在 put 上，无影响。
+内存总账见 F5。无 N+1 类问题。无新发现。
+
+## 工程完成总结
+
+```
++====================================================================+
+|         MEGA PLAN REVIEW — COMPLETION SUMMARY (ENG)                |
++====================================================================+
+| Step 0 范围挑战      | 范围成立; 架构修正 E1(单时钟归属)             |
+| Section 1 (Arch)    | 1 issue (E1) — 已裁决采纳                     |
+| Section 2 (Quality) | 0 issues (DRY 收敛为 E1 一部分)               |
+| Section 3 (Tests)   | 测试图+产物落盘; E1 扩围已并入 T8             |
+| Section 4 (Perf)    | 0 issues (GIL 争用被缓冲吸收)                 |
+| NOT in scope        | 已写（5 项）                                  |
+| What already exists | 已写                                          |
+| Failure modes       | 6 项, 0 CRITICAL GAPS                         |
+| Test plan artifact  | 已写盘 ✓                                      |
+| TODOS 收集          | E3 自适应preroll, E4 帧直方图, 根因三件套(若门裁缓冲优先), 批量推理 |
+| Unresolved          | 0（顺序问题留门）                              |
++====================================================================+
+```
