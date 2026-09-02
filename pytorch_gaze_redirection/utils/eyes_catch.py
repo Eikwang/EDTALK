@@ -31,7 +31,9 @@ def eyes_catch(hps, file_name):
     # Iterate through each image in the folder
     valid_extensions = {".jpg", ".png"} # Supported image formats
     file_path = os.path.join(DATA_PATH, file_name)
-    
+    dets = []
+    img = None
+
     # Check if the file is an image
     if os.path.isfile(file_path) and os.path.splitext(file_name)[1].lower() in valid_extensions:
         try:
@@ -55,6 +57,9 @@ def eyes_catch(hps, file_name):
     eyes_position = []
 
     size = []
+
+    if img is None or len(dets) == 0:
+        return None, None, None
 
     # Iterate through each detected face
     for i, d in enumerate(dets):

@@ -1,0 +1,84 @@
+{
+  "name": "audio2lip-training-optimization",
+  "id": "audio2lip-training-optimization",
+  "description": "调查audio2lip微调模型的训练流程，分析训练速度慢和效果提升不明显的问题，提出优化方案",
+  "captainSessionId": "session-5335dd1b-0219-4ea5-b001-42201985a777",
+  "createdAt": 1787799819423,
+  "members": [
+    {
+      "id": "a1f9266a-9be4-407d-8b11-d3b573983356",
+      "name": "训练代码分析员",
+      "role": "分析训练代码逻辑，找出优化点",
+      "provider": "xiaomi-token-plan-cn",
+      "model": "mimo-v2.5-pro",
+      "reasoningEffort": "high",
+      "joinedAt": 1787799825346,
+      "status": "idle"
+    },
+    {
+      "id": "8395f113-20e8-40e5-a6b1-0cfc7e069c52",
+      "name": "训练日志分析员",
+      "role": "分析训练日志，找出性能瓶颈",
+      "provider": "xiaomi-token-plan-cn",
+      "model": "mimo-v2.5-pro",
+      "reasoningEffort": "high",
+      "joinedAt": 1787799825522,
+      "status": "idle"
+    },
+    {
+      "id": "f04fdff9-95bb-4316-b284-1c4248a9c8cb",
+      "name": "推理脚本分析员",
+      "role": "分析推理脚本，优化实时推理性能",
+      "provider": "xiaomi-token-plan-cn",
+      "model": "mimo-v2.5-pro",
+      "reasoningEffort": "high",
+      "joinedAt": 1787799825673,
+      "status": "idle"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "subject": "分析训练代码性能瓶颈",
+      "description": "详细分析 train_audio2mouth.py 和 trainer_audio2mouth.py 的训练逻辑，重点关注：\n1. DataLoader配置（num_workers=0的性能影响）\n2. VGG loss计算开销（4尺度x8次VGG19 forward）\n3. 梯度累积策略\n4. GPU利用率（当前仅0.6GB/13.5GB）\n5. 数据预加载和内存使用\n\n需要提供具体的优化建议和代码修改方案。",
+      "status": "completed",
+      "assignee": "训练代码分析员",
+      "dependencies": [],
+      "attempt": 1,
+      "createdAt": 1787799891339,
+      "updatedAt": 1787800026807,
+      "attemptId": "b11463da-b14a-4177-9292-a78d35a17169",
+      "reassigning": false,
+      "output": "\n## 训练代码性能瓶颈分析报告\n\n### 1. DataLoader配置 (num_workers=0)\n**现状**: \n- 所有DataLoader设置num_workers=0，主进程同步加载数据\n- 原因：Windows WDDM + LMDB mmap + CUDA三方冲突导致access violation\n- 注释说明CPU数据加载约10ms/batch，远小于GPU计算800ms/batch\n\n**性能影响**:\n- 数据加载与GPU计算串行执行，无法并行\n- 当batch_size=1时，数据加载开销相对较小\n- 但如果增大batch_size，数据加载可能成为瓶颈\n\n**优化建议**:\n- ✅ 当前设置是必要的Windows兼容性修复\n- 可考虑使用pin_memory=True提升CPU->GPU传输效率（已禁用）\n- 未来迁移到Linux可启用num_workers>0\n\n### 2. VGG Loss计算开销\n**现状** (vgg19.py):\n- 使用4尺度图像金字塔: [1, 0.5, 0.25, 0.125]\n- 每个尺度对recon和real图像各做一次VGG19 forward\n- VGG19有5个slice，提取5层特征\n- 权重: (10, 10, 10, 10, 10)\n\n**计算量**: 4 scales × 2 images × 5 layers = 40次loss计算/iter\n\n**优化建议**:\n- ✅ 已实现vgg_sparse_freq稀疏计算（每N iter算一次VGG，权重补偿×N）\n- 建议设置vgg_sparse_freq=30~100，可节省~97% VGG计算\n- 可进一步减少尺度数量（如只用[1, 0.5]两个尺度）\n- 可使用VGG特征缓存，避免重复forward\n\n### 3. 梯度累积策略\n**现状**:\n- accumulation_steps=4（默认）\n- 每4个batch执行一次optimizer step\n- 等效batch_size = batch_size × accumulation_steps = 1 × 4 = 4\n\n**分析**:\n- 标准技术，用于在有限显存下增大有效batch size\n- 当前实现正确：非step时保留梯度，step时清零\n\n**优化建议**:\n- ✅ 策略正确\n- 可根据GPU显存情况调整batch_size和accumulation_steps\n- 建议: batch_size=2, accumulation_steps=2 → 等效4\n\n### 4. GPU利用率 (0.6GB/13.5GB)\n**现状**:\n- batch_size=1（默认）\n- GPU显存占用仅0.6GB/13.5GB = 4.4%\n- 模型严重未充分利用GPU\n\n**原因分析**:\n- batch_size=1过小\n- 梯度累积虽增大等效batch size，但无法提升GPU并行度\n- VGG19计算密集但batch_size=1时并行度低\n\n**优化建议**:\n- 🔥 **关键优化**: 增大batch_size至4-8，显著提升GPU利用率\n- 调整accumulation_steps=1（如果batch_size足够大）\n- 监控显存使用，找到最优batch_size\n- 预期: batch_size=4可使GPU利用率提升至~2GB，仍有大量空间\n\n### 5. 数据预加载和内存使用\n**现状**:\n- 使用LMDB存储图像，按需读取\n- 特征文件(.npy)按需加载\n- 可选preload_features参数预加载特征到内存\n- 每个样本加载: audio(5帧mel) + lip(5帧) + pose(5帧) + bbox(5帧) + 6张图像(1 identity + 5 target)\n\n**内存占用**:\n- LMDB: 内存映射，按需加载，内存效率高\n- .npy文件: 每次__getitem__都从磁盘读取，I/O开销\n\n**优化建议**:\n- ✅ 已有preload_features选项，小数据集建议启用\n- 可实现特征缓存池，避免重复加载\n- 考虑将特征文件合并为单个大文件，减少文件打开次数\n\n### 综合优化方案\n\n**短期优化 (立即可行)**:\n1. 设置vgg_sparse_freq=50，节省98% VGG计算\n2. 增大batch_size=4，提升GPU利用率\n3. 调整accumulation_steps=1（batch_size增大后）\n\n**中期优化**:\n1. 实现特征预加载缓存池\n2. 减少VGG尺度数量至2个\n3. 优化数据加载pipeline\n\n**长期优化**:\n1. 迁移到Linux，启用多进程DataLoader\n2. 使用分布式训练\n3. 模型混合精度训练（已有AMP支持）\n\n### 代码修改建议\n\n1. **VGG稀疏计算优化** (train_audio2mouth.py):\n   ```python\n   parser.add_argument(\"--vgg_sparse_freq\", type=int, default=50, \n                       help=\"VGG稀疏计算频率，推荐30-100\")\n   ```\n\n2. **Batch size优化** (train_audio2mouth.py):\n   ```python\n   parser.add_argument(\"--batch_size\", type=int, default=4,\n                       help=\"批次大小，推荐4-8\")\n   parser.add_argument(\"--accumulation_steps\", type=int, default=1,\n                       help=\"梯度累积步数，batch_size增大后设为1\")\n   ```\n\n3. **数据加载优化** (dataset_audio2lip.py):\n   - 实现特征缓存机制\n   - 使用内存池减少I/O\n"
+    },
+    {
+      "id": "t2",
+      "subject": "分析训练日志找性能瓶颈",
+      "description": "分析 audio2lip_train.log 训练日志，重点关注：\n1. 各epoch的loss变化趋势（Epoch1: 42.88, Epoch2: 39.77, Epoch3: 38.47）\n2. 各loss分量的占比和变化（VGG loss占主导约40+）\n3. 训练速度（1.23 it/s）和时间消耗\n4. 内存使用模式（GPU仅0.6GB allocated）\n5. 评估阶段的时间开销\n\n需要识别主要性能瓶颈和loss收敛问题。",
+      "status": "completed",
+      "assignee": "训练日志分析员",
+      "dependencies": [],
+      "attempt": 1,
+      "createdAt": 1787799891459,
+      "updatedAt": 1787800008167,
+      "attemptId": "b000ed19-95ee-4b6e-97f0-bb7f44c52bea",
+      "reassigning": false,
+      "output": "训练日志分析完成。主要发现：\n1. VGG Loss主导（94.7%）：4尺度×8次VGG19前向传播/迭代，是主要计算瓶颈\n2. GPU严重低配：仅使用0.6GB/16GB（batch_size=4过小）\n3. 训练速度：1.20-1.23 it/s，每epoch约3.5小时\n4. Loss收敛良好：42.88→39.77→38.47（降10.3%），验证loss 36.23→31.56（降12.9%）\n5. 内存稳定：无泄漏，GPU预留13.5GB但仅分配0.6GB\n\n关键优化建议：\n- 批量大小增至8-16（2-4x加速）\n- VGG尺度从4减至2（~50%计算减少）\n- 使用混合精度训练（FP16，1.5-2x加速）\n- 总体预期：训练时间从18小时降至3-6小时"
+    },
+    {
+      "id": "t3",
+      "subject": "分析推理脚本和模型加载逻辑",
+      "description": "分析 demo_change_a_video_lip.py 推理脚本，重点关注：\n1. 模型加载逻辑：使用 EDTalk_lip_pose.pt 的 gen 权重，而非训练后的 dec 权重\n2. Audio2Lip模型的使用方式\n3. 视频帧处理和GPU内存使用\n4. 流式写入和时序平滑\n5. 与训练流程的一致性问题\n\n特别注意：推理时是否正确使用了训练后的模型权重。",
+      "status": "completed",
+      "assignee": "推理脚本分析员",
+      "dependencies": [],
+      "attempt": 1,
+      "createdAt": 1787799891594,
+      "updatedAt": 1787800704712,
+      "attemptId": "0687a42f-7d34-45d9-904a-3377873e6d48",
+      "reassigning": false,
+      "output": "## 推理脚本分析报告：demo_change_a_video_lip.py\n\n### 1. 模型加载逻辑分析\n\n**推理时加载的权重：**\n- Audio2Lip: 从 `ckpts/Audio2Lip.pt` 加载 [`audio2lip`] (93个参数键)\n- Generator: 从 `ckpts/EDTalk_lip_pose.pt` 加载 [`gen`] (195个参数键)\n- 推理脚本注释：\"使用预训练模型的 gen 权重（含原始 Decoder）；排查：训练后的 dec 权重可能导致嘴部僵硬\"\n\n**权重文件内容验证：**\n| 文件 | 包含键 | 说明 |\n|------|--------|------|\n| EDTalk_lip_pose.pt | gen, dis, g_optim, d_optim, args | 完整预训练模型（195个gen参数键） |\n| Audio2Lip.pt | audio2lip, args | 预训练Audio2Lip |\n| 训练检查点(052000.pt) | audio2lip, args, start_iter | 仅audio2lip，无gen |\n\n**关键发现：训练后的dec权重确实未被使用！**\n\n### 2. 训练-推理一致性问题\n\n**训练脚本问题（train/trainer_audio2mouth.py）：**\n1. **导入错误**：第8-9行导入 `networks_Lip_NonLip.generator`，但该目录不存在于当前项目\n2. **保存缺陷**：save方法（第355-365行）仅保存 `audio2lip`，不保存 `gen`\n3. **train_generator=True**：虽然设为True，但保存时未包含gen权重\n\n**fine_tune trainer（fine_tune/trainer_fine_tune.py）是正确的：**\n- 导入 `networks.generator_lip_pose.Generator` ✓\n- 保存 gen + dis + g_optim + d_optim ✓\n- 支持 only_fine_tune_dec 模式 ✓\n\n**Generator架构差异：**\n- `networks/generator.py`: 使用 `Synthesis` decoder（EDTalk-bak的训练脚本使用）\n- `networks/generator_lip_pose.py`: 使用 `Synthesis_lip_pose` decoder（推理脚本和fine_tune使用）\n\n**推理流程 vs 训练流程：**\n- 推理：audio→Audio2Lip→lip系数→Generator.test_from_audio_pose_image→图像\n- 训练：audio→Audio2Lip→lip预测 vs ground truth lip→loss→更新Audio2Lip\n- 一致性：推理流程正确使用了训练后的Audio2Lip模型\n\n### 3. 视频帧处理效率\n\n**PreloadedVideoReader（一次性加载到GPU）：**\n- 优点：零延迟读取\n- 缺点：长视频占用大量GPU显存（256x256×1000帧≈750MB）\n- 改进：应使用流式读取或分块加载\n\n**逐帧推理（无批处理）：**\n- 每帧调用一次 `gen.test_from_audio_pose_image()`\n- GPU利用率低，无法充分利用并行计算\n- 改进：批处理推理，一次处理多帧\n\n**视频写入：**\n- StreamingVideoWriter：逐帧写入，内存友好\n- 但每帧需要 GPU→CPU 数据传输\n\n### 4. 优化建议\n\n**紧急修复：**\n1. 修复 train/trainer_audio2mouth.py 的导入路径\n2. 修复 save 方法，确保保存 gen 权重\n\n**推理性能优化：**\n1. 批处理推理：一次处理4-8帧，提高GPU利用率\n2. 流式视频读取：替代PreloadedVideoReader，减少显存占用\n3. ONNX Runtime加速：将Generator导出为ONNX，减少推理延迟\n4. 异步流水线：推理和视频写入并行执行\n\n**模型加载优化：**\n1. 如果fine_tune训练了dec权重，应使用fine_tune的检查点而非EDTalk_lip_pose.pt\n2. 需要明确dec权重\"嘴部僵硬\"的具体原因并修复\n"
+    }
+  ],
+  "taskSeq": 3
+}

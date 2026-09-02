@@ -472,7 +472,7 @@ class ToFlow(nn.Module):
         self._cached_size_int = H
         return grid
 
-    def forward(self, input, style, feat, skip=None, return_mask=False):
+    def forward(self, input, style, feat, skip=None):
         out = self.conv(input, style)
         out = out + self.bias
 
@@ -490,8 +490,6 @@ class ToFlow(nn.Module):
 
         feat_warp = F.grid_sample(feat, flow, align_corners=True) * mask
 
-        if return_mask:
-            return feat_warp, feat_warp + input * (1.0 - mask), out, mask
         return feat_warp, feat_warp + input * (1.0 - mask), out
 
 
@@ -841,7 +839,7 @@ class Synthesis_lip_pose(nn.Module):
 
         self.n_latent = self.log_size * 2 - 2
 
-    def forward(self, wa, alpha, feats, return_masks=False):
+    def forward(self, wa, alpha, feats):
 
         # wa: bs x style_dim torch.Size([1, 512])
         # alpha: bs x style_dim 3个1*20的列表
@@ -855,31 +853,19 @@ class Synthesis_lip_pose(nn.Module):
         out = self.input(latent) # torch.Size([1, 512, 4, 4])
         out = self.conv1(out, latent[:, 0])
 
-        masks = [] if return_masks else None
-
         i = 1
         for conv1, conv2, to_rgb, to_flow, feat in zip(self.convs[::2], self.convs[1::2], self.to_rgbs,
                                                        self.to_flows, feats):
             out = conv1(out, latent[:, i])
             out = conv2(out, latent[:, i + 1])
             if out.size(2) == 8:
-                if return_masks:
-                    out_warp, out, skip_flow, layer_mask = to_flow(out, latent[:, i + 2], feat, return_mask=True)
-                    masks.append(layer_mask)
-                else:
-                    out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat)
+                out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat)
                 skip = to_rgb(out_warp)
             else:
-                if return_masks:
-                    out_warp, out, skip_flow, layer_mask = to_flow(out, latent[:, i + 2], feat, skip_flow, return_mask=True)
-                    masks.append(layer_mask)
-                else:
-                    out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat, skip_flow)
+                out_warp, out, skip_flow = to_flow(out, latent[:, i + 2], feat, skip_flow)
                 skip = to_rgb(out_warp, skip)
             i += 2
 
         img = skip
 
-        if return_masks:
-            return img, masks
         return img

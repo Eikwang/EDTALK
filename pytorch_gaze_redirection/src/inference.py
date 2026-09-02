@@ -17,7 +17,10 @@ CONVERGENCE_H = 0.05
 LANDMARK_MODEL = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                               'utils', 'eyes_catch_model',
                               'shape_predictor_68_face_landmarks.dat')
-EAR_BLINK = 0.12
+EAR_CLOSE = 0.12
+EAR_OPEN = 0.16
+OPEN_CONFIRM_FRAMES = 3
+MAX_BLINK_FRAMES = 26
 
 
 class GazeRedirectInference:
@@ -55,12 +58,8 @@ class GazeRedirectInference:
         self._fixed_eye_size = None
         self._cached_mask = None
         self._frame_count = 0
-        self._prev_ear_l = None
-        self._prev_ear_r = None
-        self._blink_frames_l = 0
-        self._blink_frames_r = 0
-        self._is_blinking_l = False
-        self._is_blinking_r = False
+        self._low_ear_count = 0
+        self._open_confirm_count = 0
 
     def reset(self):
         self._prev_left_center = None
@@ -68,12 +67,8 @@ class GazeRedirectInference:
         self._fixed_eye_size = None
         self._cached_mask = None
         self._frame_count = 0
-        self._prev_ear_l = None
-        self._prev_ear_r = None
-        self._blink_frames_l = 0
-        self._blink_frames_r = 0
-        self._is_blinking_l = False
-        self._is_blinking_r = False
+        self._low_ear_count = 0
+        self._open_confirm_count = 0
 
     def _detect_landmarks(self, frame_bgr):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -180,9 +175,6 @@ class GazeRedirectInference:
 
         lm_result = self._detect_landmarks(frame_bgr)
 
-        blink_l = False
-        blink_r = False
-
         if lm_result is None:
             if self._prev_left_center is not None and self._fixed_eye_size is not None:
                 l_cx, l_cy = self._prev_left_center
@@ -193,38 +185,7 @@ class GazeRedirectInference:
         else:
             left_pts, right_pts, l_ear, r_ear = lm_result
 
-            l_ear = self._smooth(l_ear, self._prev_ear_l, 0.5)
-            r_ear = self._smooth(r_ear, self._prev_ear_r, 0.5)
-            self._prev_ear_l = l_ear
-            self._prev_ear_r = r_ear
-
-            if not self._is_blinking_l:
-                if l_ear < EAR_BLINK:
-                    self._blink_frames_l += 1
-                else:
-                    self._blink_frames_l = 0
-                self._is_blinking_l = self._blink_frames_l >= 2
-            else:
-                if l_ear >= EAR_BLINK:
-                    self._is_blinking_l = False
-                    self._blink_frames_l = 0
-
-            if not self._is_blinking_r:
-                if r_ear < EAR_BLINK:
-                    self._blink_frames_r += 1
-                else:
-                    self._blink_frames_r = 0
-                self._is_blinking_r = self._blink_frames_r >= 2
-            else:
-                if r_ear >= EAR_BLINK:
-                    self._is_blinking_r = False
-                    self._blink_frames_r = 0
-
-            blink_l = self._is_blinking_l
-            blink_r = self._is_blinking_r
-
-            if blink_l and blink_r:
-                return result
+            min_ear = min(l_ear, r_ear)
 
             l_info, r_info = self._compute_eye_info(left_pts, right_pts)
             l_cx_raw, l_cy_raw, l_size = l_info
@@ -243,31 +204,35 @@ class GazeRedirectInference:
 
             eye_size = self._fixed_eye_size
 
+            if min_ear < EAR_CLOSE:
+                self._low_ear_count += 1
+                self._open_confirm_count = 0
+            elif self._low_ear_count > 0:
+                if min_ear < EAR_OPEN:
+                    self._open_confirm_count = 0
+                else:
+                    self._open_confirm_count += 1
+                    if self._open_confirm_count >= OPEN_CONFIRM_FRAMES:
+                        self._low_ear_count = 0
+                        self._open_confirm_count = 0
+            else:
+                self._open_confirm_count = 0
+
+            if self._low_ear_count > 0 and self._low_ear_count <= MAX_BLINK_FRAMES:
+                return result
+
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        if not blink_l and not blink_r:
-            l_tensor, l_x, l_y = self._crop_eye(frame_rgb, l_cx, l_cy, eye_size)
-            r_tensor, r_x, r_y = self._crop_eye(frame_rgb, r_cx, r_cy, eye_size)
+        l_tensor, l_x, l_y = self._crop_eye(frame_rgb, l_cx, l_cy, eye_size)
+        r_tensor, r_x, r_y = self._crop_eye(frame_rgb, r_cx, r_cy, eye_size)
 
-            batch = torch.stack([l_tensor, r_tensor]).to(self.device)
+        batch = torch.stack([l_tensor, r_tensor]).to(self.device)
 
-            with torch.no_grad():
-                generated = self.generator(batch, self._gaze_angles)
+        with torch.no_grad():
+            generated = self.generator(batch, self._gaze_angles)
 
-            self._paste_eye(result, generated[0], l_x, l_y, eye_size)
-            self._paste_eye(result, generated[1], r_x, r_y, eye_size)
-        elif not blink_l:
-            l_tensor, l_x, l_y = self._crop_eye(frame_rgb, l_cx, l_cy, eye_size)
-            batch = l_tensor.unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                generated = self.generator(batch, self._gaze_angles[:1])
-            self._paste_eye(result, generated[0], l_x, l_y, eye_size)
-        elif not blink_r:
-            r_tensor, r_x, r_y = self._crop_eye(frame_rgb, r_cx, r_cy, eye_size)
-            batch = r_tensor.unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                generated = self.generator(batch, self._gaze_angles[1:])
-            self._paste_eye(result, generated[0], r_x, r_y, eye_size)
+        self._paste_eye(result, generated[0], l_x, l_y, eye_size)
+        self._paste_eye(result, generated[1], r_x, r_y, eye_size)
 
         return result
 

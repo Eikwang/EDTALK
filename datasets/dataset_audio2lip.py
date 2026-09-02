@@ -2,7 +2,6 @@ import os
 from unittest import main
 from skimage import io, img_as_float32, transform
 from skimage.color import gray2rgb
-from sklearn.model_selection import train_test_split
 from imageio import mimread
 from PIL import Image
 import numpy as np

@@ -14,8 +14,8 @@ def test_main_help():
     )
     assert result.returncode == 0, f"Help command failed: {result.stderr}"
     assert "usage:" in result.stdout.lower(), "Help output should contain 'usage:'"
-    assert "--model-path" in result.stdout, "Should contain --model-path argument"
-    assert "--audio2lip-path" in result.stdout, "Should contain --audio2lip-path argument"
+    assert "--character-dir" in result.stdout, "Should contain --character-dir argument"
+    assert "--target-fps" in result.stdout, "Should contain --target-fps argument"
 
 
 def test_missing_init_file():

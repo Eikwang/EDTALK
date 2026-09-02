@@ -519,15 +519,28 @@ def process(input_path, output_dir, output_size=256, output_format='jpg',
                 )
             
             crop_info['frame_idx'] = frame_idx
-            
+
+            # Crop and resize first — we need the 256x256 image for landmark detection
+            resized, _ = crop_and_resize(warmup_frame, crop_info, output_size)
+
             if face_result is not None:
+                # Detect landmarks on the 256x256 cropped face image
+                # This gives coordinates directly in 256x256 space, eliminating
+                # the need for coordinate mapping during compositing
                 fx1, fy1, fw, fh, _ = face_result
-                lms = detect_landmarks(landmark_predictor, warmup_frame, (fx1, fy1, fw, fh))
+                # Map face bbox to 256x256 space for landmark detection
+                scale = output_size / float(max(1, crop_info['crop_size']))
+                bbox_256 = (
+                    (fx1 - crop_info['crop_x']) * scale,
+                    (fy1 - crop_info['crop_y']) * scale,
+                    fw * scale,
+                    fh * scale,
+                )
+                lms = detect_landmarks(landmark_predictor, resized, bbox_256)
             else:
                 lms = None
             landmarks_list.append(lms if lms is not None else np.full((68, 2), np.nan, dtype=np.float32))
-            
-            resized, _ = crop_and_resize(warmup_frame, crop_info, output_size)
+
             out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
             write_queue.put((resized, out_path, imwrite_params))
             
@@ -570,15 +583,26 @@ def process(input_path, output_dir, output_size=256, output_format='jpg',
                 )
             
             crop_info['frame_idx'] = frame_idx
-            
+
+            # Crop and resize first — we need the 256x256 image for landmark detection
+            resized, _ = crop_and_resize(frame, crop_info, output_size)
+
             if face_result is not None:
+                # Detect landmarks on the 256x256 cropped face image
+                # This gives coordinates directly in 256x256 space
                 fx1, fy1, fw, fh, _ = face_result
-                lms = detect_landmarks(landmark_predictor, frame, (fx1, fy1, fw, fh))
+                scale = output_size / float(max(1, crop_info['crop_size']))
+                bbox_256 = (
+                    (fx1 - crop_info['crop_x']) * scale,
+                    (fy1 - crop_info['crop_y']) * scale,
+                    fw * scale,
+                    fh * scale,
+                )
+                lms = detect_landmarks(landmark_predictor, resized, bbox_256)
             else:
                 lms = None
             landmarks_list.append(lms if lms is not None else np.full((68, 2), np.nan, dtype=np.float32))
-            
-            resized, _ = crop_and_resize(frame, crop_info, output_size)
+
             out_path = os.path.join(output_dir, f'{frame_idx}.{output_ext}')
             write_queue.put((resized, out_path, imwrite_params))
             

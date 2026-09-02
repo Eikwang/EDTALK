@@ -11,11 +11,10 @@ class Direction(nn.Module):
         self.weight = nn.Parameter(torch.randn(512, lip_dim+pose_dim))
 
     def _compute_Q(self):
-        with torch.no_grad():
-            weight = self.weight + 1e-8
-            Q, R = torch.linalg.qr(weight)
-            if Q.dtype != torch.float32:
-                Q = Q.to(torch.float32)
+        weight = self.weight + 1e-8
+        Q, R = torch.linalg.qr(weight)
+        if Q.dtype != torch.float32:
+            Q = Q.to(torch.float32)
         return Q
 
     def forward(self, input):
@@ -53,11 +52,10 @@ class Pose_Direction(nn.Module):
         self.weight = nn.Parameter(torch.randn(512, pose_dim))
 
     def _compute_Q(self):
-        with torch.no_grad():
-            weight = self.weight + 1e-8
-            Q, R = torch.linalg.qr(weight)
-            if Q.dtype != torch.float32:
-                Q = Q.to(torch.float32)
+        weight = self.weight + 1e-8
+        Q, R = torch.linalg.qr(weight)
+        if Q.dtype != torch.float32:
+            Q = Q.to(torch.float32)
         return Q
 
     def forward(self, input):
@@ -95,15 +93,14 @@ class Lip_Direction(nn.Module):
         self.weight = nn.Parameter(torch.randn(512, lip_dim))
 
     def _compute_Q(self, pose_weight=None):
-        with torch.no_grad():
-            if pose_weight is not None:
-                weight = torch.cat([self.weight, pose_weight], -1)
-            else:
-                weight = self.weight
-            weight = weight + 1e-8
-            Q, R = torch.linalg.qr(weight)
-            if Q.dtype != torch.float32:
-                Q = Q.to(torch.float32)
+        if pose_weight is not None:
+            weight = torch.cat([self.weight, pose_weight], -1)
+        else:
+            weight = self.weight
+        weight = weight + 1e-8
+        Q, R = torch.linalg.qr(weight)
+        if Q.dtype != torch.float32:
+            Q = Q.to(torch.float32)
         return Q
 
     def forward(self, input, pose_weight):
@@ -160,7 +157,7 @@ class Generator(nn.Module):
         self.pose_fc = nn.Sequential(*pose_fc)
 
 
-    def forward(self, img_source, img_drive, h_start=None, return_masks=False):
+    def forward(self, img_source, img_drive, h_start=None):
         wa, wa_t, feats, feats_t = self.enc(img_source, img_drive, h_start) # torch.Size([1, 512]) alpha3个torch.Size([1, 20])
         shared_fc = self.fc(wa_t)
         alpha_D_lip = self.lip_fc(shared_fc)
@@ -168,11 +165,18 @@ class Generator(nn.Module):
         alpha_D = torch.cat([alpha_D_lip, alpha_D_pose], dim=-1)
         directions_D = self.direction_lipnonlip(alpha_D) # torch.Size([1, 512])
         latent_poseD = wa + directions_D
-        if return_masks:
-            img_recon, masks = self.dec(latent_poseD, None, feats, return_masks=True)
-            return img_recon, masks
         img_recon = self.dec(latent_poseD, None, feats)
         return img_recon
+
+    def orthogonality_loss(self):
+        """计算 Direction 权重矩阵的正交正则化损失
+
+        目标: W^T @ W 接近单位矩阵，确保 lip 和 pose 方向正交
+        """
+        W = self.direction_lipnonlip.weight  # [512, 26]
+        WtW = W.T @ W  # [26, 26]
+        I = torch.eye(WtW.shape[0], device=WtW.device, dtype=WtW.dtype)
+        return F.mse_loss(WtW, I)
 
     def test_from_audio_pose_image(self, img_source, alpha_D_lip, pose_img_drive, h_start=None):
 

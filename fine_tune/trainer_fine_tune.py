@@ -21,18 +21,6 @@ class Trainer(nn.Module):
         self.batch_size = args.batch_size
         self.rank = rank
 
-        # 获取头部区域比例 (默认 0.6 = 图像高度的 60%)
-        self.head_ratio = getattr(args, 'head_ratio', 0.6)
-
-        # 是否使用 landmark 检测 (默认 False，使用固定矩形)
-        self.use_landmark = getattr(args, 'use_landmark', False)
-
-        # 初始化 landmark 检测器 (如果启用)
-        self._detector = None
-        self._predictor = None
-        if self.use_landmark:
-            self._init_landmark_detector()
-
         self.gen = Generator().to(device)
         self.dis = Discriminator().to(device)
 
@@ -48,6 +36,12 @@ class Trainer(nn.Module):
         g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
         d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
 
+        # beta1: 可通过 --beta1 命令行参数配置
+        # 原始训练使用 beta1=0 (无动量), 适合微调预训练模型
+        # 建议微调时用 0 或 0.1, 避免过大动量覆盖预训练权重
+        _beta1 = getattr(args, 'beta1', None)
+        beta1 = _beta1 if _beta1 is not None else 0.0
+
         if args.only_fine_tune_dec:
             requires_grad(self.gen, False)
             requires_grad(self.gen.dec, True)
@@ -55,7 +49,7 @@ class Trainer(nn.Module):
             self.g_optim = optim.Adam(
                 net_parameters,
                 lr=args.lr * g_reg_ratio,
-                betas=(0.5, 0.99)
+                betas=(beta1, 0.99)
             )
         elif getattr(args, 'freeze_direction', False):
             # 冻结 Direction+fc+lip_fc+pose_fc, 训练 Encoder+Decoder
@@ -66,204 +60,41 @@ class Trainer(nn.Module):
             self.g_optim = optim.Adam(
                 net_parameters,
                 lr=args.lr * g_reg_ratio,
-                betas=(0.5, 0.99)
+                betas=(beta1, 0.99)
             )
         else:
-            self.g_optim = optim.Adam(
-                self.gen.parameters(),
-                lr=args.lr * g_reg_ratio,
-                betas=(0.5, 0.99)
-            )
+            # 分层学习率: Direction 使用更高学习率保持解耦能力
+            direction_lr_ratio = getattr(args, 'direction_lr_ratio', 5.0)
+            direction_params = list(self.gen.direction_lipnonlip.parameters())
+            direction_param_ids = set(id(p) for p in direction_params)
+            other_params = [p for p in self.gen.parameters() if id(p) not in direction_param_ids]
+
+            self.g_optim = optim.Adam([
+                {'params': direction_params, 'lr': args.lr * g_reg_ratio * direction_lr_ratio},
+                {'params': other_params, 'lr': args.lr * g_reg_ratio}
+            ], betas=(beta1, 0.99))
 
         self.d_optim = optim.Adam(
             self.dis.parameters(),
             lr=args.lr * d_reg_ratio,
-            betas=(0.5, 0.99)
+            betas=(beta1, 0.99)
         )
 
         self.criterion_vgg = VGGLoss().to(device)
 
-    def _init_landmark_detector(self):
-        """初始化 dlib landmark 检测器"""
-        try:
-            import dlib
-            import cv2
-            import numpy as np
+        # 记录冻结配置: 在 __init__ 结束时保存正确的 requires_grad 状态
+        # gen_update/dis_update 会互相切换, 需要在每次 gen_update 开始时恢复
+        self._save_gen_grad_state()
 
-            # 查找 landmark 模型路径
-            predictor_path = None
-            candidates = [
-                os.path.join(os.path.dirname(__file__), '..', 'ckpts', 'shape_predictor_68_face_landmarks.dat'),
-                'shape_predictor_68_face_landmarks.dat',
-            ]
-            for p in candidates:
-                if os.path.exists(p):
-                    predictor_path = p
-                    break
+    def _save_gen_grad_state(self):
+        """保存 Generator 各参数的 requires_grad 状态"""
+        self._gen_grad_state = {name: p.requires_grad for name, p in self.gen.named_parameters()}
 
-            if predictor_path is None:
-                print("[WARN] Landmark model not found, falling back to fixed rectangle mode")
-                self.use_landmark = False
-                return
-
-            self._detector = dlib.get_frontal_face_detector()
-            self._predictor = dlib.shape_predictor(predictor_path)
-            print(f"[INFO] Landmark detector initialized from {predictor_path}")
-
-        except ImportError as e:
-            print(f"[WARN] dlib not available ({e}), falling back to fixed rectangle mode")
-            self.use_landmark = False
-        except Exception as e:
-            print(f"[WARN] Failed to init landmark detector: {e}, falling back to fixed rectangle mode")
-            self.use_landmark = False
-
-    def _compute_head_region_from_landmark(self, img_target):
-        """从 landmark 检测生成头部区域掩码
-
-        Args:
-            img_target: [B, 3, 256, 256] 目标图像
-
-        Returns:
-            head_mask: [B, 1, 256, 256] 头部区域 (1=头部, 0=背景)
-        """
-        import cv2
-        import numpy as np
-
-        B, C, H, W = img_target.shape
-        device = img_target.device
-
-        # 将 tensor 转换为 numpy 图像
-        images_np = []
-        for i in range(B):
-            img = img_target[i].cpu().numpy()
-            img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
-            img = (img + 1.0) * 127.5  # [-1, 1] -> [0, 255]
-            img = img.astype(np.uint8)
-            images_np.append(img)
-
-        head_masks = []
-
-        for img_np in images_np:
-            # 检测人脸
-            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-            rects = self._detector(gray, 0)
-
-            if len(rects) == 0:
-                # 未检测到人脸，使用固定矩形
-                head_start = int(H * (1.0 - self.head_ratio))
-                center_x = W // 2
-                half_width = int(W * 0.4)
-                mask = np.zeros((H, W), dtype=np.float32)
-                mask[head_start:H, center_x - half_width:center_x + half_width] = 1.0
-                head_masks.append(mask)
-                continue
-
-            # 取第一个检测到的人脸
-            rect = rects[0]
-            shape = self._predictor(gray, rect)
-
-            # 转换为 numpy 数组 (68个点)
-            points = shape.parts()
-            landmarks = np.array([(p.x, p.y) for p in points])
-
-            # 头部区域: 使用所有关键点计算边界框
-            # 点 0-16: 下巴轮廓 (最下方)
-            # 点 17-26: 眉毛 (最上方)
-            all_points = landmarks
-
-            # 计算头部边界框
-            head_x_min = int(all_points[:, 0].min())
-            head_x_max = int(all_points[:, 0].max())
-            head_y_min = int(all_points[:, 1].min())
-            head_y_max = int(all_points[:, 1].max())
-
-            # 扩展边界框 (上下各扩展 20%, 左右各扩展 15%)
-            head_height = head_y_max - head_y_min
-            head_width = head_x_max - head_x_min
-
-            expand_y = int(head_height * 0.2)
-            expand_x = int(head_width * 0.15)
-
-            head_y_min = max(0, head_y_min - expand_y)
-            head_y_max = min(H, head_y_max + expand_y)
-            head_x_min = max(0, head_x_min - expand_x)
-            head_x_max = min(W, head_x_max + expand_x)
-
-            # 创建掩码
-            mask = np.zeros((H, W), dtype=np.float32)
-            mask[head_y_min:head_y_max, head_x_min:head_x_max] = 1.0
-
-            head_masks.append(mask)
-
-        # 转换为 tensor
-        head_masks = np.stack(head_masks, axis=0)  # [B, H, W]
-        head_masks = torch.from_numpy(head_masks).unsqueeze(1).to(device)  # [B, 1, H, W]
-
-        return head_masks
-
-    def _compute_head_region(self, img_target):
-        """生成头部区域掩码
-
-        Args:
-            img_target: [B, 3, 256, 256] 目标图像
-
-        Returns:
-            head_mask: [B, 1, 256, 256] 头部区域 (1=头部, 0=背景)
-        """
-        if self.use_landmark and self._predictor is not None:
-            return self._compute_head_region_from_landmark(img_target)
-
-        # 固定矩形方案 (fallback)
-        B, C, H, W = img_target.shape
-        device = img_target.device
-
-        # 头部区域: 图像底部中央的矩形
-        # head_ratio=0.6 表示头部占图像高度的 60%
-        head_start = int(H * (1.0 - self.head_ratio))
-        head_end = H
-
-        # 宽度方向: 中央区域 (约 80% 宽度)
-        center_x = W // 2
-        half_width = int(W * 0.4)
-
-        # 创建掩码
-        head_mask = torch.zeros(B, 1, H, W, device=device)
-        head_mask[:, :, head_start:head_end, center_x - half_width:center_x + half_width] = 1.0
-
-        return head_mask
-
-    def _mask_regularization(self, masks, head_region):
-        """计算 mask 正则化损失
-
-        目标: 非头部区域的 mask -> 1 (纯用 source feature, 背景保持不变)
-
-        Args:
-            masks: list of [B, 1, H, W] 各分辨率层的 mask
-            head_region: [B, 1, 256, 256] 头部区域掩码
-
-        Returns:
-            reg_loss: scalar 正则化损失
-        """
-        reg_loss = 0.0
-
-        for mask in masks:
-            # 将头部区域缩放到当前 mask 的分辨率
-            h, w = mask.shape[2], mask.shape[3]
-            head_resized = F.interpolate(
-                head_region,
-                size=(h, w),
-                mode='bilinear',
-                align_corners=False
-            )
-
-            # 背景区域掩码 (1 - 头部区域)
-            bg_mask = 1.0 - head_resized
-
-            # 约束: 背景区域的 mask 应该接近 1
-            # loss = |1 - mask| * bg_mask
-            reg_loss += ((1.0 - mask) * bg_mask).abs().mean()
-
-        return reg_loss
+    def _restore_gen_grad_state(self):
+        """恢复 Generator 各参数的 requires_grad 状态"""
+        for name, p in self.gen.named_parameters():
+            if name in self._gen_grad_state:
+                p.requires_grad = self._gen_grad_state[name]
 
     def g_nonsaturating_loss(self, fake_pred):
         return F.softplus(-fake_pred).mean()
@@ -277,35 +108,52 @@ class Trainer(nn.Module):
         self.gen.train()
         self.gen.zero_grad()
 
-        requires_grad(self.gen, True)
+        # 恢复 __init__ 中设置的冻结状态 (而不是无条件解冻所有 gen 参数)
+        # gen_update/dis_update 会互相切换 requires_grad, 所以需要恢复正确的冻结配置
+        self._restore_gen_grad_state()
         requires_grad(self.dis, False)
 
         gen_fwd = self.gen_ddp if getattr(self.args, 'distributed', False) else self.gen
         dis_fwd = self.dis_ddp if getattr(self.args, 'distributed', False) else self.dis
 
-        # 主重建
-        img_target_recon = gen_fwd(img_source, img_target)
+        # ---- 手动调用 encoder/decoder (而非 gen.forward()) 以便获取中间结果 ----
+        # 1. 编码 source 和 target
+        wa_s, wa_t, feats_s, feats_t = gen_fwd.enc(img_source, img_target)
+
+        # 2. 从 target 提取运动方向 (lip + pose)
+        shared_fc = gen_fwd.fc(wa_t)
+        alpha_lip = gen_fwd.lip_fc(shared_fc)
+        alpha_pose = gen_fwd.pose_fc(shared_fc)
+        alpha = torch.cat([alpha_lip, alpha_pose], dim=-1)
+        directions = gen_fwd.direction_lipnonlip(alpha)
+
+        # 3. 主任务: source身份 + target运动 → 重建target图像
+        latent = wa_s + directions
+        img_target_recon = gen_fwd.dec(latent, None, feats_s)
+
+        # 4. 自重建正则化: target身份 + target运动 → 重建target图像
+        #    作用: 锚定Decoder，防止跨身份训练导致Decoder漂移
+        #    复用已计算的 encoder 结果，仅额外一次 decoder 前向
+        self_recon_weight = getattr(self.args, 'self_recon_weight', 0.5)
+        if self_recon_weight > 0:
+            latent_self = wa_t + directions
+            recon_self = gen_fwd.dec(latent_self, None, feats_t)
+            self_recon_loss = F.l1_loss(recon_self, img_target)
+        else:
+            self_recon_loss = torch.tensor(0.0, device=img_source.device)
+
+        # ---- 计算损失 ----
         img_recon_pred = dis_fwd(img_target_recon)
 
         vgg_loss = self.criterion_vgg(img_target_recon, img_target).mean()
         l1_loss = F.l1_loss(img_target_recon, img_target)
         gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
 
-        g_loss = vgg_loss + 100.0 * l1_loss + 0.5 * gan_g_loss
+        # 正交正则化: 约束 Direction 权重矩阵保持正交性
+        # 防止微调过程中 lip/pose 方向纠缠导致背景变形
+        ortho_loss = gen_fwd.orthogonality_loss()
 
-        # Mask 正则化 (如果启用)
-        mask_reg_weight = getattr(self.args, 'mask_reg_weight', 0.0)
-        if mask_reg_weight > 0:
-            # 获取头部区域掩码
-            head_region = self._compute_head_region(img_target)
-
-            # 重新前向获取 masks (不使用 DDP wrapper, 因为需要 return_masks)
-            _, masks = self.gen(img_source, img_target, return_masks=True)
-
-            # 计算 mask 正则化损失
-            mask_reg_loss = self._mask_regularization(masks, head_region)
-
-            g_loss = g_loss + mask_reg_loss * mask_reg_weight
+        g_loss = vgg_loss + l1_loss + gan_g_loss + 0.01 * ortho_loss + self_recon_weight * self_recon_loss
 
         g_loss.backward()
         self.g_optim.step()
@@ -332,7 +180,15 @@ class Trainer(nn.Module):
     def sample(self, img_source, img_target):
         with torch.no_grad():
             self.gen.eval()
-            img_recon = self.gen(img_source, img_target)
+            # 与 gen_update 保持一致的手动 encoder/decoder 调用
+            wa_s, wa_t, feats_s, feats_t = self.gen.enc(img_source, img_target)
+            shared_fc = self.gen.fc(wa_t)
+            alpha_lip = self.gen.lip_fc(shared_fc)
+            alpha_pose = self.gen.pose_fc(shared_fc)
+            alpha = torch.cat([alpha_lip, alpha_pose], dim=-1)
+            directions = self.gen.direction_lipnonlip(alpha)
+            latent = wa_s + directions
+            img_recon = self.gen.dec(latent, None, feats_s)
         return img_recon
 
     def resume(self, resume_ckpt):

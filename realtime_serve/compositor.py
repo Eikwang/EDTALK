@@ -21,6 +21,7 @@ coordinate mapping errors and ensures pixel-accurate mask alignment.
 """
 import numpy as np
 import cv2
+import threading
 
 
 class MouthCompositor:
@@ -62,6 +63,11 @@ class MouthCompositor:
         # EMA-smoothed facemark (in 256x256 space), persists across frames
         self._smoothed_facemark: np.ndarray | None = None
 
+        # State lock: generate_mask() runs on the batch-preload thread while
+        # composite()'s fallback mask path runs on the render thread — both
+        # mutate the shared EMA / mask cache, so they must be serialized.
+        self._state_lock = threading.Lock()
+
         # Mask cache: avoid recomputing expensive distance transforms every frame
         # The mask changes slowly (landmarks shift ~2-5px between frames at 25fps),
         # so we only recompute when landmarks move beyond a tolerance threshold.
@@ -84,8 +90,88 @@ class MouthCompositor:
         if facemark_256 is None or np.any(np.isnan(facemark_256)):
             return None
 
-        facemark_256 = self._smooth_landmarks(facemark_256)
-        return self._create_mouth_mask(256, 256, facemark_256)
+        with self._state_lock:
+            facemark_256 = self._smooth_landmarks(facemark_256)
+            return self._create_mouth_mask(256, 256, facemark_256)
+
+    def _resolve_mask(self, facemark_256: np.ndarray,
+                      precomputed_mask: np.ndarray | None = None) -> np.ndarray | None:
+        """Resolve the mouth mask for this frame."""
+        if precomputed_mask is not None:
+            return precomputed_mask
+
+        with self._state_lock:
+            facemark_256 = self._smooth_landmarks(facemark_256)
+            if self._cached_mask is not None and self._cached_mask_facemark is not None:
+                max_shift = np.max(np.abs(facemark_256 - self._cached_mask_facemark))
+                if max_shift < self._mask_cache_tolerance:
+                    return self._cached_mask
+                mask = self._create_mouth_mask(256, 256, facemark_256)
+                self._cached_mask = mask
+                self._cached_mask_facemark = facemark_256.copy()
+                return mask
+            mask = self._create_mouth_mask(256, 256, facemark_256)
+            self._cached_mask = mask
+            self._cached_mask_facemark = facemark_256.copy()
+            return mask
+
+    def prepare_crop(self, orifra_frame: np.ndarray, meta: np.ndarray):
+        """Prepare the ori crop for blending.
+
+        This step is CPU-only and can overlap with GPU->CPU transfer of the
+        rendered frame. Returns the data needed by blend().
+
+        Returns:
+            (ori_crop_256, paste_coords) or None if crop is invalid.
+            paste_coords = (x1_c, y1_c, x2_c, y2_c, crop_w, crop_h)
+        """
+        crop_x = float(meta['crop_x'])
+        crop_y = float(meta['crop_y'])
+        crop_size = float(meta['crop_size'])
+
+        if crop_size <= 0:
+            return None
+
+        crop_size_int = int(round(crop_size))
+        if crop_size_int <= 0:
+            return None
+
+        x1 = int(round(crop_x))
+        y1 = int(round(crop_y))
+        x2 = x1 + crop_size_int
+        y2 = y1 + crop_size_int
+
+        x1_c = max(0, x1)
+        y1_c = max(0, y1)
+        x2_c = min(orifra_frame.shape[1], x2)
+        y2_c = min(orifra_frame.shape[0], y2)
+
+        crop_w = x2_c - x1_c
+        crop_h = y2_c - y1_c
+        if crop_w <= 0 or crop_h <= 0:
+            return None
+
+        ori_crop_256 = cv2.resize(orifra_frame[y1_c:y2_c, x1_c:x2_c],
+                                  (256, 256), interpolation=cv2.INTER_LINEAR)
+        return ori_crop_256, (x1_c, y1_c, x2_c, y2_c, crop_w, crop_h)
+
+    def blend(self, orifra_frame: np.ndarray, rendered_frame_256: np.ndarray,
+              mask_256: np.ndarray, prepared_crop) -> np.ndarray:
+        """Blend rendered mouth onto the prepared ori crop and paste back."""
+        if prepared_crop is None:
+            return orifra_frame
+
+        ori_crop_256, (x1_c, y1_c, x2_c, y2_c, crop_w, crop_h) = prepared_crop
+
+        mask_3ch = np.stack([mask_256] * 3, axis=-1)
+        blended_256 = (rendered_frame_256.astype(np.float32) * mask_3ch +
+                       ori_crop_256.astype(np.float32) * (1.0 - mask_3ch))
+        blended_256 = blended_256.astype(np.uint8)
+
+        blended_full = cv2.resize(blended_256, (crop_w, crop_h),
+                                  interpolation=cv2.INTER_LINEAR)
+        orifra_frame[y1_c:y2_c, x1_c:x2_c] = blended_full
+        return orifra_frame
 
     def composite(self, orifra_frame: np.ndarray, rendered_frame_256: np.ndarray,
                   facemark: np.ndarray, meta: np.ndarray,
@@ -114,7 +200,6 @@ class MouthCompositor:
         if facemark is None:
             raise ValueError("facemark required")
 
-        # Get crop parameters from metadata
         crop_x = float(meta['crop_x'])
         crop_y = float(meta['crop_y'])
         crop_size = float(meta['crop_size'])
@@ -122,71 +207,13 @@ class MouthCompositor:
         if crop_size <= 0:
             return orifra_frame
 
-        # facemark is already in 256x256 space — no coordinate mapping needed
         facemark_256 = facemark
-
-        # Check for NaN landmarks (face not detected in that frame)
         if np.any(np.isnan(facemark_256)):
             return orifra_frame
 
-        # --- Get or generate mask ---
-        if precomputed_mask is not None:
-            mask_256 = precomputed_mask
-        else:
-            # Fallback: generate mask from facemark (legacy path)
-            facemark_256 = self._smooth_landmarks(facemark_256)
-            if self._cached_mask is not None and self._cached_mask_facemark is not None:
-                max_shift = np.max(np.abs(facemark_256 - self._cached_mask_facemark))
-                if max_shift < self._mask_cache_tolerance:
-                    mask_256 = self._cached_mask
-                else:
-                    mask_256 = self._create_mouth_mask(256, 256, facemark_256)
-                    self._cached_mask = mask_256
-                    self._cached_mask_facemark = facemark_256.copy()
-            else:
-                mask_256 = self._create_mouth_mask(256, 256, facemark_256)
-                self._cached_mask = mask_256
-                self._cached_mask_facemark = facemark_256.copy()
-
-        # --- Blend at 256x256 first, then resize result (much faster) ---
-        # Instead of resizing rendered+mask to 1268x1268 and blending there (1.6M px float32),
-        # we blend at 256x256 (65K px float32) and resize the composited result.
-        crop_size_int = int(round(crop_size))
-        if crop_size_int <= 0:
-            return orifra_frame
-
-        # Extract ori crop at original resolution (for resize target)
-        x1 = int(round(crop_x))
-        y1 = int(round(crop_y))
-        x2 = x1 + crop_size_int
-        y2 = y1 + crop_size_int
-
-        x1_c = max(0, x1)
-        y1_c = max(0, y1)
-        x2_c = min(orifra_frame.shape[1], x2)
-        y2_c = min(orifra_frame.shape[0], y2)
-
-        # Resize ori crop to 256x256 (for blending at low resolution)
-        crop_w = x2_c - x1_c
-        crop_h = y2_c - y1_c
-        if crop_w <= 0 or crop_h <= 0:
-            return orifra_frame
-
-        ori_crop_256 = cv2.resize(orifra_frame[y1_c:y2_c, x1_c:x2_c],
-                                  (256, 256), interpolation=cv2.INTER_LINEAR)
-
-        # Blend at 256x256 (only 65K pixels × 3ch float32 — very fast)
-        mask_3ch = np.stack([mask_256] * 3, axis=-1)
-        blended_256 = (rendered_frame_256.astype(np.float32) * mask_3ch +
-                       ori_crop_256.astype(np.float32) * (1.0 - mask_3ch))
-        blended_256 = blended_256.astype(np.uint8)
-
-        # Resize composited result back to ori crop size and assign
-        blended_full = cv2.resize(blended_256, (crop_w, crop_h),
-                                  interpolation=cv2.INTER_LINEAR)
-        orifra_frame[y1_c:y2_c, x1_c:x2_c] = blended_full
-
-        return orifra_frame
+        mask_256 = self._resolve_mask(facemark_256, precomputed_mask)
+        prepared = self.prepare_crop(orifra_frame, meta)
+        return self.blend(orifra_frame, rendered_frame_256, mask_256, prepared)
 
     def _smooth_landmarks(self, facemark_256: np.ndarray) -> np.ndarray:
         """Apply EMA smoothing to facemark landmarks to prevent edge flickering.

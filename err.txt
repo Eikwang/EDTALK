@@ -1,0 +1,7 @@
+python train_fine_tune.py --freeze_direction --resume_ckpt ckpts/EDTalk_lip_pose.pt --datapath wy --lr 0.0001 --batch_size 4 --iter 50000 --mask_reg_weight 0.1 --display_freq 4000 --save_freq 5000 --exp_name wy
+
+
+
+
+# audio2lip train-log
+

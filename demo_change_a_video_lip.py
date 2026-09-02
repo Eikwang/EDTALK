@@ -132,9 +132,14 @@ def get_mel(audio_path):
     syncnet_mel_step_size = 16
 
 
+    # Calculate actual mel_fps from the mel spectrogram parameters.
+    # hop_size=200 (standard Wav2Lip) → mel_fps = 16000/200 = 80.
+    # Must match training data preprocessing for correct lip coefficients.
+    mel_fps = 16000.0 / audio.get_hop_size()
+
     for i in range(num_frames):
         start_frame_num = i-2
-        start_idx = int(80. * (start_frame_num / float(fps)))
+        start_idx = int(mel_fps * (start_frame_num / float(fps)))
         end_idx = start_idx + syncnet_mel_step_size
         seq = list(range(start_idx, end_idx))
         seq = [ min(max(item, 0), orig_mel.shape[0]-1) for item in seq ]
@@ -165,11 +170,27 @@ class Demo(nn.Module):
         model_path = args.model_path
         audio2lip_model_path = args.audio2lip_model_path
         print('==> loading model')
+        
+        # 加载 Audio2Lip 模型
         self.audio2lip = Audio2Lip().cuda()
-        weight = torch.load(audio2lip_model_path, map_location=lambda storage, loc: storage, weights_only=False)['audio2lip']
-        self.audio2lip.load_state_dict(weight)
+        
+        # 检查是否使用训练后的检查点
+        if hasattr(args, 'finetuned_ckpt') and args.finetuned_ckpt:
+            # 加载训练后的检查点（包含 audio2lip 权重）
+            print(f'==> loading finetuned Audio2Lip from: {args.finetuned_ckpt}')
+            ckpt = torch.load(args.finetuned_ckpt, map_location=lambda storage, loc: storage, weights_only=False)
+            self.audio2lip.load_state_dict(ckpt['audio2lip'])
+        else:
+            # 加载预训练的 Audio2Lip 权重
+            print(f'==> loading pretrained Audio2Lip from: {audio2lip_model_path}')
+            weight = torch.load(audio2lip_model_path, map_location=lambda storage, loc: storage, weights_only=False)['audio2lip']
+            self.audio2lip.load_state_dict(weight)
+        
         self.audio2lip.eval()
+        
+        # 加载 Generator 模型（始终使用预训练权重）
         self.gen = Generator().cuda()
+        print(f'==> loading pretrained Generator from: {model_path}')
         weight = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)['gen']
         self.gen.load_state_dict(weight)
         self.gen.eval()
@@ -313,6 +334,8 @@ if __name__ == '__main__':
     parser.add_argument("--audio_driving_path", type=str, default='test_data/teaser.mp3')
     parser.add_argument("--save_path", type=str, default='res/demo_change_a_video_lip_teaser.mp4')
     parser.add_argument("--audio2lip_model_path", type=str, default='ckpts/Audio2Lip.pt')
+    parser.add_argument("--finetuned_ckpt", type=str, default=None,
+                        help="训练后的检查点路径 (包含 audio2lip 权重, 优先级高于 audio2lip_model_path)")
     parser.add_argument("--model_path", type=str, default='ckpts/EDTalk_lip_pose.pt')
     parser.add_argument('--face_sr', action='store_true', help='Face super-resolution (Optional). Please install GFPGAN first')
     parser.add_argument('--temporal_smooth', action='store_true',

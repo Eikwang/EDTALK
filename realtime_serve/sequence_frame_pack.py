@@ -1,14 +1,21 @@
 """Character data pack for loading and managing preprocessed video frames.
 
 Batched sliding-window preload design:
-    Instead of loading frames on demand (per-frame disk I/O), frames are
-    preloaded in batches of BATCH_SIZE. A sliding window of NUM_BATCHES
+    Frames are preloaded in batches of BATCH_SIZE. A sliding window of two
     batches is maintained: the current batch is being rendered while the
     next batch is loaded in a background thread.
 
-    This eliminates per-frame disk I/O during rendering — all frame reads
-    happen in batch during preloading, keeping the render loop free of
-    blocking I/O.
+    Timing contract (critical for stable 25fps):
+    - The preload of batch N+1 starts the moment batch N becomes current
+      (NOT when the render reaches 90% of batch N). This gives the preloader
+      the ENTIRE batch duration (~4s at 25fps for 100 frames) to load the
+      next ~0.5s of work.
+    - JPEG decoding is parallelized across a thread pool (cv2.imread
+      releases the GIL), so the preload thread does not starve the render
+      thread or the audio callback.
+    - The render thread NEVER performs a synchronous batch load: if the
+      requested frame is outside the window, a background load is started
+      and get_frame() falls back to a single-frame disk read (~25ms).
 
 Directory structure:
     <character_dir>/
@@ -22,29 +29,33 @@ Directory structure:
 """
 import os
 import threading
-from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from typing import Tuple, List, Optional
+
 import numpy as np
 import cv2
 import torch
-from typing import Tuple, List, Optional, Dict
 
 
 class BatchPreloader:
     """Batched sliding-window preloader for video frames.
 
-    Maintains a window of NUM_BATCHES batches, each containing BATCH_SIZE frames.
-    The current batch is used for rendering while the next batch is loaded
-    in a background thread. When the render crosses a batch boundary, the
-    preloaded batch becomes current and a new preload starts.
+    Maintains a window of two batches. The batch after the current one is
+    always being preloaded in the background (wrap-aware at segment end).
 
-    Memory layout:
-        orifra frames: CPU numpy arrays (BATCH_SIZE × ~125KB = ~12.5MB per batch)
-        crop tensors: GPU float32 tensors (BATCH_SIZE × ~786KB = ~78.6MB per batch)
-        Total window (2 batches): ~182MB — trivial for 16GB GPU
+    Memory layout (BATCH_SIZE=100):
+        orifra frames: CPU numpy arrays (100 x ~11MB = ~1.1GB per batch)
+        crop tensors:  GPU float32 (100 x 786KB = ~79MB per batch)
     """
 
     BATCH_SIZE = 100   # frames per batch
     NUM_BATCHES = 2    # window = current + next
+
+    _DECODE_WORKERS = 8
+    # Max frames per CPU->GPU transfer. Small chunks (~8MB) interleave with
+    # render-loop kernels instead of one 79MB burst monopolizing PCIe/L2 —
+    # measured as a contributor to gen p99 spikes (60-120ms).
+    _TRANSFER_CHUNK = 10
 
     def __init__(self, segment_cache: dict, device: str = 'cuda',
                  compositor=None):
@@ -81,178 +92,97 @@ class BatchPreloader:
         self._preload_done = threading.Event()
         self._preload_target_start: int = -1
 
-    def reset(self, segment: str):
-        """Reset preloader for a new segment.
+        # State lock: serializes ensure_loaded decisions from the render
+        # thread and API threads (segment switch / prefetch).
+        self._state_lock = threading.Lock()
 
-        Args:
-            segment: Segment name
-        """
-        # Wait for any in-progress preload
-        if self._preload_thread is not None and self._preload_thread.is_alive():
-            self._preload_done.wait(timeout=5.0)
+        # Generation counter: bumped on reset(); in-flight workers discard
+        # their results if the generation changed (segment switched away).
+        self._gen = 0
 
-        self._segment = segment
-        self._orifra_bufs = [None, None]
-        self._crop_bufs = [None, None]
-        self._mask_bufs = [None, None]
-        self._facemark_bufs = [None, None]
-        self._batch_starts = [-1, -1]
-        self._current_slot = 0
-        self._preload_target_start = -1
-
-    def _load_batch_sync(self, slot: int, start_idx: int, segment: str):
-        """Load a batch of frames into the specified slot (blocking).
-
-        Also precomputes mouth masks from facemark data if compositor is available.
-
-        Args:
-            slot: Buffer slot (0 or 1)
-            start_idx: First frame index to load
-            segment: Segment name
-        """
-        data = self._segment_cache[segment]
-        total = data['total_frames']
-        count = min(self.BATCH_SIZE, total - start_idx)
-
-        orifra_list = []
-        crop_list = []
-        mask_list = []
-        facemark_list = []
-
-        facemark_data = data.get('facemark')  # (total_frames, 68, 2)
-
-        for i in range(count):
-            idx = (start_idx + i) % total
-
-            # Load orifra
-            img = cv2.imread(data['orifra_files'][idx])
-            if img is None:
-                raise ValueError(f"Failed to read orifra: {data['orifra_files'][idx]}")
-            orifra_list.append(img)
-
-            # Load crop → tensor
-            crop_img = cv2.imread(data['crop_files'][idx])
-            if crop_img is None:
-                raise ValueError(f"Failed to read crop: {data['crop_files'][idx]}")
-            crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-            crop_tensor = torch.from_numpy(crop_rgb).permute(2, 0, 1).float() / 255.0
-            crop_tensor = (crop_tensor - 0.5) * 2.0  # normalize to [-1, 1]
-            crop_list.append(crop_tensor)
-
-            # Precompute mask from facemark
-            if facemark_data is not None and self._compositor is not None:
-                fm = facemark_data[idx]  # (68, 2)
-                mask = self._compositor.generate_mask(fm)
-                mask_list.append(mask)
-            else:
-                mask_list.append(None)
-
-            # Store facemark for later mask recomputation
-            if facemark_data is not None:
-                facemark_list.append(facemark_data[idx])
-            else:
-                facemark_list.append(None)
-
-        # Stack crop tensors and move to GPU in one transfer
-        crop_batch = torch.stack(crop_list, dim=0).to(self._device)  # [B, 3, 256, 256]
-
-        with self._preload_lock:
-            self._orifra_bufs[slot] = orifra_list
-            self._crop_bufs[slot] = crop_batch
-            self._mask_bufs[slot] = mask_list
-            self._facemark_bufs[slot] = facemark_list
-            self._batch_starts[slot] = start_idx
-
-    def _preload_worker(self, slot: int, start_idx: int, segment: str):
-        """Background thread: load next batch."""
-        try:
-            self._load_batch_sync(slot, start_idx, segment)
-        except Exception as e:
-            print(f"[BatchPreloader] Preload error: {e}")
-        finally:
-            self._preload_done.set()
-
-    def _start_preload(self, slot: int, start_idx: int, segment: str):
-        """Start async preloading of a batch."""
-        self._preload_done.clear()
-        self._preload_target_start = start_idx
-        self._preload_thread = threading.Thread(
-            target=self._preload_worker,
-            args=(slot, start_idx, segment),
-            daemon=True
+        # Persistent decode pool (cv2.imread releases the GIL)
+        self._decode_pool = ThreadPoolExecutor(
+            max_workers=min(self._DECODE_WORKERS, os.cpu_count() or 4)
         )
-        self._preload_thread.start()
 
-    def _is_in_batch(self, frame_idx: int, slot: int) -> bool:
-        """Check if frame_idx falls within the batch in the given slot."""
-        start = self._batch_starts[slot]
-        if start < 0:
-            return False
-        return start <= frame_idx < start + self.BATCH_SIZE
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def reset(self, segment: str):
+        """Reset preloader for a new segment (fast, non-blocking).
+
+        Abandoning any in-flight preload is safe: the worker checks the
+        generation counter before publishing its results.
+        """
+        with self._state_lock:
+            self._reset_locked(segment)
 
     def ensure_loaded(self, frame_idx: int, segment: str):
         """Ensure frame_idx is available in the preloaded window.
 
-        Call this BEFORE get_frame() for each render iteration.
+        Call this BEFORE get_frame() for each render iteration. This method
+        never blocks on disk I/O — worst case it starts a background load
+        and get_frame() falls back to a single-frame disk read.
 
         Logic:
-        1. frame_idx in current batch → check if near boundary → early preload
-        2. frame_idx in next (preloading) batch → swap if done, else fallback
-        3. frame_idx not in window → sync load only if no preload running
-
-        Args:
-            frame_idx: Frame index needed for rendering
-            segment: Current segment name
+        1. frame_idx in current batch -> make sure next batch is preloading
+        2. frame_idx in next batch -> swap to it (if loaded), keep chain going
+        3. frame_idx outside window (jump / cold start) -> start a background
+           load of the batch containing it; get_frame falls back meanwhile
         """
-        # Check if segment changed
-        if segment != self._segment:
-            self.reset(segment)
+        with self._state_lock:
+            if segment != self._segment:
+                self._reset_locked(segment)
 
-        other_slot = 1 - self._current_slot
-        data = self._segment_cache[segment]
+            data = self._segment_cache[segment]
+            total = data['total_frames']
+            frame_idx %= total
 
-        # Fast path: frame_idx is in current batch
-        if self._is_in_batch(frame_idx, self._current_slot):
-            # Early preload: if within last 10% of batch, start next batch
-            start = self._batch_starts[self._current_slot]
-            offset = frame_idx - start
-            if offset >= self.BATCH_SIZE * 0.9 and not self.is_preloading:
-                next_start = start + self.BATCH_SIZE
-                if next_start < data['total_frames']:
-                    self._start_preload(other_slot, next_start, segment)
-            return
+            cur = self._current_slot
+            other = 1 - cur
 
-        # frame_idx is in the other (preloading) batch
-        if self._is_in_batch(frame_idx, other_slot):
-            if self._preload_thread is not None and self._preload_thread.is_alive():
-                # Still loading — DON'T block, use current batch as fallback
+            # Fast path: frame_idx is in current batch
+            if self._is_in_batch(frame_idx, cur):
+                self._maybe_preload_next(segment, total)
                 return
-            # Preload done — swap to it and start next preload
-            self._current_slot = other_slot
-            next_start = self._batch_starts[other_slot] + self.BATCH_SIZE
-            if next_start < data['total_frames']:
-                self._start_preload(other_slot, next_start, segment)
-            return
 
-        # frame_idx not in any batch
-        # If a preload is running, DON'T do sync load — use current batch fallback
-        if self.is_preloading:
-            return
+            # frame_idx is in the other batch
+            if self._is_in_batch(frame_idx, other):
+                if self._is_preloading():
+                    # Still loading — get_frame uses disk fallback
+                    return
+                # Preload done — swap to it
+                self._current_slot = other
+                self._maybe_preload_next(segment, total)
+                return
 
-        # No preload running — synchronous load as last resort
-        batch_start = (frame_idx // self.BATCH_SIZE) * self.BATCH_SIZE
-        self._load_batch_sync(self._current_slot, batch_start, segment)
+            # frame_idx not in any batch (jump or cold start)
+            if self._is_preloading():
+                return
 
-        # Start preloading next batch
-        next_start = batch_start + self.BATCH_SIZE
-        if next_start < data['total_frames']:
-            self._start_preload(other_slot, next_start, segment)
+            target_slot = other if self._batch_starts[cur] >= 0 else cur
+            start = (frame_idx // self.BATCH_SIZE) * self.BATCH_SIZE
+            self._start_preload(target_slot, start, segment)
+
+    def load_initial(self, segment: str):
+        """Synchronously load batch 0 and kick off batch 1 (startup only)."""
+        with self._state_lock:
+            if segment != self._segment:
+                self._reset_locked(segment)
+            data = self._segment_cache[segment]
+            total = data['total_frames']
+            if self._is_in_batch(0, self._current_slot):
+                return
+            if self._is_in_batch(0, 1 - self._current_slot):
+                self._current_slot = 1 - self._current_slot
+                self._maybe_preload_next(segment, total)
+                return
+            self._load_batch_sync(self._current_slot, 0, segment, self._gen)
+            self._maybe_preload_next(segment, total)
 
     def get_orifra(self, frame_idx: int) -> Optional[np.ndarray]:
         """Get orifra frame from preloaded buffer.
-
-        Args:
-            frame_idx: Frame index
 
         Returns:
             orifra frame as BGR uint8 numpy array, or None if not loaded
@@ -270,9 +200,6 @@ class BatchPreloader:
     def get_crop(self, frame_idx: int) -> Optional[torch.Tensor]:
         """Get crop tensor from preloaded buffer (already on GPU).
 
-        Args:
-            frame_idx: Frame index
-
         Returns:
             crop tensor [1, 3, 256, 256] on GPU, or None if not loaded
         """
@@ -288,9 +215,6 @@ class BatchPreloader:
 
     def get_mask(self, frame_idx: int) -> Optional[np.ndarray]:
         """Get precomputed mouth mask from preloaded buffer.
-
-        Args:
-            frame_idx: Frame index
 
         Returns:
             mask (256, 256) float32, or None if not available
@@ -331,13 +255,184 @@ class BatchPreloader:
         """Whether a background preload is in progress."""
         return self._preload_thread is not None and self._preload_thread.is_alive()
 
+    @property
+    def stats(self) -> dict:
+        """Diagnostics for logging."""
+        return {
+            'batch_start': self._batch_starts[self._current_slot],
+            'preloading': self.is_preloading,
+            'segment': self._segment,
+        }
+
+    def close(self):
+        """Shut down the decode pool."""
+        if self._decode_pool is not None:
+            self._decode_pool.shutdown(wait=False)
+            self._decode_pool = None
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _reset_locked(self, segment: str):
+        """Reset all state for a new segment. Caller holds _state_lock."""
+        self._gen += 1
+        self._segment = segment
+        self._orifra_bufs = [None, None]
+        self._crop_bufs = [None, None]
+        self._mask_bufs = [None, None]
+        self._facemark_bufs = [None, None]
+        self._batch_starts = [-1, -1]
+        self._current_slot = 0
+        self._preload_target_start = -1
+        self._preload_done.set()
+
+    def _maybe_preload_next(self, segment: str, total: int):
+        """Ensure the batch after the current one is (being) preloaded.
+
+        Wrap-aware: after the last batch, the next batch is batch 0, so the
+        segment loops seamlessly. Caller holds _state_lock.
+        """
+        start = self._batch_starts[self._current_slot]
+        if start < 0:
+            return
+        next_start = start + self.BATCH_SIZE
+        if next_start >= total:
+            next_start = 0
+        other = 1 - self._current_slot
+        if self._batch_starts[other] == next_start:
+            return  # already loaded (or being loaded) into the other slot
+        if self._is_preloading():
+            return
+        self._start_preload(other, next_start, segment)
+
+    def _start_preload(self, slot: int, start_idx: int, segment: str):
+        """Start async preloading of a batch. Caller holds _state_lock."""
+        self._preload_done.clear()
+        self._preload_target_start = start_idx
+        gen = self._gen
+        self._preload_thread = threading.Thread(
+            target=self._preload_worker,
+            args=(slot, start_idx, segment, gen),
+            daemon=True
+        )
+        self._preload_thread.start()
+
+    def _preload_worker(self, slot: int, start_idx: int, segment: str,
+                        gen: int):
+        """Background thread: load next batch."""
+        try:
+            self._load_batch_sync(slot, start_idx, segment, gen)
+        except Exception as e:
+            print(f"[BatchPreloader] Preload error: {e}")
+        finally:
+            self._preload_done.set()
+
+    def _get_decode_pool(self) -> ThreadPoolExecutor:
+        return self._decode_pool
+
+    @staticmethod
+    def _decode_frame(job):
+        """Decode one frame pair (pure function, GIL-released in cv2)."""
+        orifra_path, crop_path = job
+        img = cv2.imread(orifra_path)
+        if img is None:
+            raise ValueError(f"Failed to read orifra: {orifra_path}")
+        crop_img = cv2.imread(crop_path)
+        if crop_img is None:
+            raise ValueError(f"Failed to read crop: {crop_path}")
+        crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
+        # Normalize in numpy (avoids per-frame torch CPU ops holding the GIL)
+        crop_np = np.ascontiguousarray(
+            crop_rgb.astype(np.float32).transpose(2, 0, 1) / 127.5 - 1.0
+        )
+        return img, crop_np
+
+    def _load_batch_sync(self, slot: int, start_idx: int, segment: str,
+                         gen: int):
+        """Load a batch of frames into the specified slot.
+
+        Args:
+            slot: Buffer slot (0 or 1)
+            start_idx: First frame index to load
+            segment: Segment name
+            gen: Generation at request time; results are discarded if the
+                 preloader was reset while loading.
+        """
+        data = self._segment_cache[segment]
+        total = data['total_frames']
+        count = min(self.BATCH_SIZE, total - start_idx)
+        if count <= 0:
+            return
+
+        facemark_data = data.get('facemark')  # (total_frames, 68, 2)
+
+        # Phase 1: parallel JPEG decode (cv2 releases the GIL)
+        jobs = []
+        for i in range(count):
+            idx = (start_idx + i) % total
+            jobs.append((data['orifra_files'][idx], data['crop_files'][idx]))
+        pool = self._get_decode_pool()
+        decoded = list(pool.map(self._decode_frame, jobs))
+
+        if gen != self._gen:
+            return  # reset happened while loading — discard
+
+        orifra_list = [d[0] for d in decoded]
+        crop_np_list = [d[1] for d in decoded]
+
+        # Phase 2: mask precomputation (serial — the compositor's landmark
+        # EMA is order-dependent, so masks must be generated in frame order)
+        mask_list = []
+        facemark_list = []
+        for i in range(count):
+            fm = facemark_data[(start_idx + i) % total] if facemark_data is not None else None
+            facemark_list.append(fm)
+            if fm is not None and self._compositor is not None:
+                mask_list.append(self._compositor.generate_mask(fm))
+            else:
+                mask_list.append(None)
+
+        # Phase 3: move to GPU in bounded chunks (each ~79MB, ~10ms) so a
+        # large transfer cannot monopolize the CUDA context and stall the
+        # render thread's kernels
+        crop_np = np.stack(crop_np_list, axis=0)  # [B, 3, 256, 256]
+        crop_tensor = torch.from_numpy(crop_np)
+        del crop_np_list, decoded
+        chunks = []
+        for i in range(0, crop_tensor.shape[0], self._TRANSFER_CHUNK):
+            chunks.append(crop_tensor[i:i + self._TRANSFER_CHUNK].to(self._device))
+        crop_batch = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+
+        if gen != self._gen:
+            return  # reset happened while loading — discard
+
+        with self._preload_lock:
+            self._orifra_bufs[slot] = orifra_list
+            self._crop_bufs[slot] = crop_batch
+            self._mask_bufs[slot] = mask_list
+            self._facemark_bufs[slot] = facemark_list
+            self._batch_starts[slot] = start_idx
+
+    def _is_in_batch(self, frame_idx: int, slot: int) -> bool:
+        """Check if frame_idx falls within the batch in the given slot."""
+        start = self._batch_starts[slot]
+        if start < 0:
+            return False
+        return start <= frame_idx < start + self.BATCH_SIZE
+
+    def _is_preloading(self) -> bool:
+        """Whether a preload is in flight. Caller holds _state_lock."""
+        return self._preload_thread is not None and self._preload_thread.is_alive()
+
 
 class CharacterDataPack:
     """Loads and manages preprocessed character data with multiple segments.
 
     Batched preload: Only metadata/facemark are loaded at startup. Orifra and
     crop frames are preloaded in batches via BatchPreloader — a sliding window
-    of 2×100 frames is maintained, with background preloading of the next batch.
+    of 2 x BATCH_SIZE frames is maintained, with the next batch always
+    preloading in the background.
 
     Each segment contains:
     - orifra: Original frames at full resolution (batch-preloaded to CPU)
@@ -361,14 +456,13 @@ class CharacterDataPack:
         self.character_dir = character_dir
         self.device = device
 
-        # Discover available segments
+        # Discover available segments by listing orifra subdirectories
         self.orifra_base = os.path.join(character_dir, "orifra")
         self.count_base = os.path.join(character_dir, "count")
         self.metadata_base = os.path.join(character_dir, "metadata")
         self.facemark_base = os.path.join(character_dir, "facemark")
         self.checkpoint_dir = os.path.join(character_dir, "checkpoint")
 
-        # Find all segments by listing orifra subdirectories
         if not os.path.exists(self.orifra_base):
             raise FileNotFoundError(f"orifra directory not found: {self.orifra_base}")
 
@@ -387,15 +481,18 @@ class CharacterDataPack:
         self._segment_cache: dict = {}
 
         # Batch preloader (replaces LRU cache)
-        self._preloader = BatchPreloader(self._segment_cache, device)
         BatchPreloader.BATCH_SIZE = batch_size
+        self._preloader = BatchPreloader(self._segment_cache, device)
+
+        # Cached resolution (avoids reading a frame from disk on every call)
+        self._resolution: Optional[tuple] = None
 
         # Load current segment (only metadata + facemark + file lists)
         self._load_segment(self.current_segment)
 
-        # Preload first batch for current segment
-        self._preloader.reset(self.current_segment)
-        self._preloader.ensure_loaded(0, self.current_segment)
+        # Preload first batch for current segment (blocking — startup only),
+        # then kick off the background preload of the second batch.
+        self._preloader.load_initial(self.current_segment)
 
         print(f'==> loaded character: {character_dir}')
         print(f'  -> Available segments: {self.segments}')
@@ -434,8 +531,8 @@ class CharacterDataPack:
     def _load_segment(self, segment: str):
         """Load a segment's metadata and file lists (NOT actual frame data).
 
-        Frames are loaded lazily on demand via get_frame().
-        Only metadata, facemark, and file path lists are loaded at startup.
+        Frames are loaded lazily in batches via the BatchPreloader.
+        Only metadata, facemark, and file path lists are loaded here.
         """
         if segment in self._segment_cache:
             return
@@ -506,10 +603,8 @@ class CharacterDataPack:
         """Ensure frame idx is available in the preloaded window.
 
         Call this BEFORE get_frame() for each render iteration.
-        Triggers batch preloading when crossing batch boundaries.
-
-        Args:
-            idx: Frame index needed for rendering
+        Never blocks on I/O; worst case get_frame() reads the single
+        requested frame from disk.
         """
         actual = idx % self._segment_cache[self.current_segment]['total_frames']
         self._preloader.ensure_loaded(actual, self.current_segment)
@@ -517,7 +612,9 @@ class CharacterDataPack:
     def switch_segment(self, segment: str) -> bool:
         """Switch to a different segment.
 
-        Resets the batch preloader and preloads the first batch of the new segment.
+        Resets the batch preloader and starts loading the first batch of
+        the new segment in the background (non-blocking; the render loop
+        falls back to single-frame disk reads for the first ~0.5s).
 
         Args:
             segment: Segment name to switch to
@@ -531,7 +628,7 @@ class CharacterDataPack:
         self.current_segment = segment
         self._load_segment(segment)
 
-        # Reset preloader and preload first batch of new segment
+        # Fast reset + background load of the new segment's first batch
         self._preloader.reset(segment)
         self._preloader.ensure_loaded(0, segment)
 
@@ -543,9 +640,10 @@ class CharacterDataPack:
         IMPORTANT: Call ensure_loaded(idx) before this method to ensure
         the frame data is in the preloaded buffer.
 
-        If the frame is not in the preloaded buffer (e.g., during batch
-        transition), returns the nearest available frame from the current
-        batch to avoid slow disk I/O.
+        If the frame is not in the preloaded buffer (e.g., right after a
+        segment switch or an out-of-window jump), it is read from disk
+        individually (~25ms) — this keeps the render loop running instead
+        of freezing on a synchronous batch load.
 
         Args:
             idx: Frame index (can be any integer, will be modulo total_frames)
@@ -566,34 +664,20 @@ class CharacterDataPack:
         cropped = self._preloader.get_crop(actual)
         mask = self._preloader.get_mask(actual)
 
-        # If frame not in buffer, clamp to nearest available frame in batch
-        # This avoids slow disk I/O during batch transitions
-        if orifra is None or cropped is None:
-            slot = self._preloader._current_slot
-            start = self._preloader._batch_starts[slot]
-            if start >= 0:
-                batch_size = self._preloader.BATCH_SIZE
-                # Clamp to batch range [start, start+batch_size)
-                clamped = max(start, min(actual, start + batch_size - 1))
-                if orifra is None:
-                    orifra = self._preloader.get_orifra(clamped)
-                if cropped is None:
-                    cropped = self._preloader.get_crop(clamped)
-                if mask is None:
-                    mask = self._preloader.get_mask(clamped)
-                actual = clamped
-
-        # Last resort fallback (should rarely happen)
+        # Last resort: single-frame disk read (bounded ~25ms, keeps the
+        # render loop alive while a background batch load is in flight)
         if orifra is None:
             orifra = self._read_orifra_frame(data['orifra_files'][actual])
         if cropped is None:
             img = cv2.imread(data['crop_files'][actual])
+            if img is None:
+                raise ValueError(f"Failed to read crop: {data['crop_files'][actual]}")
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            tensor = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
-            tensor = (tensor - 0.5) * 2.0
+            tensor = torch.from_numpy(
+                np.ascontiguousarray(img_rgb.astype(np.float32).transpose(2, 0, 1)) / 127.5 - 1.0
+            )
             cropped = tensor.unsqueeze(0).to(self.device)
 
-        # Already in memory
         meta = data['metadata'][actual]
         facemark = data['facemark'][actual]
 
@@ -607,15 +691,18 @@ class CharacterDataPack:
 
     @property
     def resolution(self) -> tuple:
-        """Get resolution of current segment frames.
+        """Get resolution of current segment frames (cached after first read)."""
+        if self._resolution is None:
+            data = self._segment_cache[self.current_segment]
+            # Read one orifra frame to determine resolution
+            first_frame = self._read_orifra_frame(data['orifra_files'][0])
+            self._resolution = first_frame.shape[:2]
+        return self._resolution
 
-        Uses metadata to determine resolution without loading a frame.
-        Falls back to loading the first frame if metadata doesn't contain it.
-        """
-        data = self._segment_cache[self.current_segment]
-        # Try to get resolution from first orifra frame
-        first_frame = self._read_orifra_frame(data['orifra_files'][0])
-        return first_frame.shape[:2]
+    @property
+    def preload_stats(self) -> dict:
+        """Diagnostics from the batch preloader."""
+        return self._preloader.stats
 
     def get_model_paths(self) -> dict:
         """Get paths to model checkpoints."""
@@ -637,7 +724,7 @@ class CharacterDataPack:
 
     def close(self):
         """Release GPU memory."""
-        # Clear preloader buffers
+        self._preloader.close()
         self._preloader.reset('')
         for segment_data in self._segment_cache.values():
             segment_data.clear()

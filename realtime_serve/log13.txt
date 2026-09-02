@@ -1,0 +1,244 @@
+(D:\AI\EDTalk\runtime312) PS D:\AI\EDTalk> python -m realtime_serve.main --character-dir wy --target-fps 25 --face-repair on
+============================================================
+EDTalk Realtime Streaming Inference Service
+============================================================
+
+[Config] target_fps=25 output pacing only
+[Config] buffer_frames=8 (~88MB)
+[Config] preroll_frames=4 (~0.16s startup delay)
+
+[1/7] Loading character data: wy...
+  -> Segment "1": 12341 frames (lazy), resolution from metadata
+==> loaded character: wy
+  -> Available segments: ['1', '11', '22', '33', '44', '55']
+  -> Current segment: 1
+  -> Batch preload enabled (batch_size=100, window=200)
+
+[2/7] Loading models...
+==> loading Audio2Lip model
+==> loading Generator model
+==> warmup done in 0.4s
+==> models loaded successfully
+
+[3/7] Initializing audio processing...
+[AudioProcessor] Idle audio loaded: D:\AI\EDTalk\realtime_serve\noice.wav
+  Duration: 99.8s, RMS: 0.003966, ~-48 dB
+
+[4/7] Initializing face repair (mode: on)...
+[FaceRepair] Model loaded: realtime_serve/weights/facefix256.onnx
+[FaceRepair] Provider: CUDAExecutionProvider
+[FaceRepair] Alpha (repair strength): 0.7
+[FaceRepair] GPU-inline IOBinding: active
+[FaceRepair] Warmup complete
+
+[5/7] Initializing mouth compositor...
+
+[6/7] Initializing output buffer and streamer...
+
+[7/7] Initializing UnityCapture sender...
+Character resolution: (2560, 1440) -> Camera: 1440x2560
+Initializing virtual camera: 1440x2560@25fps
+尝试使用后端: unitycapture
+虚拟摄像头初始化成功 (backend: unitycapture)
+测试帧发送成功
+
+Initializing audio player...
+[AudioPlayer] Independent playback mode: 16000Hz
+
+Creating render loop...
+
+Service initialized successfully!
+------------------------------------------------------------
+
+Starting output streamer...
+[OutputStreamer] Preroll: waiting for 4 frames
+Starting render loop...
+
+API server running at http://0.0.0.0:8000
+Endpoints:
+  POST /audio/push      - Push audio chunk (streaming TTS)
+  POST /audio/push_full - Push full audio segment (file-based)
+  POST /segment/switch  - Switch segment
+  GET  /status          - Get service status
+
+Press Ctrl+C to stop.
+
+INFO:     Started server process [5284]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[OutputStreamer] Preroll complete (4 frames); resuming output at 25fps
+[RenderLoop] FPS:20.1  frame:99  mode:idle  buffer:0  gen=p50:31.6/p95:51.8/p99:107.1ms comp=p50:0.3/p95:1.9/p99:2.4ms repair=p50:7.7/p95:17.2/p99:19.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.4/p95:84.2/p99:127.8ms
+[RenderLoop] FPS:19.1  frame:202  mode:idle  buffer:1  gen=p50:32.6/p95:49.2/p99:99.5ms comp=p50:0.3/p95:1.6/p99:6.8ms repair=p50:8.0/p95:14.6/p99:19.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.8/p95:69.0/p99:118.6ms
+[RenderLoop] FPS:22.1  frame:309  mode:idle  buffer:0  gen=p50:32.5/p95:49.2/p99:99.1ms comp=p50:0.3/p95:1.6/p99:6.3ms repair=p50:8.1/p95:13.2/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.0/p95:69.2/p99:115.7ms
+[RenderLoop] FPS:25.0  frame:417  mode:idle  buffer:0  gen=p50:27.1/p95:45.3/p99:81.1ms comp=p50:0.3/p95:0.3/p99:4.0ms repair=p50:8.4/p95:12.8/p99:14.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:40.1/p95:57.5/p99:102.1ms
+[RenderLoop] FPS:17.3  frame:527  mode:idle  buffer:0  gen=p50:21.4/p95:53.8/p99:82.0ms comp=p50:0.3/p95:0.3/p99:1.0ms repair=p50:9.1/p95:13.0/p99:17.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:75.6/p99:100.1ms
+[RenderLoop] FPS:23.1  frame:639  mode:idle  buffer:0  gen=p50:21.2/p95:48.4/p99:85.3ms comp=p50:0.3/p95:0.3/p99:1.2ms repair=p50:9.1/p95:12.6/p99:17.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:68.6/p99:100.9ms
+[RenderLoop] FPS:23.1  frame:750  mode:idle  buffer:0  gen=p50:21.4/p95:47.0/p99:94.4ms comp=p50:0.3/p95:0.3/p99:1.0ms repair=p50:8.9/p95:12.9/p99:14.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:61.7/p99:106.6ms
+[RenderLoop] FPS:24.4  frame:861  mode:idle  buffer:0  gen=p50:21.4/p95:40.0/p99:91.6ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.7/p95:12.7/p99:13.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:55.3/p99:107.8ms
+[RenderLoop] FPS:18.4  frame:972  mode:idle  buffer:1  gen=p50:21.4/p95:43.8/p99:94.7ms comp=p50:0.3/p95:0.4/p99:0.5ms repair=p50:8.7/p95:12.3/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:59.9/p99:113.3ms
+[RenderLoop] FPS:25.0  frame:1087  mode:idle  buffer:0  gen=p50:21.1/p95:43.8/p99:94.5ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.7/p95:11.4/p99:14.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:59.9/p99:111.3ms
+[RenderLoop] FPS:24.0  frame:1201  mode:idle  buffer:0  gen=p50:21.1/p95:37.3/p99:85.1ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.7/p95:12.2/p99:14.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:55.0/p99:97.5ms
+[RenderLoop] FPS:24.8  frame:1313  mode:idle  buffer:0  gen=p50:21.2/p95:49.6/p99:81.4ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.7/p95:12.2/p99:14.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:64.9/p99:97.5ms
+[RenderLoop] FPS:17.4  frame:1424  mode:idle  buffer:0  gen=p50:21.2/p95:49.8/p99:90.8ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.7/p95:11.8/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:67.4/p99:106.6ms
+[RenderLoop] FPS:23.9  frame:1537  mode:idle  buffer:0  gen=p50:21.3/p95:50.3/p99:84.9ms comp=p50:0.3/p95:0.5/p99:4.3ms repair=p50:8.7/p95:12.2/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:68.5/p99:101.1ms
+[RenderLoop] FPS:24.1  frame:1650  mode:idle  buffer:0  gen=p50:21.3/p95:42.1/p99:82.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.6/p95:11.2/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:53.9/p99:96.8ms
+[RenderLoop] FPS:23.0  frame:1757  mode:idle  buffer:1  gen=p50:22.1/p95:47.9/p99:91.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.3/p95:12.6/p99:15.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:59.5/p99:108.0ms
+[RenderLoop] FPS:16.7  frame:1865  mode:idle  buffer:1  gen=p50:22.6/p95:50.2/p99:85.9ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.3/p95:13.0/p99:15.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:67.7/p99:99.2ms
+[RenderLoop] FPS:23.0  frame:1972  mode:idle  buffer:0  gen=p50:27.3/p95:50.2/p99:92.7ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.5/p95:13.0/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.9/p95:67.8/p99:108.0ms
+[RenderLoop] FPS:23.1  frame:2087  mode:idle  buffer:0  gen=p50:21.9/p95:38.5/p99:87.5ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.6/p95:12.4/p99:14.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:55.3/p99:105.6ms
+[RenderLoop] FPS:17.9  frame:2194  mode:idle  buffer:0  gen=p50:21.4/p95:49.9/p99:99.1ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.6/p95:12.4/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:67.3/p99:119.0ms
+[RenderLoop] FPS:16.8  frame:2300  mode:idle  buffer:0  gen=p50:23.6/p95:49.9/p99:96.9ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.4/p95:13.2/p99:14.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.0/p95:67.3/p99:114.4ms
+[RenderLoop] FPS:23.1  frame:2411  mode:idle  buffer:0  gen=p50:23.5/p95:49.9/p99:100.5ms comp=p50:0.3/p95:0.3/p99:3.5ms repair=p50:8.3/p95:12.7/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.8/p95:67.3/p99:116.7ms
+[RenderLoop] FPS:23.6  frame:2521  mode:idle  buffer:0  gen=p50:23.3/p95:41.6/p99:76.7ms comp=p50:0.3/p95:0.3/p99:3.5ms repair=p50:8.3/p95:12.7/p99:14.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.7/p95:56.2/p99:94.1ms
+[RenderLoop] FPS:22.0  frame:2626  mode:idle  buffer:1  gen=p50:22.8/p95:51.5/p99:89.2ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.6/p95:12.4/p99:13.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:69.4/p99:101.3ms
+[RenderLoop] FPS:19.3  frame:2730  mode:idle  buffer:1  gen=p50:24.1/p95:48.8/p99:95.1ms comp=p50:0.3/p95:0.4/p99:5.4ms repair=p50:8.5/p95:12.8/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.4/p95:66.5/p99:112.2ms
+[RenderLoop] FPS:25.0  frame:2842  mode:idle  buffer:1  gen=p50:25.3/p95:50.3/p99:89.8ms comp=p50:0.3/p95:0.4/p99:5.5ms repair=p50:8.5/p95:13.1/p99:15.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.8/p95:68.4/p99:101.7ms
+[RenderLoop] FPS:25.0  frame:2956  mode:idle  buffer:0  gen=p50:21.3/p95:40.9/p99:82.3ms comp=p50:0.3/p95:0.3/p99:3.8ms repair=p50:9.0/p95:12.5/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:55.6/p99:100.4ms
+[RenderLoop] FPS:18.5  frame:3062  mode:idle  buffer:0  gen=p50:21.0/p95:53.8/p99:92.7ms comp=p50:0.3/p95:0.3/p99:3.8ms repair=p50:9.2/p95:11.9/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:67.5/p99:112.3ms
+[RenderLoop] FPS:24.9  frame:3178  mode:idle  buffer:0  gen=p50:21.0/p95:51.6/p99:78.9ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.1/p95:12.1/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:71.2/p99:107.5ms
+[RenderLoop] FPS:25.0  frame:3295  mode:idle  buffer:0  gen=p50:20.9/p95:41.5/p99:81.2ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.0/p95:10.4/p99:15.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:52.6/p99:106.2ms
+[RenderLoop] FPS:23.6  frame:3409  mode:idle  buffer:0  gen=p50:21.0/p95:38.7/p99:77.0ms comp=p50:0.3/p95:0.3/p99:0.3ms repair=p50:8.9/p95:10.3/p99:15.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:51.4/p99:93.5ms
+[RenderLoop] FPS:25.0  frame:3517  mode:idle  buffer:0  gen=p50:21.0/p95:47.6/p99:93.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.9/p95:10.6/p99:13.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:67.0/p99:111.8ms
+[RenderLoop] FPS:20.0  frame:3633  mode:idle  buffer:0  gen=p50:21.0/p95:47.6/p99:95.3ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:9.1/p95:10.5/p99:12.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:65.0/p99:112.1ms
+[RenderLoop] FPS:24.3  frame:3749  mode:idle  buffer:0  gen=p50:20.9/p95:41.7/p99:93.7ms comp=p50:0.3/p95:0.4/p99:0.5ms repair=p50:9.2/p95:10.4/p99:14.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:53.2/p99:108.3ms
+[RenderLoop] FPS:25.0  frame:3864  mode:idle  buffer:0  gen=p50:20.8/p95:41.6/p99:83.7ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:9.2/p95:10.9/p99:15.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:52.1/p99:101.3ms
+[RenderLoop] FPS:16.0  frame:3969  mode:idle  buffer:0  gen=p50:21.1/p95:50.7/p99:94.6ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:9.1/p95:12.2/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:68.2/p99:109.5ms
+[RenderLoop] FPS:23.0  frame:4082  mode:idle  buffer:0  gen=p50:21.2/p95:49.7/p99:97.8ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.9/p95:12.0/p99:13.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:66.9/p99:110.2ms
+[RenderLoop] FPS:24.0  frame:4193  mode:idle  buffer:0  gen=p50:21.6/p95:48.2/p99:99.9ms comp=p50:0.3/p95:0.4/p99:0.5ms repair=p50:8.7/p95:12.0/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:66.3/p99:117.4ms
+[RenderLoop] FPS:22.3  frame:4305  mode:idle  buffer:0  gen=p50:21.9/p95:40.8/p99:93.3ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.6/p95:11.5/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:53.1/p99:107.7ms
+[RenderLoop] FPS:23.5  frame:4411  mode:idle  buffer:0  gen=p50:21.4/p95:51.5/p99:94.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.7/p95:11.1/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:68.6/p99:106.8ms
+[RenderLoop] FPS:19.6  frame:4521  mode:idle  buffer:0  gen=p50:22.8/p95:43.7/p99:94.3ms comp=p50:0.3/p95:0.5/p99:0.9ms repair=p50:8.7/p95:12.6/p99:13.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.4/p95:60.3/p99:110.5ms
+[RenderLoop] FPS:23.9  frame:4634  mode:idle  buffer:0  gen=p50:22.5/p95:49.7/p99:95.3ms comp=p50:0.3/p95:0.5/p99:3.2ms repair=p50:8.7/p95:12.6/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:67.4/p99:110.0ms
+[RenderLoop] FPS:22.5  frame:4744  mode:idle  buffer:1  gen=p50:22.1/p95:41.0/p99:86.5ms comp=p50:0.3/p95:0.5/p99:2.9ms repair=p50:8.6/p95:12.3/p99:14.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:57.0/p99:99.9ms
+[RenderLoop] FPS:16.3  frame:4841  mode:idle  buffer:1  gen=p50:24.0/p95:47.6/p99:93.6ms comp=p50:0.3/p95:0.3/p99:3.4ms repair=p50:8.4/p95:12.8/p99:14.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.9/p95:65.6/p99:116.3ms
+[RenderLoop] FPS:19.9  frame:4937  mode:idle  buffer:1  gen=p50:34.0/p95:50.7/p99:98.6ms comp=p50:0.3/p95:0.3/p99:5.2ms repair=p50:8.2/p95:13.9/p99:15.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:46.2/p95:68.2/p99:116.3ms
+[RenderLoop] FPS:20.2  frame:5033  mode:idle  buffer:0  gen=p50:34.7/p95:49.7/p99:95.6ms comp=p50:0.3/p95:0.3/p99:3.4ms repair=p50:8.5/p95:14.9/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:49.0/p95:68.0/p99:115.0ms
+[RenderLoop] FPS:20.0  frame:5129  mode:idle  buffer:1  gen=p50:34.7/p95:57.4/p99:95.0ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.6/p95:15.0/p99:16.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:49.5/p95:80.2/p99:113.3ms
+[RenderLoop] FPS:16.3  frame:5223  mode:idle  buffer:0  gen=p50:34.6/p95:53.4/p99:95.0ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.8/p95:14.6/p99:15.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:49.4/p95:69.9/p99:116.9ms
+[RenderLoop] FPS:17.7  frame:5320  mode:idle  buffer:0  gen=p50:34.6/p95:53.4/p99:98.7ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.8/p95:14.5/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:49.2/p95:69.9/p99:120.1ms
+[RenderLoop] FPS:21.5  frame:5424  mode:idle  buffer:0  gen=p50:34.0/p95:50.0/p99:87.4ms comp=p50:0.3/p95:0.3/p99:1.2ms repair=p50:8.6/p95:14.3/p99:15.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:47.4/p95:62.4/p99:106.7ms
+[RenderLoop] FPS:21.5  frame:5525  mode:idle  buffer:1  gen=p50:33.0/p95:50.0/p99:87.4ms comp=p50:0.3/p95:0.3/p99:1.1ms repair=p50:8.4/p95:13.9/p99:14.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.9/p95:66.6/p99:104.6ms
+[RenderLoop] FPS:17.3  frame:5634  mode:idle  buffer:0  gen=p50:30.9/p95:48.5/p99:83.0ms comp=p50:0.3/p95:0.3/p99:1.1ms repair=p50:8.3/p95:12.8/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:41.8/p95:67.1/p99:100.0ms
+[RenderLoop] FPS:21.5  frame:5737  mode:idle  buffer:0  gen=p50:30.2/p95:47.9/p99:85.9ms comp=p50:0.3/p95:0.3/p99:1.1ms repair=p50:8.3/p95:12.8/p99:15.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:42.1/p95:66.7/p99:100.0ms
+[RenderLoop] FPS:20.7  frame:5839  mode:idle  buffer:0  gen=p50:32.6/p95:48.5/p99:90.3ms comp=p50:0.3/p95:0.3/p99:1.2ms repair=p50:8.2/p95:13.1/p99:15.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.3/p95:66.5/p99:112.8ms
+[RenderLoop] FPS:21.2  frame:5936  mode:idle  buffer:1  gen=p50:33.4/p95:56.7/p99:90.3ms comp=p50:0.3/p95:0.3/p99:1.4ms repair=p50:8.3/p95:14.3/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:45.8/p95:72.0/p99:113.4ms
+[RenderLoop] FPS:18.7  frame:6037  mode:idle  buffer:0  gen=p50:33.6/p95:48.7/p99:89.8ms comp=p50:0.3/p95:0.3/p99:3.8ms repair=p50:8.3/p95:14.3/p99:14.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:46.2/p95:68.5/p99:108.3ms
+[RenderLoop] FPS:21.5  frame:6137  mode:idle  buffer:0  gen=p50:33.6/p95:48.5/p99:92.7ms comp=p50:0.3/p95:0.3/p99:5.4ms repair=p50:8.5/p95:14.3/p99:15.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:45.6/p95:67.7/p99:114.0ms
+[RenderLoop] FPS:22.1  frame:6237  mode:idle  buffer:1  gen=p50:33.5/p95:49.8/p99:92.7ms comp=p50:0.3/p95:0.3/p99:5.7ms repair=p50:8.5/p95:14.0/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:46.1/p95:68.5/p99:114.0ms
+[RenderLoop] FPS:19.0  frame:6333  mode:idle  buffer:1  gen=p50:34.0/p95:49.8/p99:94.3ms comp=p50:0.3/p95:0.3/p99:5.7ms repair=p50:8.4/p95:14.3/p99:15.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:47.6/p95:69.5/p99:110.1ms
+[RenderLoop] FPS:20.4  frame:6432  mode:idle  buffer:0  gen=p50:33.7/p95:49.4/p99:93.9ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.3/p95:13.7/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:46.0/p95:66.9/p99:105.2ms
+[RenderLoop] FPS:20.7  frame:6533  mode:idle  buffer:0  gen=p50:33.6/p95:48.4/p99:86.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.4/p95:14.1/p99:15.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:45.9/p95:66.1/p99:102.6ms
+[RenderLoop] FPS:22.1  frame:6642  mode:idle  buffer:0  gen=p50:31.5/p95:47.7/p99:91.9ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.6/p95:13.7/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:43.5/p95:65.2/p99:106.4ms
+[RenderLoop] FPS:23.6  frame:6749  mode:idle  buffer:0  gen=p50:22.0/p95:46.1/p99:91.9ms comp=p50:0.3/p95:0.4/p99:0.6ms repair=p50:8.7/p95:12.7/p99:14.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.5/p95:63.0/p99:106.4ms
+[RenderLoop] FPS:17.0  frame:6863  mode:idle  buffer:0  gen=p50:21.1/p95:50.3/p99:90.3ms comp=p50:0.3/p95:0.4/p99:3.7ms repair=p50:8.9/p95:11.8/p99:15.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:68.0/p99:110.1ms
+[RenderLoop] FPS:23.0  frame:6977  mode:idle  buffer:0  gen=p50:21.0/p95:50.2/p99:99.8ms comp=p50:0.3/p95:0.3/p99:3.6ms repair=p50:9.1/p95:11.8/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:67.6/p99:118.6ms
+[RenderLoop] FPS:23.0  frame:7089  mode:idle  buffer:1  gen=p50:21.2/p95:39.9/p99:97.9ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.9/p95:11.7/p99:14.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:52.5/p99:111.8ms
+[RenderLoop] FPS:19.6  frame:7193  mode:idle  buffer:1  gen=p50:21.9/p95:50.6/p99:90.3ms comp=p50:0.3/p95:0.4/p99:5.5ms repair=p50:8.7/p95:12.0/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.5/p95:67.2/p99:109.0ms
+[RenderLoop] FPS:21.3  frame:7306  mode:idle  buffer:0  gen=p50:21.6/p95:50.8/p99:84.7ms comp=p50:0.3/p95:0.4/p99:5.4ms repair=p50:8.8/p95:12.4/p99:15.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:67.6/p99:105.3ms
+[RenderLoop] FPS:22.1  frame:7418  mode:idle  buffer:0  gen=p50:21.4/p95:50.8/p99:90.0ms comp=p50:0.3/p95:0.3/p99:2.7ms repair=p50:8.8/p95:11.9/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:67.6/p99:106.6ms
+[RenderLoop] FPS:23.6  frame:7529  mode:idle  buffer:1  gen=p50:21.3/p95:41.0/p99:76.5ms comp=p50:0.3/p95:0.3/p99:5.1ms repair=p50:8.8/p95:11.4/p99:15.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:56.9/p99:92.1ms
+[RenderLoop] FPS:23.1  frame:7632  mode:idle  buffer:1  gen=p50:25.8/p95:43.7/p99:99.2ms comp=p50:0.3/p95:0.3/p99:2.7ms repair=p50:8.6/p95:12.9/p99:16.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.6/p95:59.0/p99:120.7ms
+[RenderLoop] FPS:17.0  frame:7739  mode:idle  buffer:1  gen=p50:27.7/p95:49.0/p99:99.0ms comp=p50:0.3/p95:0.4/p99:2.9ms repair=p50:8.6/p95:12.9/p99:14.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:40.0/p95:65.6/p99:119.5ms
+[RenderLoop] FPS:22.0  frame:7847  mode:idle  buffer:1  gen=p50:28.9/p95:49.3/p99:98.4ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.5/p95:13.0/p99:14.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:41.5/p95:66.6/p99:117.8ms
+[RenderLoop] FPS:24.4  frame:7958  mode:idle  buffer:0  gen=p50:22.8/p95:41.3/p99:101.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.6/p95:12.6/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.1/p95:52.5/p99:118.3ms
+[RenderLoop] FPS:19.3  frame:8062  mode:idle  buffer:0  gen=p50:22.6/p95:50.1/p99:99.8ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.7/p95:12.9/p99:15.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:65.2/p99:116.1ms
+[RenderLoop] FPS:22.3  frame:8176  mode:idle  buffer:0  gen=p50:21.9/p95:43.6/p99:91.2ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.6/p95:13.0/p99:15.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:65.0/p99:108.3ms
+[RenderLoop] FPS:22.5  frame:8283  mode:idle  buffer:1  gen=p50:23.4/p95:47.3/p99:91.2ms comp=p50:0.3/p95:0.5/p99:1.0ms repair=p50:8.4/p95:13.3/p99:15.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.2/p95:65.0/p99:110.6ms
+[RenderLoop] FPS:23.0  frame:8394  mode:idle  buffer:0  gen=p50:23.5/p95:40.2/p99:86.7ms comp=p50:0.3/p95:0.5/p99:0.9ms repair=p50:8.3/p95:12.9/p99:14.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.9/p95:52.1/p99:105.6ms
+[RenderLoop] FPS:17.0  frame:8497  mode:idle  buffer:0  gen=p50:23.0/p95:49.6/p99:99.6ms comp=p50:0.3/p95:0.5/p99:1.1ms repair=p50:8.0/p95:12.8/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.3/p95:66.9/p99:121.1ms
+[RenderLoop] FPS:22.9  frame:8604  mode:idle  buffer:1  gen=p50:27.3/p95:49.6/p99:99.6ms comp=p50:0.3/p95:0.4/p99:0.7ms repair=p50:8.0/p95:13.1/p99:14.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:40.0/p95:66.8/p99:121.1ms
+[RenderLoop] FPS:22.7  frame:8712  mode:idle  buffer:0  gen=p50:28.9/p95:49.6/p99:100.4ms comp=p50:0.3/p95:0.3/p99:1.5ms repair=p50:8.1/p95:12.3/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:41.6/p95:66.8/p99:120.6ms
+[RenderLoop] FPS:23.0  frame:8823  mode:idle  buffer:1  gen=p50:24.4/p95:40.5/p99:92.3ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.5/p95:12.1/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.3/p95:53.4/p99:112.0ms
+[RenderLoop] FPS:18.6  frame:8927  mode:idle  buffer:1  gen=p50:25.1/p95:43.3/p99:89.4ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.5/p95:12.5/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.7/p95:67.5/p99:104.4ms
+[RenderLoop] FPS:19.8  frame:9035  mode:idle  buffer:0  gen=p50:25.1/p95:49.5/p99:87.3ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:8.4/p95:13.2/p99:15.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.8/p95:67.7/p99:106.4ms
+[RenderLoop] FPS:22.0  frame:9141  mode:idle  buffer:0  gen=p50:30.8/p95:49.5/p99:92.7ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.2/p95:12.9/p99:15.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:42.8/p95:67.6/p99:109.5ms
+[RenderLoop] FPS:23.0  frame:9249  mode:idle  buffer:1  gen=p50:29.9/p95:41.5/p99:99.3ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.3/p95:12.6/p99:14.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:41.9/p95:52.7/p99:120.1ms
+[RenderLoop] FPS:17.3  frame:9357  mode:idle  buffer:1  gen=p50:22.5/p95:49.4/p99:93.5ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.5/p95:12.4/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.0/p95:65.8/p99:114.3ms
+[RenderLoop] FPS:24.0  frame:9468  mode:idle  buffer:0  gen=p50:21.4/p95:49.4/p99:93.5ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.7/p95:12.5/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:61.2/p99:112.3ms
+[RenderLoop] FPS:23.1  frame:9577  mode:idle  buffer:0  gen=p50:22.8/p95:42.2/p99:90.0ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.4/p95:12.5/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:37.6/p95:58.3/p99:105.4ms
+[RenderLoop] FPS:21.0  frame:9685  mode:idle  buffer:1  gen=p50:21.7/p95:41.9/p99:82.5ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.4/p95:12.5/p99:16.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:58.0/p99:99.7ms
+[RenderLoop] FPS:20.2  frame:9796  mode:idle  buffer:1  gen=p50:21.0/p95:50.0/p99:92.3ms comp=p50:0.3/p95:0.3/p99:3.3ms repair=p50:8.7/p95:12.6/p99:14.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:67.8/p99:110.7ms
+[RenderLoop] FPS:21.6  frame:9908  mode:idle  buffer:0  gen=p50:21.0/p95:50.3/p99:92.3ms comp=p50:0.3/p95:0.3/p99:5.2ms repair=p50:8.8/p95:11.6/p99:13.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:32.9/p95:68.2/p99:110.7ms
+[RenderLoop] FPS:23.1  frame:10018  mode:idle  buffer:1  gen=p50:21.5/p95:42.6/p99:98.2ms comp=p50:0.3/p95:0.3/p99:5.4ms repair=p50:8.6/p95:11.6/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:55.1/p99:114.0ms
+[RenderLoop] FPS:22.8  frame:10125  mode:idle  buffer:0  gen=p50:21.4/p95:43.1/p99:87.8ms comp=p50:0.3/p95:0.5/p99:5.7ms repair=p50:8.7/p95:12.4/p99:15.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:59.8/p99:102.7ms
+[RenderLoop] FPS:15.8  frame:10232  mode:idle  buffer:0  gen=p50:22.1/p95:46.6/p99:89.1ms comp=p50:0.3/p95:0.5/p99:4.6ms repair=p50:8.6/p95:13.0/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.2/p95:65.1/p99:104.2ms
+[RenderLoop] FPS:23.6  frame:10342  mode:idle  buffer:1  gen=p50:22.0/p95:46.6/p99:91.8ms comp=p50:0.3/p95:0.5/p99:1.8ms repair=p50:8.5/p95:13.1/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.7/p95:65.0/p99:106.2ms
+[RenderLoop] FPS:21.3  frame:10450  mode:idle  buffer:0  gen=p50:22.9/p95:40.8/p99:91.8ms comp=p50:0.3/p95:0.5/p99:4.8ms repair=p50:8.6/p95:13.1/p99:14.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.4/p95:55.4/p99:103.8ms
+[RenderLoop] FPS:23.5  frame:10560  mode:idle  buffer:0  gen=p50:23.2/p95:40.8/p99:92.0ms comp=p50:0.3/p95:0.5/p99:4.9ms repair=p50:8.9/p95:12.8/p99:14.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.8/p95:54.3/p99:108.8ms
+[RenderLoop] FPS:24.0  frame:10670  mode:idle  buffer:0  gen=p50:23.2/p95:42.2/p99:93.2ms comp=p50:0.3/p95:0.5/p99:4.9ms repair=p50:8.9/p95:12.6/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:35.3/p95:57.1/p99:108.8ms
+[RenderLoop] FPS:19.0  frame:10775  mode:idle  buffer:0  gen=p50:22.4/p95:65.2/p99:96.7ms comp=p50:0.3/p95:0.4/p99:3.4ms repair=p50:9.1/p95:12.3/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.6/p95:79.9/p99:111.5ms
+[RenderLoop] FPS:20.9  frame:10887  mode:idle  buffer:1  gen=p50:21.6/p95:44.9/p99:98.3ms comp=p50:0.3/p95:0.3/p99:1.0ms repair=p50:9.0/p95:12.7/p99:14.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:60.1/p99:111.5ms
+[RenderLoop] FPS:23.9  frame:10998  mode:idle  buffer:0  gen=p50:21.8/p95:48.7/p99:96.7ms comp=p50:0.3/p95:0.3/p99:1.0ms repair=p50:8.9/p95:13.3/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:67.2/p99:111.1ms
+[RenderLoop] FPS:25.0  frame:11110  mode:idle  buffer:1  gen=p50:21.6/p95:41.8/p99:82.9ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.0/p95:12.8/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:52.5/p99:105.7ms
+[RenderLoop] FPS:16.5  frame:11217  mode:idle  buffer:0  gen=p50:21.4/p95:52.5/p99:93.1ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.7/p95:12.1/p99:14.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:69.6/p99:107.6ms
+[RenderLoop] FPS:22.8  frame:11329  mode:idle  buffer:0  gen=p50:21.3/p95:51.8/p99:93.1ms comp=p50:0.3/p95:0.3/p99:3.4ms repair=p50:8.7/p95:12.1/p99:14.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:69.5/p99:106.4ms
+[RenderLoop] FPS:23.8  frame:11443  mode:idle  buffer:1  gen=p50:21.1/p95:41.2/p99:87.0ms comp=p50:0.3/p95:0.3/p99:1.0ms repair=p50:8.8/p95:11.9/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:53.3/p99:103.5ms
+[RenderLoop] FPS:24.0  frame:11554  mode:idle  buffer:1  gen=p50:20.9/p95:40.5/p99:95.3ms comp=p50:0.3/p95:0.3/p99:2.2ms repair=p50:9.1/p95:11.7/p99:15.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:53.2/p99:110.4ms
+[RenderLoop] FPS:19.6  frame:11663  mode:idle  buffer:0  gen=p50:21.1/p95:52.1/p99:95.6ms comp=p50:0.3/p95:0.3/p99:1.8ms repair=p50:9.1/p95:12.2/p99:14.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:69.1/p99:111.2ms
+[RenderLoop] FPS:24.0  frame:11776  mode:idle  buffer:0  gen=p50:21.8/p95:50.7/p99:90.1ms comp=p50:0.3/p95:0.3/p99:3.1ms repair=p50:8.9/p95:12.5/p99:16.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:68.4/p99:104.7ms
+[RenderLoop] FPS:23.6  frame:11887  mode:idle  buffer:0  gen=p50:21.2/p95:40.4/p99:83.7ms comp=p50:0.3/p95:0.3/p99:5.1ms repair=p50:8.9/p95:12.7/p99:19.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:60.0/p99:99.7ms
+[RenderLoop] FPS:23.1  frame:11992  mode:idle  buffer:1  gen=p50:22.0/p95:43.2/p99:91.8ms comp=p50:0.3/p95:0.4/p99:5.1ms repair=p50:8.8/p95:12.7/p99:15.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:60.3/p99:112.8ms
+[RenderLoop] FPS:16.5  frame:12098  mode:idle  buffer:1  gen=p50:24.1/p95:43.9/p99:97.8ms comp=p50:0.3/p95:0.3/p99:3.3ms repair=p50:8.6/p95:12.5/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.7/p95:59.6/p99:114.9ms
+[RenderLoop] FPS:23.4  frame:12206  mode:idle  buffer:0  gen=p50:27.5/p95:46.4/p99:96.2ms comp=p50:0.3/p95:0.3/p99:5.6ms repair=p50:8.4/p95:12.7/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:41.8/p95:62.9/p99:112.5ms
+[RenderLoop] FPS:23.2  frame:12318  mode:idle  buffer:1  gen=p50:23.9/p95:38.7/p99:84.0ms comp=p50:0.3/p95:0.3/p99:6.9ms repair=p50:8.7/p95:12.9/p99:15.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:38.1/p95:54.1/p99:106.8ms
+[RenderLoop] FPS:19.1  frame:12424  mode:idle  buffer:1  gen=p50:21.5/p95:41.6/p99:81.9ms comp=p50:0.3/p95:0.3/p99:3.7ms repair=p50:8.8/p95:12.7/p99:16.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:57.6/p99:102.5ms
+[RenderLoop] FPS:19.6  frame:12522  mode:idle  buffer:0  gen=p50:30.0/p95:48.0/p99:86.3ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:8.6/p95:13.8/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:43.1/p95:65.5/p99:110.7ms
+[RenderLoop] FPS:18.5  frame:12620  mode:idle  buffer:1  gen=p50:33.6/p95:48.0/p99:91.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.4/p95:13.8/p99:14.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:47.4/p95:65.4/p99:119.0ms
+[RenderLoop] FPS:22.9  frame:12718  mode:idle  buffer:0  gen=p50:33.9/p95:52.1/p99:97.9ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.4/p95:13.8/p99:14.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:47.8/p95:65.4/p99:121.8ms
+[RenderLoop] FPS:20.6  frame:12813  mode:idle  buffer:1  gen=p50:33.9/p95:57.9/p99:98.6ms comp=p50:0.3/p95:0.4/p99:4.8ms repair=p50:8.5/p95:14.0/p99:17.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:48.1/p95:78.4/p99:119.6ms
+[RenderLoop] FPS:15.3  frame:12907  mode:idle  buffer:1  gen=p50:33.9/p95:48.8/p99:107.0ms comp=p50:0.3/p95:0.4/p99:5.4ms repair=p50:8.5/p95:14.2/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:47.9/p95:65.0/p99:124.3ms
+[RenderLoop] FPS:21.9  frame:13008  mode:idle  buffer:0  gen=p50:34.1/p95:48.8/p99:113.6ms comp=p50:0.3/p95:0.4/p99:5.8ms repair=p50:8.3/p95:14.0/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:47.7/p95:65.0/p99:127.2ms
+[RenderLoop] FPS:22.6  frame:13114  mode:idle  buffer:1  gen=p50:32.5/p95:49.1/p99:108.9ms comp=p50:0.3/p95:0.5/p99:5.7ms repair=p50:8.2/p95:13.0/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.2/p95:67.1/p99:124.1ms
+[RenderLoop] FPS:16.8  frame:13214  mode:idle  buffer:0  gen=p50:31.0/p95:50.1/p99:94.7ms comp=p50:0.3/p95:0.4/p99:0.6ms repair=p50:8.0/p95:12.3/p99:17.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:43.1/p95:69.2/p99:115.1ms
+[RenderLoop] FPS:19.6  frame:13314  mode:idle  buffer:1  gen=p50:32.5/p95:50.0/p99:96.4ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.1/p95:13.2/p99:17.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:44.5/p95:68.0/p99:119.7ms
+[RenderLoop] FPS:22.3  frame:13413  mode:idle  buffer:0  gen=p50:33.4/p95:53.0/p99:99.1ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.2/p95:14.3/p99:16.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:46.7/p95:68.3/p99:120.6ms
+[RenderLoop] FPS:22.0  frame:13516  mode:idle  buffer:1  gen=p50:32.9/p95:55.3/p99:99.1ms comp=p50:0.3/p95:0.3/p99:3.8ms repair=p50:8.5/p95:14.0/p99:16.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:45.8/p95:67.8/p99:120.6ms
+[RenderLoop] FPS:23.0  frame:13617  mode:idle  buffer:1  gen=p50:31.0/p95:48.8/p99:96.4ms comp=p50:0.3/p95:0.4/p99:5.5ms repair=p50:8.5/p95:13.1/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:42.8/p95:66.3/p99:109.9ms
+[RenderLoop] FPS:16.4  frame:13728  mode:idle  buffer:1  gen=p50:22.6/p95:47.8/p99:99.8ms comp=p50:0.3/p95:0.4/p99:3.4ms repair=p50:8.4/p95:13.0/p99:14.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.0/p95:65.5/p99:115.3ms
+[RenderLoop] FPS:25.0  frame:13840  mode:idle  buffer:0  gen=p50:21.7/p95:47.8/p99:102.9ms comp=p50:0.3/p95:0.4/p99:0.5ms repair=p50:8.5/p95:12.4/p99:13.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:65.1/p99:118.4ms
+[RenderLoop] FPS:23.1  frame:13953  mode:idle  buffer:0  gen=p50:21.3/p95:38.5/p99:89.1ms comp=p50:0.3/p95:0.4/p99:0.5ms repair=p50:8.7/p95:11.4/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:51.4/p99:103.9ms
+[RenderLoop] FPS:19.0  frame:14055  mode:idle  buffer:0  gen=p50:21.4/p95:43.7/p99:100.6ms comp=p50:0.3/p95:0.5/p99:3.3ms repair=p50:8.7/p95:12.6/p99:16.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:59.6/p99:120.1ms
+[RenderLoop] FPS:22.0  frame:14166  mode:idle  buffer:0  gen=p50:21.7/p95:44.3/p99:102.8ms comp=p50:0.3/p95:0.3/p99:3.3ms repair=p50:8.5/p95:13.0/p99:15.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:61.1/p99:120.1ms
+[RenderLoop] FPS:23.7  frame:14275  mode:idle  buffer:0  gen=p50:21.9/p95:48.2/p99:105.0ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.5/p95:12.6/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:64.1/p99:119.6ms
+[RenderLoop] FPS:23.1  frame:14385  mode:idle  buffer:0  gen=p50:22.1/p95:39.7/p99:93.6ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:8.5/p95:12.1/p99:13.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.3/p95:53.6/p99:114.6ms
+[RenderLoop] FPS:22.1  frame:14489  mode:idle  buffer:0  gen=p50:21.6/p95:51.7/p99:101.9ms comp=p50:0.3/p95:0.3/p99:1.3ms repair=p50:8.6/p95:12.1/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:69.3/p99:118.9ms
+[RenderLoop] FPS:17.3  frame:14601  mode:idle  buffer:0  gen=p50:21.5/p95:49.2/p99:107.9ms comp=p50:0.3/p95:0.3/p99:1.5ms repair=p50:9.1/p95:12.8/p99:13.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:59.4/p99:123.3ms
+[RenderLoop] FPS:22.1  frame:14713  mode:idle  buffer:0  gen=p50:20.8/p95:48.0/p99:110.7ms comp=p50:0.3/p95:0.3/p99:4.1ms repair=p50:9.3/p95:12.2/p99:13.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:59.5/p99:126.9ms
+[RenderLoop] FPS:24.8  frame:14822  mode:idle  buffer:0  gen=p50:20.9/p95:41.0/p99:98.6ms comp=p50:0.3/p95:0.3/p99:5.7ms repair=p50:9.1/p95:12.6/p99:14.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:54.2/p99:119.8ms
+[RenderLoop] FPS:17.9  frame:14924  mode:idle  buffer:1  gen=p50:20.9/p95:50.3/p99:101.5ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:9.1/p95:13.0/p99:14.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:66.4/p99:124.3ms
+[RenderLoop] FPS:23.0  frame:15030  mode:idle  buffer:0  gen=p50:22.1/p95:50.8/p99:101.1ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.9/p95:12.8/p99:14.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:73.9/p99:123.5ms
+[RenderLoop] FPS:23.6  frame:15137  mode:idle  buffer:1  gen=p50:22.7/p95:55.3/p99:103.5ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:8.8/p95:12.7/p99:15.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.0/p95:73.9/p99:126.5ms
+[RenderLoop] FPS:24.0  frame:15248  mode:idle  buffer:0  gen=p50:20.9/p95:45.2/p99:91.3ms comp=p50:0.3/p95:0.3/p99:0.5ms repair=p50:9.2/p95:12.0/p99:15.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:62.2/p99:113.5ms
+[RenderLoop] FPS:15.6  frame:15343  mode:idle  buffer:0  gen=p50:21.4/p95:50.6/p99:105.6ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:9.2/p95:13.5/p99:16.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:34.0/p95:66.1/p99:126.4ms
+[RenderLoop] FPS:13.8  frame:15451  mode:idle  buffer:0  gen=p50:21.4/p95:52.9/p99:107.6ms comp=p50:0.3/p95:0.3/p99:5.5ms repair=p50:9.3/p95:13.3/p99:15.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.7/p95:69.7/p99:131.2ms
+[RenderLoop] FPS:22.3  frame:15558  mode:idle  buffer:0  gen=p50:21.8/p95:53.1/p99:107.6ms comp=p50:0.3/p95:0.3/p99:5.5ms repair=p50:9.2/p95:12.8/p99:15.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:69.4/p99:125.9ms
+[RenderLoop] FPS:24.0  frame:15673  mode:idle  buffer:0  gen=p50:20.8/p95:42.6/p99:83.8ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.2/p95:10.7/p99:16.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:57.8/p99:99.7ms
+[RenderLoop] FPS:18.3  frame:15768  mode:idle  buffer:0  gen=p50:21.5/p95:50.8/p99:101.0ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:9.1/p95:12.7/p99:16.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:70.1/p99:115.3ms
+[RenderLoop] FPS:22.6  frame:15886  mode:idle  buffer:0  gen=p50:22.6/p95:51.0/p99:101.5ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:9.0/p95:12.6/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:69.2/p99:114.7ms
+[RenderLoop] FPS:24.0  frame:15996  mode:idle  buffer:0  gen=p50:20.9/p95:48.7/p99:83.7ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.1/p95:11.8/p99:13.2ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.0/p95:65.7/p99:95.1ms
+[RenderLoop] FPS:24.4  frame:16105  mode:idle  buffer:1  gen=p50:21.4/p95:47.8/p99:59.9ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:9.0/p95:12.4/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:64.7/p99:80.4ms
+[RenderLoop] FPS:14.7  frame:16208  mode:idle  buffer:1  gen=p50:21.8/p95:49.7/p99:54.9ms comp=p50:0.3/p95:0.3/p99:0.8ms repair=p50:9.0/p95:12.7/p99:16.0ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.6/p95:65.9/p99:90.6ms
+[RenderLoop] FPS:22.5  frame:16314  mode:idle  buffer:0  gen=p50:23.3/p95:49.8/p99:83.9ms comp=p50:0.3/p95:0.3/p99:3.5ms repair=p50:8.8/p95:12.9/p99:15.3ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:37.4/p95:64.8/p99:100.3ms
+[RenderLoop] FPS:24.0  frame:16426  mode:idle  buffer:0  gen=p50:25.3/p95:51.2/p99:86.1ms comp=p50:0.3/p95:0.3/p99:3.5ms repair=p50:8.7/p95:12.4/p99:13.6ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.8/p95:64.9/p99:97.8ms
+[RenderLoop] FPS:23.4  frame:16533  mode:idle  buffer:1  gen=p50:21.7/p95:49.0/p99:64.8ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:8.9/p95:11.8/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:62.5/p99:83.8ms
+[RenderLoop] FPS:20.8  frame:16643  mode:idle  buffer:0  gen=p50:21.1/p95:48.3/p99:91.3ms comp=p50:0.3/p95:0.3/p99:0.9ms repair=p50:9.1/p95:12.4/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:63.0/p99:108.0ms
+[RenderLoop] FPS:16.7  frame:16749  mode:idle  buffer:0  gen=p50:21.2/p95:49.3/p99:86.1ms comp=p50:0.3/p95:0.3/p99:0.6ms repair=p50:9.0/p95:12.4/p99:14.4ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:63.0/p99:102.3ms
+[RenderLoop] FPS:23.7  frame:16859  mode:idle  buffer:0  gen=p50:27.6/p95:48.2/p99:74.2ms comp=p50:0.3/p95:0.3/p99:3.9ms repair=p50:8.8/p95:12.5/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:40.0/p95:62.9/p99:90.5ms
+[RenderLoop] FPS:23.0  frame:16969  mode:idle  buffer:0  gen=p50:23.9/p95:44.1/p99:52.5ms comp=p50:0.3/p95:0.3/p99:2.1ms repair=p50:8.8/p95:13.2/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:39.1/p95:61.1/p99:67.5ms
+[RenderLoop] FPS:16.4  frame:17075  mode:idle  buffer:0  gen=p50:22.1/p95:47.9/p99:80.2ms comp=p50:0.3/p95:0.3/p99:1.3ms repair=p50:9.0/p95:12.8/p99:13.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.5/p95:64.8/p99:93.9ms
+[RenderLoop] FPS:23.9  frame:17183  mode:idle  buffer:0  gen=p50:23.6/p95:49.1/p99:81.1ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:8.9/p95:12.4/p99:14.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:38.8/p95:65.4/p99:94.9ms
+[RenderLoop] FPS:25.0  frame:17298  mode:idle  buffer:0  gen=p50:21.3/p95:46.8/p99:75.1ms comp=p50:0.3/p95:0.3/p99:0.7ms repair=p50:9.0/p95:12.1/p99:14.7ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.3/p95:64.7/p99:88.9ms
+[RenderLoop] FPS:21.0  frame:17409  mode:idle  buffer:0  gen=p50:21.1/p95:43.1/p99:56.8ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.0/p95:10.4/p99:12.8ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:60.2/p99:72.7ms
+[RenderLoop] FPS:20.7  frame:17514  mode:idle  buffer:0  gen=p50:21.4/p95:47.5/p99:58.3ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.1/p95:12.4/p99:15.5ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:63.7/p99:93.6ms
+[RenderLoop] FPS:21.9  frame:17628  mode:idle  buffer:0  gen=p50:21.5/p95:48.6/p99:58.3ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.2/p95:12.6/p99:17.9ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.2/p95:64.8/p99:93.0ms
+[RenderLoop] FPS:25.0  frame:17742  mode:idle  buffer:0  gen=p50:21.0/p95:45.5/p99:78.8ms comp=p50:0.3/p95:0.3/p99:0.4ms repair=p50:9.2/p95:12.3/p99:16.1ms put=p50:0.0/p95:0.0/p99:0.0ms total=p50:33.1/p95:63.4/p99:93.0ms
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [5284]
+
+Shutting down service...
+[AudioPlayer] Closed
+Service stopped.
+(D:\AI\EDTalk\runtime312) PS D:\AI\EDTalk>

@@ -26,15 +26,14 @@ class Trainer(nn.Module):
         self.batch_size = args.batch_size
         self.dis_weight = args.dis_weight
         self.audio2lip = Audio2Lip().to(device)
-        self.train_generator = args.train_generator
+        self.train_generator = True
 
         requires_grad(self.audio2lip.audio_encoder, False)
 
         self.gen = Generator(args.size, args.latent_dim_style, args.latent_dim_lip, args.latent_dim_pose, args.channel_multiplier).to(
             device)
-        if self.train_generator:
-            requires_grad(self.gen, False)
-            requires_grad(self.gen.dec, True)
+        requires_grad(self.gen, False)
+        requires_grad(self.gen.dec, True)
         if self.dis_weight !=0:
             self.dis = Discriminator(args.size, args.channel_multiplier).to(device)
 
@@ -72,20 +71,20 @@ class Trainer(nn.Module):
 
         if args.distributed:
             self.audio2lip = self.audio2lip.module
-            if self.train_generator:
-                self.gen = self.gen.module
-                # self.dis = self.dis.module
+            self.gen = self.gen.module
 
 
         net_parameters = filter(lambda p: p.requires_grad, self.audio2lip.parameters())
         train_parameters = list(net_parameters)
-        if self.train_generator:
-            net_parameters2 = filter(lambda p: p.requires_grad, self.gen.parameters())
-            train_parameters += list(net_parameters2)
+        net_parameters2 = filter(lambda p: p.requires_grad, self.gen.parameters())
+        train_parameters += list(net_parameters2)
+        # 修正: 原 betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio) 导致 beta1=0.0,
+        # Adam 无一阶动量退化为类 RMSProp, 训练不稳定。
+        # 改为标准 Adam betas (0.9, 0.999), lr 已通过 g_reg_ratio 缩放。
         self.g_optim = optim.Adam(
             train_parameters,
             lr=args.lr * g_reg_ratio,
-            betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio)
+            betas=(0.9, 0.999)
         )
 
 
@@ -99,6 +98,11 @@ class Trainer(nn.Module):
         # self.criterion_vgg = VGGLoss().to('cuda')
 
         self.criterion_vgg = VGGLoss().to('cuda')
+
+        # VGG 稀疏计算：每 vgg_sparse_freq 个 iter 计算一次 VGG，权重乘以 N 补偿
+        self.vgg_sparse_freq = getattr(args, 'vgg_sparse_freq', 0)
+        self.disable_vgg = getattr(args, 'disable_vgg', False)
+        self._train_iter = 0
 
         self.sync_weight = args.sync_weight
 
@@ -171,9 +175,9 @@ class Trainer(nn.Module):
                 if torch.cuda.is_available():
                     self.syncnet = self.syncnet.cuda()
                     self.syncnet.eval()
-                self.logloss = nn.BCELoss()
 
         self.start_iter = 0
+
     def g_nonsaturating_loss(self, fake_pred):
         return F.softplus(-fake_pred).mean()
 
@@ -183,84 +187,106 @@ class Trainer(nn.Module):
 
         return real_loss.mean() + fake_loss.mean()
 
-    def gen_update(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox = None): # torch.Size([64, 5, 80, 16])
+    def gen_update(self, audio_features, lip_features, pose_features, identity_img, target_img, bbox = None, scaler=None, step_optimizer=True): # torch.Size([64, 5, 80, 16])
 
         self.audio2lip.train()
         self.gen.train()
-        self.gen.zero_grad()
-        self.audio2lip.zero_grad()
+        # 梯度累积: 仅在实际执行 optimizer step 时清零梯度
+        # 非 step 时保留已有梯度，实现累积效果
+        if step_optimizer:
+            self.gen.zero_grad()
+            self.audio2lip.zero_grad()
+        self._train_iter += 1
         G_losses = {}
-        # requires_grad(self.audio2lip, True)
-        # requires_grad(self.gen.enc, False)
-        # requires_grad(self.gen.dec, False)
-        # requires_grad(self.gen.fc, False)
-        # requires_grad(self.audio2lip.audio_encoder, False)
-        # img_a_identity, img_b_identity, img_a, img_b, imagea_b, imageb_a = bi['img_a_identity'],bi['img_b_identity'],bi['img_a'],bi['img_b'],bi['imagea_b'],bi['imageb_a']
-        # img_a_identity, img_b_identity, img_a, img_b, imagea_b, imageb_a = img_a_identity.cuda(), img_b_identity.cuda(), img_a.cuda(), img_b.cuda(), imagea_b.cuda(), imageb_a.cuda()
-        batch_size, T = audio_features.shape[0], audio_features.shape[1]
-        audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
-        lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
-        # .reshape([bbs*bs, 3, 256, 256])
-        G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
-        G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*0.1
 
-        wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
-        lip_features_predict = lip_features_predict.reshape([batch_size*T, 20])
-        pose_features = pose_features.reshape([batch_size*T, 6])
-        alpha = torch.cat([lip_features_predict, pose_features], dim=-1)
-        directions = self.gen.direction_lipnonlip(alpha)
-        rep = torch.LongTensor([T]*batch_size).cuda()
-        wa_identity = torch.repeat_interleave(wa_identity, rep, dim=0)
-        layer_num = len(feats_identity)
-        for i in range(layer_num):
-            feats_identity[i] = torch.repeat_interleave(feats_identity[i], rep, dim=0)
+        # AMP autocast: 前向传播在 FP16 下执行，减少显存占用并加速计算
+        # 注意: backward 仍需 FP32 (GradScaler 自动处理), SyncNet/crop_bbox 等
+        # 自定义操作在 autocast 下安全（PyTorch 会自动选择合适精度）
+        use_amp = scaler is not None
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            batch_size, T = audio_features.shape[0], audio_features.shape[1]
+            audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
+            lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
+            G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
+            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*0.5
 
-        latent = wa_identity + directions
+            wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
+            lip_features_predict = lip_features_predict.reshape([batch_size*T, 20])
+            pose_features = pose_features.reshape([batch_size*T, 6])
+            alpha = torch.cat([lip_features_predict, pose_features], dim=-1)
+            directions = self.gen.direction_lipnonlip(alpha)
+            rep = torch.LongTensor([T]*batch_size).cuda()
+            wa_identity = torch.repeat_interleave(wa_identity, rep, dim=0)
+            layer_num = len(feats_identity)
+            for i in range(layer_num):
+                feats_identity[i] = torch.repeat_interleave(feats_identity[i], rep, dim=0)
 
-        recon = self.gen.dec(latent, None, feats_identity)# torch.Size([20, 3, 256, 256])
-        if self.dis_weight !=0:
-            recon_pred = self.dis(recon)
-        target_img = target_img.reshape([batch_size*T, 3, 256, 256])
+            latent = wa_identity + directions
 
-        G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
-        if self.dis_weight !=0:
-            G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
+            recon = self.gen.dec(latent, None, feats_identity)# torch.Size([20, 3, 256, 256])
+            if self.dis_weight !=0:
+                recon_pred = self.dis(recon)
+            target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
-        G_losses['recon_l1_loss'] = F.l1_loss(recon, target_img)
+            # VGG 感知损失：支持稀疏计算 + 权重补偿
+            # vgg_sparse_freq=0: 每 iter 计算 VGG，权重 0.5
+            # vgg_sparse_freq=N: 每 N iter 计算一次 VGG，权重 0.5×N（保持平均贡献不变）
+            # disable_vgg=True: 完全关闭 VGG loss
+            if self.disable_vgg:
+                G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
+            elif self.vgg_sparse_freq > 0 and self._train_iter % self.vgg_sparse_freq != 0:
+                G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
+            else:
+                vgg_weight = 0.15 * (self.vgg_sparse_freq if self.vgg_sparse_freq > 0 else 1)
+                G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean() * vgg_weight
+            if self.dis_weight !=0:
+                G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
-        if self.sync_weight != 0:
+            G_losses['recon_l1_loss'] = F.l1_loss(recon, target_img) * 25
 
-            preds = bbox.reshape(batch_size*T, 4)
-            preds = preds.to('cuda')/256.
-            box_to_feat = torch.from_numpy(np.array([i for i in range(batch_size*T)]))
-            gt_bbox = crop_bbox_batch(target_img, preds, box_to_feat, 96)
-            pre_bbox = crop_bbox_batch(recon, preds, box_to_feat, 96)
+            if self.sync_weight != 0:
 
-            G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
-            pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-            value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, 'cuda').mean() # torch.Size([4, 3, 5, 96, 96])
-            G_losses['sync'] = self.sync_weight * value
+                preds = bbox.reshape(batch_size*T, 4)
+                preds = preds.to('cuda')/256.
+                box_to_feat = torch.from_numpy(np.array([i for i in range(batch_size*T)]))
+                gt_bbox = crop_bbox_batch(target_img, preds, box_to_feat, 96)
+                pre_bbox = crop_bbox_batch(recon, preds, box_to_feat, 96)
 
-        G_losses_values = [val.mean() for val in G_losses.values()]
-        g_loss = sum(G_losses_values)
+                G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean() * 8
+                pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4)
+                # 与训练端 SyncNet 输入格式一致：将 T 帧 mel 沿时间轴拼接为连续时频谱图
+                # audio_features: (B*T, 1, 80, 16)
+                # → reshape(B, T, 80, 16) → permute(0,2,1,3) → reshape(B, 1, 80, T*16)
+                mel_for_sync = audio_features.reshape(batch_size, T, 80, 16)
+                mel_for_sync = mel_for_sync.permute(0, 2, 1, 3).reshape(batch_size, 1, 80, T * 16)
+                value = self.get_sync_loss(mel_for_sync, pre_bbox, 'cuda').mean()
+                G_losses['sync'] = self.sync_weight * value
 
-        g_loss.backward()
-        self.g_optim.step()
+            G_losses_values = [val.mean() for val in G_losses.values()]
+            g_loss = sum(G_losses_values)
+
+        # AMP backward: scaler 缩放 loss 防止 FP16 梯度下溢, backward 后自动 unscale
+        # 梯度累积: 每次都 backward 累积梯度, 但只在 step_optimizer 时执行 optimizer step
+        if use_amp:
+            scaler.scale(g_loss).backward()
+            if step_optimizer:
+                scaler.step(self.g_optim)
+                scaler.update()
+        else:
+            g_loss.backward()
+            if step_optimizer:
+                self.g_optim.step()
         recon = recon.reshape(batch_size, T, 3,256,256)
         return G_losses, recon[:,-1], g_loss
 
     def get_sync_loss(self, mel, g, device):
-        def cosine_loss(a, v, y): # torch.Size([4, 512]) y torch.Size([4, 1])
-            d = F.cosine_similarity(a, v)
-            with torch.cuda.amp.autocast(enabled=False):
-                loss = self.logloss(d.unsqueeze(1), y)
-            return loss
-        g = g[:, :, :, g.size(3)//2:] # # torch.Size([4, 3, 5, 96, 96])
-        g = torch.cat([g[:, :, i] for i in range(g.size(2))], dim=1) # torch.Size([4, 15, 48, 96])
-        # B, 3 * T, H//2, W
+        """SyncNet 同步损失：极小化 (1 - cos_sim)，推动唇形与音频匹配。
+        与 train_syncnet.py 的 InfoNCE 训练目标一致——高 cos_sim 表示同步。"""
+        g = g[:, :, :, g.size(3)//2:]
+        g = torch.cat([g[:, :, i] for i in range(g.size(2))], dim=1)
         a, v = self.syncnet(mel, g)
-        y = torch.ones(g.size(0), 1).float().to(device)
-        return cosine_loss(a, v, y)
+        loss = (1 - F.cosine_similarity(a, v)).mean()
+        return loss
 
 
     def dis_update(self, img_real, img_recon):
@@ -286,9 +312,8 @@ class Trainer(nn.Module):
             batch_size, T = audio_features.shape[0], audio_features.shape[1]
             audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
             lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
-            # .reshape([bbs*bs, 3, 256, 256])
             G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
-            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*0.1
+            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*0.5
 
             wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
             lip_features_predict = lip_features_predict.reshape([batch_size*T, 20])
@@ -308,11 +333,14 @@ class Trainer(nn.Module):
                 recon_pred = self.dis(recon)
             target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
-            G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean()
+            if self.disable_vgg:
+                G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
+            else:
+                G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean() * 0.15
             if self.dis_weight !=0:
                 G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
-            G_losses['recon_l1_loss'] = F.l1_loss(recon, target_img)
+            G_losses['recon_l1_loss'] = F.l1_loss(recon, target_img) * 25
 
             if self.sync_weight != 0:
 
@@ -322,9 +350,12 @@ class Trainer(nn.Module):
                 gt_bbox = crop_bbox_batch(target_img, preds, box_to_feat, 96)
                 pre_bbox = crop_bbox_batch(recon, preds, box_to_feat, 96)
 
-                G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean()
-                pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4) # torch.Size([20, 1, 80, 16])
-                value = self.get_sync_loss(audio_features.reshape(batch_size, T, 80,16)[:,0:1], pre_bbox, 'cuda').mean() # torch.Size([4, 3, 5, 96, 96])
+                G_losses['img_l1_sync'] = torch.abs(gt_bbox-pre_bbox).mean() * 8
+                pre_bbox = pre_bbox.reshape(batch_size, T, 3, 96, 96).permute(0, 2, 1, 3, 4)
+                # 与训练端 SyncNet 输入格式一致：将 T 帧 mel 沿时间轴拼接为连续时频谱图
+                mel_for_sync = audio_features.reshape(batch_size, T, 80, 16)
+                mel_for_sync = mel_for_sync.permute(0, 2, 1, 3).reshape(batch_size, 1, 80, T * 16)
+                value = self.get_sync_loss(mel_for_sync, pre_bbox, 'cuda').mean()
                 G_losses['sync'] = self.sync_weight * value
 
             G_losses_values = [val.mean() for val in G_losses.values()]
@@ -375,51 +406,57 @@ class Trainer(nn.Module):
             start_iter = 0
         # self.gen.load_state_dict(ckpt["gen"])
 
-        checkpoint = ckpt['gen']
-        # new_state_dict = OrderedDict()
-        # for key, value in checkpoint.items():
-        #     if 'enc.fc.' in key:
-        #         if 'enc.fc.4' in key:
-        #             continue
-        #         name = key.split('enc.fc.')[1]
-        #         new_state_dict[name] = value
+        # 兼容新旧两种 checkpoint 格式:
+        #   旧格式: 含 'gen'/'g_optim' (完整模型)
+        #   新格式: 仅含 'audio2lip' (微调产出, 见 save())
+        # 新格式下 gen 保持预训练/初始化状态——这正是设计意图,
+        # 因为微调的 dec 权重效果不如预训练, 不应回灌。
+        gen_state = ckpt.get('gen')
+        if gen_state is not None:
+            self.gen.load_state_dict(gen_state)
+        else:
+            print('[INFO] checkpoint 不含 gen 权重, 跳过加载 (保持预训练/初始化状态)')
 
-        self.gen.load_state_dict(checkpoint)
+        # audio2lip: 优先从训练 checkpoint 加载(微调产出), 回退到独立的 audio2lip_ckpt
+        if 'audio2lip' in ckpt:
+            self.audio2lip.load_state_dict(ckpt['audio2lip'])
+            print('[INFO] audio2lip 已从训练 checkpoint 加载')
+        elif audio2lip_ckpt is not None:
+            audio_encoder_ckpt = torch.load(audio2lip_ckpt, weights_only=False, map_location='cpu')
+            self.audio2lip.load_state_dict(audio_encoder_ckpt['audio2lip'])
+            print(f'[INFO] audio2lip 已从 {audio2lip_ckpt} 加载')
+        else:
+            print('[WARN] 无 audio2lip 权重来源 (checkpoint 与 audio2lip_ckpt 均缺失)')
 
-        # new_state_dict = OrderedDict()
-        # for key, value in checkpoint.items():
-        #     if 'enc.net_app.' in key:
-        #         name = key.split('enc.')[1]
-        #         new_state_dict[name] = value
-        # self.gen.enc.load_state_dict(new_state_dict)
-        audio_encoder_ckpt = torch.load(audio2lip_ckpt, weights_only=False, map_location='cpu')
-        self.audio2lip.load_state_dict(audio_encoder_ckpt['audio2lip'])
-        # new_state_dict = OrderedDict()
-        # for key, value in checkpoint.items():
-        #     if 'dec.' in key:
-        #         if 'dec.direc' in key:
-        #             continue
-        #         name = key.split('dec.')[1]
-        #         new_state_dict[name] = value
-        # self.gen.dec.load_state_dict(new_state_dict)
         if self.dis_weight !=0:
             self.dis.load_state_dict(ckpt["dis"])
-        try:
-            self.g_optim.load_state_dict(ckpt["g_optim"])
-        except:
-            print('cannot load pretrained g_optim')
-        # self.d_optim.load_state_dict(ckpt["d_optim"])
+        if "g_optim" in ckpt:
+            try:
+                self.g_optim.load_state_dict(ckpt["g_optim"])
+            except:
+                print('cannot load pretrained g_optim')
+        else:
+            print('[INFO] checkpoint 不含 g_optim, 跳过加载 (优化器从零开始)')
 
         return start_iter
 
     def save(self, idx, checkpoint_path):
-        torch.save(
-            {
-                "audio2lip": self.audio2lip.state_dict(),
-                # "dis": self.dis.state_dict(),
-                # "g_optim": self.g_optim.state_dict(),
-                # "d_optim": self.d_optim.state_dict(),
-                "args": self.args
-            },
-            f"{checkpoint_path}/{str(idx).zfill(6)}.pt"
-        )
+        # 确保所有 CUDA 操作完成，避免序列化时访问违例（Windows 已知问题）
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        # 微调保存策略: 仅保存 audio2lip 权重。
+        # 原因: 经测试，微调保存的 Decoder(gen.dec) 权重效果不如预训练权重，
+        # 而 gen(含 enc/dec/direction_lipnonlip) 体积巨大，保存它既浪费空间又无实际收益。
+        # audio2lip 才是微调的有效产出，推理时配合预训练 gen 使用即可。
+        # g_optim 与 gen 参数强绑定，既然不保存 gen，也不再保存 g_optim。
+        
+        # 关键修复: 将 state_dict 移到 CPU 后再保存，彻底避免 GPU 张量序列化问题
+        # Windows WDDM 模式下 torch.save 直接序列化 GPU 张量会导致 access violation
+        audio2lip_cpu = {k: v.cpu().clone() for k, v in self.audio2lip.state_dict().items()}
+        ckpt = {
+            "audio2lip": audio2lip_cpu,
+            "args": self.args,
+            "start_iter": idx,
+        }
+        torch.save(ckpt, f"{checkpoint_path}/{str(idx).zfill(6)}.pt")

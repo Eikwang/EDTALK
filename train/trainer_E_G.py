@@ -141,6 +141,9 @@ class Trainer(nn.Module):
         return start_iter
 
     def save(self, idx, checkpoint_path):
+        # 确保所有 CUDA 操作完成，避免序列化时访问违例（Windows 已知问题）
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.save(
             {
                 "gen": self.gen.state_dict(),

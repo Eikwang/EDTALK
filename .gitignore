@@ -53,6 +53,10 @@ pytorch_gaze_redirection\eyespatch_dataset/
 nul
 fastrag/
 UnityCapture-master/
+LiveTalking-main/
+test/
+tests/
+.pytest_cache/
 
 
 # open-mem: Auto-generated folder context files.

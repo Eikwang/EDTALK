@@ -4,6 +4,11 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
+# CUDA 显存碎片化修复: expandable_segments 允许 CUDA caching allocator
+# 扩展已有内存段而非创建新段，大幅减少碎片化。
+# 不使用 max_split_size_mb / roundup_power2_divisions（在 WDDM 下可能导致 segfault）。
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # faulthandler: 捕获 C 级 segfault/access violation 并打印 Python  traceback
 # Windows 上 DataLoader worker 或 CUDA driver 崩溃时，默认无任何输出。
 # 启用后至少能看到崩溃发生在哪个 C 扩展调用。
@@ -14,9 +19,9 @@ if _fh_sys.stderr:
     faulthandler.enable(file=_fh_sys.stderr, all_threads=True)
 
 # CUDA 内存分配策略
-# 不设置 PYTORCH_CUDA_ALLOC_CONF — max_split_size_mb 和 roundup_power2_divisions
-# 在 Windows WDDM 模式下可能导致训练进程 segfault。
-# 依赖 CUDA caching allocator 自动管理 + 低频 (每 1000 iter) empty_cache() 碎片回收。
+# 已在顶部设置 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# 注意: 不使用 max_split_size_mb 和 roundup_power2_divisions — 它们在 Windows WDDM
+# 模式下可能导致训练进程 segfault。expandable_segments 是安全的碎片化修复方案。
 
 import argparse
 import sys
@@ -37,6 +42,7 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import datetime
+import random
 import torch
 from torch.utils import data
 from torch.utils.data import DataLoader
@@ -222,15 +228,19 @@ def main(args):
     # elif args.dataset == 'vox':
     dataset = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=True, transform=transform,
                                            preload_features=args.preload_features)
+    
+    # 优化: 全部数据用于训练，测试时随机抽取
+    # 原方案问题: train/test 共享同一份 samples 列表, 测试集是从训练集截取的前1%,
+    #   导致: 1) 数据泄露(测试数据被训练过) 2) 测试样本固定不变 3) 训练数据损失
+    # 新方案: 训练集使用全部数据，测试时从训练集中随机抽取200个样本
     dataset_test = Audio2LipDataset_image_sync(hdtf=args.data_path, is_train=False, transform=transform,
                                                 preload_features=args.preload_features)
-
-    # 限制测试集为训练集的 1%, 避免每次 eval 跑一整轮 (与训练同规模) 浪费时间
-    # 原因: train/test 共享同一份 samples 列表, eval 一次要跑 2 万+ batch, ~1 小时
-    test_size = max(1, len(dataset.samples) // 100)
-    dataset_test.samples = dataset_test.samples[:test_size]
-    print(f"[Dataset] 测试集截断: {len(dataset_test.samples)} 样本 (训练集 1%, "
-          f"原 {len(dataset.samples)} 条)")
+    
+    test_sample_count = min(200, len(dataset.samples))
+    random.seed(42)  # 固定种子确保可复现
+    dataset_test.samples = random.sample(dataset.samples, test_sample_count)
+    random.seed()  # 恢复随机种子
+    print(f"[Dataset] 训练集: {len(dataset.samples)} 样本, 测试集: {len(dataset_test.samples)} 样本 (随机抽取)")
     # elif args.dataset == 'taichi':
     #     dataset = Taichi('train', transform, True)
     #     dataset_test = Taichi('test', transform)
@@ -276,6 +286,11 @@ def main(args):
     # Trainer
     trainer = Trainer(args, device)
 
+    # AMP 混合精度: GradScaler 缩放 loss 防止 FP16 梯度下溢
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp) if args.amp else None
+    if args.amp:
+        print('[INFO] AMP 混合精度训练已启用 (FP16 forward + FP32 backward)')
+
     # resume
     if args.resume_ckpt is not None:
         args.start_iter = trainer.resume(args.resume_ckpt, args.audio2lip_ckpt)
@@ -284,12 +299,32 @@ def main(args):
     current_iter = args.start_iter
     test_iter = 0
     print('==> training')
-    if args.vgg_sparse_freq > 0:
-        print(f'[INFO] VGG 稀疏模式: 每 {args.vgg_sparse_freq} iter 计算一次 (预计节省 ~{100-100//args.vgg_sparse_freq:.0f}% VGG 计算)')
+    if args.disable_vgg:
+        print('[INFO] VGG loss 已完全禁用 (专注于 L1 和 Sync loss)')
+    elif args.vgg_sparse_freq > 0:
+        print(f'[INFO] VGG 稀疏模式: 每 {args.vgg_sparse_freq} iter 计算一次, 权重补偿 ×{args.vgg_sparse_freq} (预计节省 ~{100-100//args.vgg_sparse_freq:.0f}% VGG 计算)')
     else:
         print(f'[INFO] VGG 全量模式: 每 iter 计算 4 尺度 x 8 次 VGG19 forward')
     print(f'[INFO] 初始内存状态: {check_memory_pressure()}')
-    
+
+    # === LR & Sync Weight 调度 ===
+    g_reg_ratio = args.g_reg_every / (args.g_reg_every + 1)
+    lr_schedule = None
+    sync_schedule = None
+    if args.lr_schedule:
+        lr_schedule = [float(x) for x in args.lr_schedule.split(',')]
+        print(f'[SCHEDULE] LR schedule: {lr_schedule} (raw, will be ×{g_reg_ratio:.2f})')
+        print(f'[SCHEDULE] Effective LR: {[f"{x*g_reg_ratio:.6f}" for x in lr_schedule]}')
+    if args.sync_schedule:
+        sync_schedule = [float(x) for x in args.sync_schedule.split(',')]
+        print(f'[SCHEDULE] Sync schedule: {sync_schedule}')
+    if lr_schedule or sync_schedule:
+        print(f'[SCHEDULE] Epoch mapping:')
+        for ep in range(args.epoch):
+            lr_val = lr_schedule[min(ep, len(lr_schedule)-1)] if lr_schedule else args.lr
+            sw_val = sync_schedule[min(ep, len(sync_schedule)-1)] if sync_schedule else args.sync_weight
+            print(f'  Epoch {ep+1}: LR={lr_val:.5f} (eff={lr_val*g_reg_ratio:.6f}), sync_weight={sw_val:.1f}')
+    # === 调度定义结束 ===
     # pbar = range(args.iter)
     last_name = None
     test_epoch= 0
@@ -302,6 +337,19 @@ def main(args):
             break
         
         print(f"\n[INFO] === Epoch {epoch+1}/{args.epoch} 开始 === iter={current_iter} | {check_memory_pressure()}")
+
+        # === LR & Sync Weight 调度: epoch 边界生效 ===
+        if lr_schedule is not None:
+            idx = min(epoch, len(lr_schedule) - 1)
+            new_lr = lr_schedule[idx] * g_reg_ratio
+            for param_group in trainer.g_optim.param_groups:
+                param_group['lr'] = new_lr
+        if sync_schedule is not None:
+            idx = min(epoch, len(sync_schedule) - 1)
+            trainer.sync_weight = sync_schedule[idx]
+        if lr_schedule is not None or sync_schedule is not None:
+            current_lr = trainer.g_optim.param_groups[0]['lr']
+            print(f'[SCHEDULE] Epoch {epoch+1}: LR={current_lr:.6f}, sync_weight={trainer.sync_weight:.1f}')
             
         if args.distributed:
             dataloader.sampler.set_epoch(epoch)
@@ -313,7 +361,7 @@ def main(args):
         recent_losses = []
         # tqdm 进度条：显示 epoch 内 batch 进度
         pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{args.epoch}', 
-                    total=trainSteps, leave=True, ncols=100)
+                    total=trainSteps, leave=True)
         
         try:
             for bii, bi in enumerate(pbar):
@@ -333,16 +381,10 @@ def main(args):
                 # 梯度累积：只在每 accumulation_steps 步执行一次优化器 step
                 step_optimizer = ((bii + 1) % args.accumulation_steps == 0) or (bii + 1 == len(dataloader))
                 
-                # VGG 稀疏计算：微调模式下每 vgg_sparse_freq iter 才计算一次 VGG
-                # 0=禁用(每 iter 都算), N=每 N iter 算一次
-                if args.vgg_sparse_freq > 0:
-                    compute_vgg = (current_iter % args.vgg_sparse_freq == 0)
-                else:
-                    compute_vgg = True
-                
                 # update generator
                 G_losses, recon, l_g_total = trainer.gen_update(
-                    audio_features, lip_features, pose_features, identity_img, target_img, bbox
+                    audio_features, lip_features, pose_features, identity_img, target_img, bbox,
+                    scaler=scaler, step_optimizer=step_optimizer
                 )
 
                 # update discriminator
@@ -416,21 +458,21 @@ def main(args):
                         test_iter+=1
                         if test_iter % 1000 == 0:
                             eval_pbar.set_postfix_str(f'iter={test_iter}')
-                        with torch.no_grad():
+                        with torch.no_grad(), torch.amp.autocast('cuda', enabled=args.amp):
                             audio_features, lip_features, pose_features, identity_img, target_img, bbox\
                             = bi['audio_features'], bi['lip_features'],bi['pose_features'], bi['identity_img'], bi['target_img'], bi['bbox']
                             audio_features, lip_features, pose_features, identity_img, target_img, bbox = \
                                         audio_features.cuda(), lip_features.cuda(), pose_features.cuda(), identity_img.cuda(), target_img.cuda(), bbox.cuda()
-                            
+
                             G_losses, recon, l_g_total = trainer.sample(audio_features, lip_features, pose_features, identity_img, target_img, bbox)
                             curloss += l_g_total.detach().item()
                             eval_steps += 1
-                            
+
                             # 收集各 loss
                             for key, value in G_losses.items():
                                 eval_losses[key] = eval_losses.get(key, 0.0) + value.detach().item()
                             eval_losses['l_g_total'] = eval_losses.get('l_g_total', 0.0) + l_g_total.detach().item()
-                            
+
                             if test_iter % args.image_save_iter == 0:
                                 sample = F.interpolate(torch.cat((identity_img.detach(),target_img.detach()[:,-1], recon.detach()), dim=0), 256)
                                 # sample = torch.flip(sample, [1])
@@ -518,13 +560,16 @@ def main(args):
                 del identity_img, target_img, bbox
                 del G_losses, recon, l_g_total
 
-                # 低频内存清理: 每 2000 iter 执行一次
-                # num_workers=0 已消除 access violation 根因, 清理仅用于碎片整理
-                # 不再每 500 iter 调用, 避免不必要的训练中断
-                if current_iter % 2000 == 0:
+                # 内存碎片整理: 每 500 iter 执行一次
+                # expandable_segments 已大幅缓解碎片化, 但 VGG19 的大块临时张量
+                # 仍会产生碎片, 定期 empty_cache 回收空洞防止 reserved 持续膨胀
+                #
+                # ⚠️ 已禁用 empty_cache(): 在 Windows WDDM 模式下，频繁调用
+                # empty_cache() 可能触发 NVIDIA 驱动 bug (nvlddmkm.sys 空指针解引用)
+                # 导致 BSOD。expandable_segments 已足够管理显存碎片。
+                if current_iter % 500 == 0:
                     gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    # torch.cuda.empty_cache()  # 禁用以避免 BSOD
 
         except Exception as e:
             # bii 可能在 for 循环第一次迭代前未定义
@@ -575,8 +620,8 @@ def main(args):
 
         # Epoch 间清理: gc + empty_cache 整理碎片
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()  # 禁用以避免 BSOD
         print(f'[INFO] Epoch {epoch+1} 结束 | {check_memory_pressure()}')
 
     return
@@ -600,8 +645,8 @@ if __name__ == "__main__":
     parser.add_argument("--d_reg_every", type=int, default=16)
     parser.add_argument("--g_reg_every", type=int, default=4)
     
-    parser.add_argument("--lr", type=float, default=0.0001,
-                        help="学习率 (微调推荐 0.00005-0.0001, 原默认 0.001 对微调过高会导致口型崩坏)")
+    parser.add_argument("--lr", type=float, default=0.001,
+                        help="学习率 (Decoder 微调推荐 0.0001~0.0005)")
     parser.add_argument("--channel_multiplier", type=int, default=1)
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--display_freq", type=int, default=1)
@@ -619,31 +664,38 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--semantic_radius", type=int, default=13)
     parser.add_argument("--log_iter", type=int, default=1000)
-    parser.add_argument("--image_save_iter", type=int, default=2500, help="local rank for distributed training")
+    parser.add_argument("--image_save_iter", type=int, default=6000, help="local rank for distributed training")
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
     parser.add_argument("--distributed", action='store_true', help="Enable distributed training")
-    parser.add_argument("--eval_iter", type=int, default=5000, help="local rank for distributed training")
-    parser.add_argument("--sync_weight", type=float, default=0.03,
-                        help="SyncNet loss weight (0=disabled, 微调推荐 0.03-0.1, 需配合 syncnet_ckpt 使用)")
+    parser.add_argument("--eval_iter", type=int, default=4000, help="local rank for distributed training")
+    parser.add_argument("--sync_weight", type=float, default=2.0,
+                        help="SyncNet loss weight (0=disabled, 自训 SyncNet 推荐 0.5~2.0)")
     parser.add_argument("--syncnet_ckpt", type=str, default=None, help="Path to SyncNet pre-trained checkpoint (e.g. ckpts/EDTalk.pt)")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--dis_weight", type=int, default=0, help="GAN 判别器权重 (0=禁用)。微调推荐关闭：小数据集 GAN 易崩溃，且 d_optim 链路未启用时 dis 仅向 audio2lip 注入噪声梯度")
     parser.add_argument("--vis_num", type=int, default=10, help="local rank for distributed training")
-    parser.add_argument("--save_freq", type=int, default=1000)
+    parser.add_argument("--save_freq", type=int, default=2000)
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--audio2lip_ckpt", type=str, default=None)
     parser.add_argument("--accumulation_steps", type=int, default=4, help="梯度累积步数（单卡显存不足时使用，等效 batch_size = batch_size * accumulation_steps）")
     parser.add_argument("--data_path", type=str, default='HDTF', help="Dataset base directory path")
-    parser.add_argument("--log_freq", type=int, default=5000, help="每 N 个 batch 打印一次滚动日志（0=只在 epoch 结束打印）")
+    parser.add_argument("--log_freq", type=int, default=1000, help="每 N 个 batch 打印一次滚动日志（0=只在 epoch 结束打印）")
     parser.add_argument("--preload_features", action='store_true',
                         help="将所有特征 preload_features 预加载到内存 (小数据集微调推荐, 大数据集慎用)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 进程数 (0=主线程加载, 默认4)")
-    parser.add_argument("--vgg_sparse_freq", type=int, default=50,
-                        help="VGG 稀疏计算频率 (0=每 iter 都算, N=每 N iter 算一次。微调推荐 500, 可节省 ~80%% VGG 计算)")
-    parser.add_argument("--train_generator", action='store_true',
-                        help="是否训练 Generator 的 Decoder 部分 (默认 False, 仅训练 audio2lip; True 时同时微调 Decoder)")
-
+    parser.add_argument("--vgg_sparse_freq", type=int, default=0,
+                        help="VGG 稀疏计算频率 (0=每 iter 都算, N=每 N iter 算一次。微调推荐 30~100, 可节省 VGG 计算)")
+    parser.add_argument("--disable_vgg", action='store_true',
+                        help="完全关闭 VGG loss (专注于 L1 和 Sync loss, 适合需要口型细节的场景)")
+    parser.add_argument("--amp", action='store_true',
+                        help="启用 AMP 混合精度训练 (FP16 forward + FP32 backward), 加速训练并减少显存占用")
+    parser.add_argument("--lr_schedule", type=str, default=None,
+                        help="Per-epoch LR schedule, comma-separated (e.g. '0.001,0.0005,0.0002,0.0001,0.00005'). "
+                             "Overrides --lr per epoch. Values use same scale as --lr (multiplied by g_reg_ratio internally).")
+    parser.add_argument("--sync_schedule", type=str, default=None,
+                        help="Per-epoch sync_weight schedule, comma-separated (e.g. '1,2,4,6,8'). "
+                             "Overrides --sync_weight per epoch.")
     opts = parser.parse_args()
 
     # opts = Config(opts.config, opts, is_train=True)

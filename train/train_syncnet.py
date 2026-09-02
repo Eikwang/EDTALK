@@ -126,16 +126,17 @@ class SyncNetDataset(Dataset):
 
         # 预计算每个视频的有效帧数，构建索引
         all_samples = []  # (video_name, frame_idx) 列表
-        self.mel_lengths = {}  # 缓存 mel 长度，避免 __getitem__ 中重复磁盘读取
+        self.mel_lengths = {}  # 缓存 mel 长度
+        self.mel_cache = {}    # 缓存完整 mel 数据，避免 __getitem__ 重复磁盘读取
+        self._orig_sizes = {}  # 缓存原始图像尺寸（用于 bbox 归一化）
         for video_name in self.video_list:
             mel_path = os.path.join(data_path, 'mel', video_name + '.npy')
             if not os.path.exists(mel_path):
                 continue
             mel = np.load(mel_path)
-            # 有效帧范围：需要前后各 half_T 帧，且 mel 特征足够
             l = len(mel)
             self.mel_lengths[video_name] = l
-            # 跳过边缘帧
+            self.mel_cache[video_name] = mel
             for i in range(self.half_T, l - self.half_T):
                 all_samples.append((video_name, i))
 
@@ -180,11 +181,11 @@ class SyncNetDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load_frame(self, video_name, frame_idx, crop_lower_half=True):
+    def _load_frame(self, video_name, frame_idx, crop_lower_half=False):
         """从 LMDB 加载单帧图片并转换为 tensor (C, H, W)，范围 [-1, 1]
         
         Args:
-            crop_lower_half: 是否只保留下半脸（与 audio2mouth 训练时的 get_sync_loss 一致）
+            crop_lower_half: 是否只保留下半脸（默认 False，由外部统一裁剪）
         """
         with self._get_env().begin(write=False) as txn:
             key = format_for_lmdb(video_name, frame_idx)
@@ -192,21 +193,15 @@ class SyncNetDataset(Dataset):
             if img_bytes is None:
                 return None
             img = Image.open(BytesIO(img_bytes)).convert('RGB')
-            # SyncNet face_encoder 期望输入 (B, 15, 48, 96)
-            # 但在 audio2mouth 的 get_sync_loss 中，人脸被裁剪为下半部分 (48, 96)
-            # 因此这里加载 96x96 后裁剪下半部分，确保训练/推理一致性
             img = img.resize((96, 96))
             img = np.array(img).astype(np.float32) / 255.0
             
             if crop_lower_half:
-                # 只保留下半脸: H//2: (48, 96, 3)
-                # 注意: numpy 数组是 (H, W, C)，所以 axis 0 是 H
                 h = img.shape[0]
                 img = img[h//2:, :, :]
             
-            # 归一化到 [-1, 1]
             img = (img - 0.5) / 0.5
-            img = torch.from_numpy(img).permute(2, 0, 1)  # HWC -> CHW
+            img = torch.from_numpy(img).permute(2, 0, 1)
             return img
 
     def _load_mel(self, video_name, frame_idx, mel_data=None):
@@ -236,6 +231,67 @@ class SyncNetDataset(Dataset):
             return None
         return bbox[frame_idx]
 
+    def _load_face_sequence(self, video_name, frame_idx):
+        """加载以 frame_idx 为中心的 5 帧 face sequence，应用 bbox 裁剪 + 下半脸裁剪。
+        与 audio2mouth 推理时 get_sync_loss 的处理流程完全一致。
+        返回: (15, 48, 96) 或 None
+        """
+        half_T = self.half_T
+        mel = self.mel_cache.get(video_name)
+        if mel is None:
+            return None
+        mel_len = len(mel)
+        
+        # 边界检查
+        if frame_idx < half_T or frame_idx >= mel_len - half_T:
+            return None
+
+        face_frames = []
+        for t in range(frame_idx - half_T, frame_idx + half_T + 1):
+            f = self._load_frame(video_name, t, crop_lower_half=False)
+            if f is None:
+                f = self._load_frame(video_name, frame_idx, crop_lower_half=False)
+                if f is None:
+                    return None
+            face_frames.append(f)
+
+        face_sequence = torch.cat(face_frames, dim=0)  # (15, 96, 96)
+
+        # bbox 裁剪（对齐 audio2mouth 推理管线 get_sync_loss）
+        # 推理时：crop_bbox_batch(recon_256x256, bbox/256, ..., 96) → 96×96 人脸
+        # 训练时：需从 LMDB 原始图像中用相同逻辑裁剪
+        # 关键修复：bbox 坐标在原始图像空间，需用原始图像尺寸归一化
+        bbox = self._load_bbox(video_name, frame_idx)
+        if bbox is not None:
+            # 获取原始图像尺寸（首次访问时缓存，同视频所有帧尺寸相同）
+            if video_name not in self._orig_sizes:
+                with self._get_env().begin(write=False) as txn:
+                    key = format_for_lmdb(video_name, frame_idx)
+                    img_bytes = txn.get(key)
+                    if img_bytes is not None:
+                        orig_img = Image.open(BytesIO(img_bytes))
+                        self._orig_sizes[video_name] = orig_img.size  # (W, H)
+            orig_w, orig_h = self._orig_sizes.get(video_name, (96, 96))
+            # 正确归一化：bbox / 原始图像尺寸 → [0, 1] 范围
+            bbox_norm = torch.tensor([
+                bbox[0] / orig_w, bbox[1] / orig_h,
+                bbox[2] / orig_w, bbox[3] / orig_h
+            ], dtype=torch.float32).unsqueeze(0)
+            seq_batch = face_sequence.unsqueeze(0)
+            box_to_feat = torch.tensor([0])
+            try:
+                cropped = crop_bbox_batch(seq_batch, bbox_norm, box_to_feat, 96)
+                if cropped is not None:
+                    face_sequence = cropped.squeeze(0)
+            except Exception:
+                pass
+
+        # 下半脸裁剪: (15, 96, 96) → (15, 48, 96)
+        h = face_sequence.shape[1]
+        face_sequence = face_sequence[:, h // 2:, :]
+
+        return face_sequence
+
     def __getitem__(self, idx):
         # 循环查找有效样本，避免递归
         max_attempts = 10
@@ -243,11 +299,9 @@ class SyncNetDataset(Dataset):
             sample_idx = (idx + attempt) % len(self)
             video_name, frame_idx = self.samples[sample_idx]
 
-            # 预加载该视频的完整 mel 数据（避免同一样本重复磁盘读取）
-            mel_path = os.path.join(self.data_path, 'mel', video_name + '.npy')
-            try:
-                full_mel_data = np.load(mel_path)
-            except Exception:
+            # 从缓存获取该视频的完整 mel 数据
+            full_mel_data = self.mel_cache.get(video_name)
+            if full_mel_data is None:
                 continue
 
             # 加载 mel 特征 (syncnet_T, 80, 16)，复用已加载的 mel 数据
@@ -256,95 +310,49 @@ class SyncNetDataset(Dataset):
                 continue
 
             # mel 合并为 (1, 80, 16 * syncnet_T) - SyncNet audio_encoder 期望 (B, 1, H, W)
-            mel = mel.view(1, 80, -1)  # (1, 80, 80)
+            # mel 原始形状: (syncnet_T, 1, 80, 16) — .npy 文件有 channel 维
+            # 必须用 permute 而非 view，确保时频结构正确：
+            #   squeeze(1) → (T, 80, 16)
+            #   permute(1, 0, 2) → (80, T, 16): 每行=1个mel bin, 每列=T帧×16时间步
+            #   reshape(1, 80, -1) → (1, 80, T*16): 连续时频谱图
+            # 直接 view 会交错混合 mel bins 和帧，破坏时频结构
+            mel = mel.squeeze(1).permute(1, 0, 2).reshape(1, 80, -1)
 
-            # 加载同步的视频帧（正样本）
-            img = self._load_frame(video_name, frame_idx)
-            if img is None:
+            # 加载正样本 face sequence
+            face_sequence = self._load_face_sequence(video_name, frame_idx)
+            if face_sequence is None:
                 continue
-
-            # 加载 bbox 并裁剪下半脸（与 audio2mouth 训练一致）
-            bbox = self._load_bbox(video_name, frame_idx)
-            if bbox is None:
-                # 如果无 bbox，使用整张图片
-                face_img = img
-            else:
-                # bbox 格式: [x1, y1, x2, y2]
-                # crop_bbox_batch 需要 batch 输入
-                bbox_tensor = torch.from_numpy(bbox).float().unsqueeze(0)  # (1, 4)
-                img_batch = img.unsqueeze(0)  # (1, 3, H, W)
-                box_to_feat = torch.tensor([0])
-                try:
-                    face_img = crop_bbox_batch(img_batch, bbox_tensor / 96, box_to_feat, 96)
-                    if face_img is not None:
-                        face_img = face_img.squeeze(0)  # (3, 96, 96)
-                    else:
-                        face_img = img
-                except Exception:
-                    face_img = img
-
-            # 构建正样本对（同步）
-            # face_encoder 期望输入: (B, 15, H, W) 即 5帧 x 3通道
-            # 这里我们取中心帧前后各 half_T 帧
-            face_frames = []
-            for t in range(frame_idx - self.half_T, frame_idx + self.half_T + 1):
-                f = self._load_frame(video_name, t)
-                if f is None:
-                    f = img  # 回退到中心帧
-                face_frames.append(f)
-
-            # 拼接为 (15, H, W) -> 5帧 * 3通道
-            face_sequence = torch.cat(face_frames, dim=0)  # (15, H, W)
 
             # 获取当前视频的有效帧范围（使用预缓存长度，不再重复加载 mel）
             mel_len = self.mel_lengths.get(video_name, frame_idx + 1)
 
-            # 负样本策略：偏移范围 [5, 10] 帧（约 0.2-0.4秒）
-            # 增大偏移量使任务更有区分度
-            if random.random() < 0.5:
-                # 50% 概率：跨视频负样本（随机选另一个视频的 mel）
-                # 这样负样本的嘴型差异更大，任务更有区分度
-                other_videos = [v for v in self.train_videos if v != video_name]
-                if other_videos:
-                    other_video = random.choice(list(other_videos))
-                    other_mel_path = os.path.join(self.data_path, 'mel', other_video + '.npy')
-                    try:
-                        other_mel_data = np.load(other_mel_path)
-                        # 随机取该视频的任意帧
-                        other_frame_idx = random.randint(
-                            self.half_T,
-                            len(other_mel_data) - self.half_T - 1
-                        )
-                        neg_mel = self._load_mel(other_video, other_frame_idx, mel_data=other_mel_data)
-                        if neg_mel is not None:
-                            neg_mel = neg_mel.view(1, 80, -1)
-                        else:
-                            neg_mel = mel  # 回退
-                    except Exception:
-                        neg_mel = mel  # 回退
-                else:
-                    neg_mel = mel  # 无其他视频时回退
-            else:
-                # 50% 概率：同视频偏移 [5, 10] 帧
-                neg_offset = random.randint(5, 10)  # [5, 10]
-                if random.random() < 0.5:
-                    neg_offset = -neg_offset
-                neg_frame_idx = frame_idx + neg_offset
+            neg_face = None
+            # 时间偏移负样本：同视频、至少偏移 3 帧的时刻。
+            # 关键设计（对齐原始 Wav2Lip）：负样本必须是同一人物但不同时刻，
+            # 这样模型学习的是"唇形是否与音频同步"（内容匹配），
+            # 而非"人脸是否来自同一视频"（身份匹配）。
+            # 偏移量 3~10 帧（120~400ms @ 25fps），覆盖爆破音
+            # /b//p//m//f/ 的动态窗口（闭唇→释放 40~120ms），
+            # 模型被迫学习精细口型差异。
+            valid_hi = mel_len - self.half_T - 1  # 有效帧索引上界
+            valid_lo = self.half_T                 # 有效帧索引下界
+            shifts = []
+            for d in range(3, 11):
+                if valid_lo <= frame_idx - d <= valid_hi:
+                    shifts.append(-d)
+                if valid_lo <= frame_idx + d <= valid_hi:
+                    shifts.append(d)
+            if shifts:
+                neg_frame_idx = frame_idx + random.choice(shifts)
+                neg_face = self._load_face_sequence(video_name, neg_frame_idx)
 
-                # 确保在有效范围内（使用视频实际帧数）
-                neg_frame_idx = max(self.half_T, min(neg_frame_idx, mel_len - self.half_T - 1))
-
-                # 复用已加载的 mel 数据，避免重复磁盘读取
-                neg_mel = self._load_mel(video_name, neg_frame_idx, mel_data=full_mel_data)
-            if neg_mel is None:
-                neg_mel = mel  # 回退
-            else:
-                neg_mel = neg_mel.view(1, 80, -1)
+            if neg_face is None:
+                continue
 
             return {
-                'mel': mel,                          # 正样本 mel (1, 80, 80)
-                'face': face_sequence,               # 正样本 face (15, 96, 96)
-                'neg_mel': neg_mel,                  # 负样本 mel (1, 80, 80)
+                'mel': mel,                          # 锚定音频 mel (1, 80, 80)
+                'face': face_sequence,               # 正样本人脸 (15, 48, 96)
+                'neg_face': neg_face,                # 负样本人脸 (15, 48, 96) — 时间偏移（同视频不同时刻）
                 'video_name': video_name,
                 'frame_idx': frame_idx,
             }
@@ -381,65 +389,77 @@ class _SyncNetDatasetView(SyncNetDataset):
 
 class SyncNetLoss(nn.Module):
     """
-    SyncNet 对比损失。
+    联合损失：逐样本对比（主）+ 可选 Batch 内 InfoNCE（辅助防坍缩）。
 
-    正样本对 (同步): 期望 cosine_similarity -> 1
-    负样本对 (不同步): 期望 cosine_similarity -> 0
+    设计原理：
+    - 主损失 (loss_pos + loss_rel)：让音频和匹配人脸同步
+    - 辅助 InfoNCE (aux_weight)：防止 face_encoder 坍缩
+      当 v_pos_emb 全部相同（坍缩）时 InfoNCE 会很大，
+      迫使 face_encoder 为不同的人脸产生不同的 embedding。
 
-    使用 BCEWithLogitsLoss 稳定训练。
+    ⚠️ 单人数据集场景：
+      InfoNCE 反作用——同一人物所有 face 理应相似，InfoNCE 却要求 batch
+      内每对都唯一，导致 Pos Sim 持续下跌。单人训练应设 aux_weight=0。
+
+    训练后的 SyncNet 可用于 audio2mouth 管线的 get_sync_loss：
+    高 cos_sim 表示唇形与音频同步，低 cos_sim 表示不同步。
     """
 
-    def __init__(self):
+    def __init__(self, margin=0.15, tau=0.1, aux_weight=0.0, pos_weight=2.0):
         super(SyncNetLoss, self).__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        self.margin = margin
+        self.tau = tau
+        self.aux_weight = aux_weight
+        self.pos_weight = pos_weight
 
-    def forward(self, a_emb, v_emb, neg_a_emb=None, neg_v_emb=None):
+    def forward(self, a_emb, v_pos_emb, v_neg_emb):
         """
         Args:
-            a_emb: 正样本音频嵌入 (B, D)
-            v_emb: 正样本视频嵌入 (B, D)
-            neg_a_emb: 负样本音频嵌入 (B, D)，可选
-            neg_v_emb: 负样本视频嵌入 (B, D)，可选
+            a_emb:      (B, D) L2-normalized audio embeddings
+            v_pos_emb:  (B, D) L2-normalized positive face embeddings
+            v_neg_emb:  (B, D) L2-normalized negative face embeddings
         Returns:
-            loss: 标量损失
+            loss / pos_sim / neg_sim
         """
-        # 正样本对的 cosine similarity，范围 [-1, 1]
-        pos_sim = F.cosine_similarity(a_emb, v_emb, dim=1)  # (B,)
-        # 移除缩放因子，与 Wav2Lip 原版对齐
-        # 原版直接用 cosine_sim 作为 logits，让 BCEWithLogitsLoss 处理
-        pos_logits = pos_sim
+        B = a_emb.size(0)
+        pos_sim = (a_emb * v_pos_emb).sum(dim=1)  # (B,)
+        neg_sim = (a_emb * v_neg_emb).sum(dim=1)  # (B,)
 
-        # 正样本标签为 1
-        pos_labels = torch.ones_like(pos_logits)
-        loss = self.bce(pos_logits, pos_labels)
+        # 主损失：逐样本对比
+        # pos_weight 增大 → 更强调拉近正对（单人数据集推荐 2.0）
+        loss_pos = self.pos_weight * (1.0 - pos_sim).pow(2).mean()
+        loss_rel = F.relu(neg_sim - pos_sim + self.margin).pow(2).mean()
+        loss = loss_pos + loss_rel
 
-        # 负样本对（如果提供）
-        if neg_a_emb is not None and neg_v_emb is not None:
-            neg_sim = F.cosine_similarity(neg_a_emb, neg_v_emb, dim=1)
-            neg_logits = neg_sim
-            neg_labels = torch.zeros_like(neg_logits)
-            loss = loss + self.bce(neg_logits, neg_labels)
+        # 辅助 InfoNCE：防止 face_encoder 坍缩（多人物场景）
+        # 单人数据集应设 aux_weight=0，避免反作用
+        if self.aux_weight > 0:
+            sim_matrix = torch.mm(a_emb, v_pos_emb.t()) / self.tau
+            labels = torch.arange(B, dtype=torch.long, device=sim_matrix.device)
+            loss_aux = F.cross_entropy(sim_matrix, labels)
+            loss = loss + self.aux_weight * loss_aux
 
-        return loss
+        return loss, pos_sim.mean(), neg_sim.mean()
 
 
 # ---------------------------------------------------------------------------
 # 训练工具函数
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, epoch, loss, checkpoint_path):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, checkpoint_path):
     """保存 SyncNet checkpoint"""
     torch.save({
         'epoch': epoch,
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict() if scheduler is not None else None,
         'loss': loss,
     }, checkpoint_path)
     print(f"[INFO] Checkpoint saved: {checkpoint_path}")
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, device='cuda'):
-    # type: (str, nn.Module, torch.optim.Optimizer|None, str) -> int
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, device='cuda'):
+    # type: (str, nn.Module, torch.optim.Optimizer|None, torch.optim.lr_scheduler|None, str) -> int
     """加载 SyncNet checkpoint"""
     if not os.path.exists(checkpoint_path):
         print(f"[WARN] Checkpoint not found: {checkpoint_path}")
@@ -449,6 +469,8 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, device='cuda'):
     model.load_state_dict(ckpt['state_dict'])
     if optimizer is not None and 'optimizer' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer'])
+    if scheduler is not None and ckpt.get('scheduler') is not None:
+        scheduler.load_state_dict(ckpt['scheduler'])
     epoch = ckpt.get('epoch', 0)
     print(f"[INFO] Loaded checkpoint from epoch {epoch}")
     return epoch
@@ -468,23 +490,56 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
 
     for batch_idx, batch in enumerate(dataloader):
         mel = batch['mel'].to(device)              # (B, 1, 80, 16*T)
-        face = batch['face'].to(device)            # (B, 15, H, W)
-        neg_mel = batch['neg_mel'].to(device)      # (B, 1, 80, 16*T)
+        face = batch['face'].to(device)            # (B, 15, H, W)  — 同步人脸（正样本）
+        neg_face = batch['neg_face'].to(device)    # (B, 15, H, W)  — 时间偏移人脸（负样本，同视频不同时刻）
 
         batch_size = mel.size(0)
 
-        # 前向传播
-        a_emb, v_emb = model(mel, face)
+        if batch_size < 2:
+            continue
 
-        # 负样本对（使用负样本 mel + 正样本 face）
-        neg_a_emb, _ = model(neg_mel, face)
+        # 音频编码器
+        audio_feat = model.audio_encoder(mel)
+        audio_feat = model.audio_pool(audio_feat)
+        a_emb = audio_feat.view(batch_size, -1)
+        a_emb = F.normalize(a_emb, p=2, dim=1)
 
-        # 计算损失
-        loss = criterion(a_emb, v_emb, neg_a_emb, v_emb)
+        # 人脸编码器（正样本：同视频同时刻）
+        face_feat = model.face_encoder(face)
+        face_feat = model.face_pool(face_feat)
+        v_pos_emb = face_feat.view(batch_size, -1)
+        v_pos_emb = F.normalize(v_pos_emb, p=2, dim=1)
 
-        # 计算相似度用于监控
-        pos_sim = F.cosine_similarity(a_emb, v_emb, dim=1).sum().item()
-        neg_sim = F.cosine_similarity(neg_a_emb, v_emb, dim=1).sum().item()
+        # 人脸编码器（负样本：时间偏移，同视频不同时刻）
+        neg_feat = model.face_encoder(neg_face)
+        neg_feat = model.face_pool(neg_feat)
+        v_neg_emb = neg_feat.view(batch_size, -1)
+        v_neg_emb = F.normalize(v_neg_emb, p=2, dim=1)
+
+        # ---- 诊断：验证数据流正确性 ----
+        if batch_idx % 100 == 0:
+            # 检查1: face vs neg_face 的原始像素差异
+            face_diff = (face - neg_face).abs().mean().item()
+            # 检查2: embedding 差异
+            emb_diff = (v_pos_emb - v_neg_emb).abs().mean().item()
+            # 检查3: 同一样本的 pos vs neg embedding 的 cosine 距离
+            per_sample_cos_diff = (v_pos_emb * v_neg_emb).sum(dim=1).mean().item()
+            # 检查4: pos_emb 自身的标准差（是否所有 pos_emb 都一样）
+            pos_emb_std = v_pos_emb.std(dim=0).mean().item()
+            # 检查5: audio_emb 的 batch 内标准差
+            audio_emb_std = a_emb.std(dim=0).mean().item()
+            # 检查6: Python 对象是否是同一个 tensor（内存地址相同）
+            same_obj = (face.data_ptr() == neg_face.data_ptr())
+            print(f"[DIAG] batch {batch_idx}: "
+                  f"same_ptr={same_obj} | "
+                  f"face_raw_diff={face_diff:.6f} | "
+                  f"emb_diff={emb_diff:.6f} | "
+                  f"pos_neg_cos={per_sample_cos_diff:.4f} | "
+                  f"pos_std={pos_emb_std:.4f} | "
+                  f"audio_std={audio_emb_std:.4f}")
+
+        # Wav2Lip 式逐样本对比损失（不使用 batch 内 InfoNCE）
+        loss, pos_sim, neg_sim = criterion(a_emb, v_pos_emb, v_neg_emb)
 
         # 反向传播
         optimizer.zero_grad()
@@ -492,8 +547,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
         optimizer.step()
 
         total_loss += loss.item() * batch_size
-        total_pos_sim += pos_sim
-        total_neg_sim += neg_sim
+        total_pos_sim += pos_sim.item() * batch_size
+        total_neg_sim += neg_sim.item() * batch_size
         total_samples += batch_size
 
         if batch_idx % 100 == 0:
@@ -522,20 +577,33 @@ def eval_epoch(model, dataloader, criterion, device, epoch):
     for batch_idx, batch in enumerate(dataloader):
         mel = batch['mel'].to(device)
         face = batch['face'].to(device)
-        neg_mel = batch['neg_mel'].to(device)
+        neg_face = batch['neg_face'].to(device)    # 时间偏移人脸（负样本）
 
         batch_size = mel.size(0)
 
-        a_emb, v_emb = model(mel, face)
-        neg_a_emb, _ = model(neg_mel, face)
-        loss = criterion(a_emb, v_emb, neg_a_emb, v_emb)
+        if batch_size < 2:
+            continue
 
-        pos_sim = F.cosine_similarity(a_emb, v_emb, dim=1).sum().item()
-        neg_sim = F.cosine_similarity(neg_a_emb, v_emb, dim=1).sum().item()
+        audio_feat = model.audio_encoder(mel)
+        audio_feat = model.audio_pool(audio_feat)
+        a_emb = audio_feat.view(batch_size, -1)
+        a_emb = F.normalize(a_emb, p=2, dim=1)
+
+        face_feat = model.face_encoder(face)
+        face_feat = model.face_pool(face_feat)
+        v_pos_emb = face_feat.view(batch_size, -1)
+        v_pos_emb = F.normalize(v_pos_emb, p=2, dim=1)
+
+        neg_feat = model.face_encoder(neg_face)
+        neg_feat = model.face_pool(neg_feat)
+        v_neg_emb = neg_feat.view(batch_size, -1)
+        v_neg_emb = F.normalize(v_neg_emb, p=2, dim=1)
+
+        loss, pos_sim, neg_sim = criterion(a_emb, v_pos_emb, v_neg_emb)
 
         total_loss += loss.item() * batch_size
-        total_pos_sim += pos_sim
-        total_neg_sim += neg_sim
+        total_pos_sim += pos_sim.item() * batch_size
+        total_neg_sim += neg_sim.item() * batch_size
         total_samples += batch_size
 
     avg_loss = total_loss / total_samples
@@ -630,25 +698,41 @@ def main(args):
     # 优化器
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # 损失函数
     criterion = SyncNetLoss()
+
+    # 学习率调度：ReduceLROnPlateau，监控 Val Gap 的改善
+    # 传递 -Gap 给 mode='min'（因为 Gap 增大 = 需最小化 -Gap）
+    # threshold_mode='abs' + threshold=0.003: 仅当 Gap 改善 ≥0.003 时才重置计数
+    # 这过滤了 ±0.001~0.002 的随机波动，确保 LR 只在真实停滞时衰减
+    lr_min_effective = max(args.lr_min, args.lr / 20)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=lr_min_effective,
+        threshold_mode='abs',
+        threshold=0.003,  # Gap 改善 < 0.003 → 视为未改善
+    )
 
     # 加载已有 checkpoint
     start_epoch = 0
     if args.resume and os.path.exists(args.resume):
-        start_epoch = load_checkpoint(args.resume, model, optimizer, str(device))
+        start_epoch = load_checkpoint(args.resume, model, optimizer, scheduler, str(device))
         start_epoch += 1
 
-    # 学习率调度：在 no_val_split 模式下不使用（基于训练损失无意义）
-    # 保留配置但不使用：lr_patience = 3, lr_decay_factor = 0.9, min_lr = 1e-6
-    epochs_since_improvement = 0
-
-    # Early Stopping: 使用较小的 patience 以避免过度训练
-    es_patience = 5
-    es_counter = 0
+    # Early Stopping 参数
+    es_patience = args.es_patience
+    es_counter = 0           # Gap 未改善的连续 epoch 数
+    best_save_epoch = -1     # 最后一次保存 best model 的 epoch
 
     # 训练循环
+    # 最佳模型追踪：使用 Val Pos/Neg Gap 而非 val_loss
+    # val_loss 波动大且与下游 audio2lip 任务关联弱，Gap 直接反映
+    # 模型的唇音同步判别能力——这才是 SyncNet 的核心指标。
     best_val_loss = float('inf')
+    best_val_gap = -float('inf')   # 追踪最佳 Pos/Neg 分离度
+    initial_lr = args.lr
     for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{args.epochs}")
@@ -666,9 +750,12 @@ def main(args):
             val_loss, val_pos_sim, val_neg_sim = eval_epoch(
                 model, val_loader, criterion, device, epoch
             )
+            val_gap = val_pos_sim - val_neg_sim
+
             # 打印 epoch 结束后的完整指标
             print(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
-                  f"Val Pos Sim: {val_pos_sim:.4f} | Val Neg Sim: {val_neg_sim:.4f}")
+                  f"Val Pos Sim: {val_pos_sim:.4f} | Val Neg Sim: {val_neg_sim:.4f} | "
+                  f"Val Gap: {val_gap:.4f}")
 
             # TensorBoard 记录
             writer.add_scalar('Loss/train', train_loss, epoch)
@@ -677,24 +764,61 @@ def main(args):
             writer.add_scalar('Sim/neg_train', train_neg_sim, epoch)
             writer.add_scalar('Sim/pos_val', val_pos_sim, epoch)
             writer.add_scalar('Sim/neg_val', val_neg_sim, epoch)
+            writer.add_scalar('Gap/val', val_gap, epoch)
             writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
 
             # 保存 checkpoint（每5个epoch保存一次）
             if epoch % 5 == 0 or epoch == args.epochs - 1:
                 checkpoint_path = os.path.join(args.checkpoint_dir, f'syncnet_epoch_{epoch:04d}.pt')
-                save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_path)
+                save_checkpoint(model, optimizer, scheduler, epoch, val_loss, checkpoint_path)
 
-            # 保存最佳模型 & 学习率调度 & Early Stopping（基于验证损失）
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            # ---- 保存最佳模型：双标准 ----
+            # 标准1（主）：Val Pos/Neg Gap 最大 —— 反映唇音判别力
+            # 标准2（辅）：若 Gap 相同，Val Pos Sim 更高优先
+            is_new_best = False
+            best_reason = ""
+            if val_gap >= best_val_gap + 0.003:  # 微小容差，过滤波动但保留所有有意义改善
+                is_new_best = True
+                best_reason = f"Val Gap: {val_gap:.4f} (prev {best_val_gap:.4f})"
+            elif abs(val_gap - best_val_gap) <= 0.005 and val_pos_sim > best_val_loss + 0.01:
+                # Gap 接近时，Pos Sim 更高的模型在推理时更可靠
+                is_new_best = True
+                best_reason = f"Val Pos: {val_pos_sim:.4f} (prev best at same Gap)"
+                best_val_loss = val_pos_sim  # 复用 best_val_loss 存储 best_pos
+
+            if is_new_best:
+                best_val_gap = val_gap
+                if 'Pos' not in best_reason:
+                    best_val_loss = val_pos_sim
                 best_path = os.path.join(args.checkpoint_dir, 'syncnet_best.pt')
-                save_checkpoint(model, optimizer, epoch, val_loss, best_path)
-                print(f"[INFO] New best model saved! Val Loss: {val_loss:.6f}")
-                epochs_since_improvement = 0
+                save_checkpoint(model, optimizer, scheduler, epoch, val_loss, best_path)
+                print(f"[INFO] New best model saved! {best_reason}")
                 es_counter = 0
+                best_save_epoch = epoch
             else:
-                epochs_since_improvement += 1
                 es_counter += 1
+
+            # 学习率调度：监控 Val Gap（Gap 增大=改善，传递 -Gap 给 mode='min'）
+            prev_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(-val_gap)
+            current_lr = optimizer.param_groups[0]['lr']
+
+            # LR 衰减时输出提示
+            if current_lr < prev_lr:
+                print(f"[LR] Learning rate decayed: {prev_lr:.8f} → {current_lr:.8f}")
+
+            # ---- Early Stopping（双条件） ----
+            # 条件1：Gap 连续 N epoch 未改善 → 触发早停
+            if es_patience > 0 and es_counter >= es_patience:
+                print(f"[Early Stop] Val Gap not improved for {es_patience} epochs "
+                      f"(since epoch {best_save_epoch}). Best Val Gap: {best_val_gap:.4f}")
+                break
+
+            # 条件2：LR 已衰减到初始 LR 的 1/10 以下 → 训练无效，停止
+            if current_lr < initial_lr / 10:
+                print(f"[Early Stop] LR ({current_lr:.8f}) below useful threshold "
+                      f"({initial_lr/10:.8f}). Best Val Gap: {best_val_gap:.4f}")
+                break
         else:
             # no_val_split 模式：基于训练损失保存 checkpoint
             print(f"[Epoch {epoch}] Train Loss: {train_loss:.6f} | "
@@ -709,29 +833,24 @@ def main(args):
             # 保存 checkpoint（每5个epoch保存一次）
             if epoch % 5 == 0 or epoch == args.epochs - 1:
                 checkpoint_path = os.path.join(args.checkpoint_dir, f'syncnet_epoch_{epoch:04d}.pt')
-                save_checkpoint(model, optimizer, epoch, train_loss, checkpoint_path)
+                save_checkpoint(model, optimizer, scheduler, epoch, train_loss, checkpoint_path)
 
             # 基于训练损失早停（连续多个 epoch 训练损失未下降）
             if train_loss < best_val_loss:
                 best_val_loss = train_loss
                 best_path = os.path.join(args.checkpoint_dir, 'syncnet_best.pt')
-                save_checkpoint(model, optimizer, epoch, train_loss, best_path)
+                save_checkpoint(model, optimizer, scheduler, epoch, train_loss, best_path)
                 print(f"[INFO] New best model saved! Train Loss: {train_loss:.6f}")
                 es_counter = 0
             else:
                 es_counter += 1
 
-            # 学习率衰减：在 no_val_split 模式下禁用（基于训练损失的 LR 调度无意义）
-            # 若未来需要，可在 val 模式下恢复此逻辑
+            # 学习率衰减：在 no_val_split 模式下不使用（基于训练损失无意义）
 
             # Early Stopping
-            if es_counter >= es_patience:
-                if val_loader is not None:
-                    print(f"[Early Stop] No improvement for {es_patience} epochs. "
-                          f"Best Val Loss: {best_val_loss:.6f}")
-                else:
-                    print(f"[Early Stop] No improvement for {es_patience} epochs. "
-                          f"Best Train Loss: {best_val_loss:.6f}")
+            if es_patience > 0 and es_counter >= es_patience:
+                print(f"[Early Stop] No improvement for {es_patience} epochs. "
+                      f"Best Train Loss: {best_val_loss:.6f}")
                 break
 
         # 定期清理缓存
@@ -751,12 +870,20 @@ if __name__ == '__main__':
                         help='数据集根目录（包含 lmdb/, mel/, bbox/）')
 
     # 训练参数
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=50,
                         help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=64,
                         help='batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='学习率')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                        help='初始学习率')
+    parser.add_argument('--lr_factor', type=float, default=0.5,
+                        help='ReduceLROnPlateau 衰减因子')
+    parser.add_argument('--lr_patience', type=int, default=2,
+                        help='ReduceLROnPlateau patience（epoch 数）')
+    parser.add_argument('--lr_min', type=float, default=1e-5,
+                        help='最小学习率')
+    parser.add_argument('--es_patience', type=int, default=5,
+                        help='Early Stopping patience（epoch 数，0 表示禁用）')
     parser.add_argument('--syncnet_T', type=int, default=5,
                         help='SyncNet 时间窗口长度（帧数）')
     parser.add_argument('--image_size', type=int, default=256,
@@ -769,8 +896,8 @@ if __name__ == '__main__':
                         help='checkpoint 保存目录')
     parser.add_argument('--resume', type=str, default=None,
                         help='恢复训练的 checkpoint 路径')
-    parser.add_argument('--val_split', type=float, default=0.05,
-                        help='验证集比例（按视频划分），默认 5%%')
+    parser.add_argument('--val_split', type=float, default=0.5,
+                        help='验证集比例（按视频划分），默认 5%')
     parser.add_argument('--no_val_split', action='store_true',
                         help='禁用验证集划分，使用全量数据集进行训练（适用于特定人物微调场景）')
 

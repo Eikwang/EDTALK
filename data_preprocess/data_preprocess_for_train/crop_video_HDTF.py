@@ -4,6 +4,7 @@ os.environ["TORCH_COMPILE"] = "0"
 os.environ["PYTORCH_JIT"] = "0"
 
 import sys
+import time
 import cv2
 import numpy as np
 from argparse import ArgumentParser
@@ -18,12 +19,21 @@ import tempfile
 import shutil
 from functools import partial
 
-# 从 imageio-ffmpeg 获取 ffmpeg 路径（无需系统安装 FFMPEG）
-try:
-    import imageio_ffmpeg
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-except ImportError:
-    FFMPEG_PATH = 'ffmpeg'
+# 使用独立版 FFMPEG（更稳定，适合大规模数据处理）
+# 优先使用 runtime312/ffmpeg/bin/ffmpeg.exe
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+FFMPEG_PATH = os.path.join(PROJECT_ROOT, 'runtime312', 'ffmpeg', 'bin', 'ffmpeg.exe')
+
+if not os.path.exists(FFMPEG_PATH):
+    # 回退到 imageio-ffmpeg 或系统 ffmpeg
+    try:
+        import imageio_ffmpeg
+        FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        FFMPEG_PATH = 'ffmpeg'
+
+print(f"[INFO] Using FFMPEG: {FFMPEG_PATH}")
 
 # ============================================================
 # S3FD 人脸检测器 (参考 crop_head_video.py 的高效实现)
@@ -149,6 +159,47 @@ class HeadTracker:
         return crop_x, crop_y, crop_size
 
 
+class DetectTimeoutGuard:
+    """单帧人脸检测超时防护（Windows WDDM 下 S3FD 偶发长时间卡顿）
+
+    检测调用是同步的，无法在进程内中断，因此策略是：单帧检测耗时超过
+    timeout_s 时记录超时，并在随后 cooldown_frames 帧内跳过检测
+    （HeadTracker 保持上一帧状态），避免卡顿恢复后立刻再次触发慢检测。
+    若检测真正死锁（永不返回），进程内无法自救，需靠 run_preprocess.py
+    的进程级重试/断点续跑，或手动终止进程。
+    """
+
+    def __init__(self, timeout_s, cooldown_frames=30):
+        self.timeout_s = float(timeout_s)
+        self.cooldown_frames = int(cooldown_frames)
+        self._started = None
+        self._overrun = False
+        self._skip_until = -1
+
+    def begin(self):
+        """检测调用开始前调用"""
+        self._started = time.monotonic()
+        self._overrun = False
+
+    def end(self):
+        """检测调用返回后调用；若耗时超过阈值则标记超时"""
+        if self._started is not None:
+            elapsed = time.monotonic() - self._started
+            self._started = None
+            if elapsed >= self.timeout_s:
+                self._overrun = True
+
+    def was_overrun(self):
+        return self._overrun
+
+    def cooldown(self, frame_idx):
+        """让后续帧进入冷却期：跳过检测，跟踪器保持上一帧状态"""
+        self._skip_until = frame_idx + self.cooldown_frames
+
+    def should_skip(self, frame_idx):
+        return frame_idx < self._skip_until
+
+
 def process_video(args, detector_info):
     """处理单个视频：cv2 读取 → 间隔检测 → HeadTracker 逐帧跟踪 → 逐帧裁切写入
 
@@ -177,6 +228,8 @@ def process_video(args, detector_info):
 
     detect_interval = getattr(args, 'detect_interval', 3)
     min_face_size = getattr(args, 'min_face_size', 30)
+    detect_timeout_s = float(getattr(args, 'detect_timeout_s', 0.0) or 0.0)
+    timeout_guard = DetectTimeoutGuard(detect_timeout_s) if detect_timeout_s > 0 else None
 
     valid_frame_count = 0
     consecutive_misses = 0
@@ -188,11 +241,22 @@ def process_video(args, detector_info):
         if not ret:
             break
 
-        # 间隔检测人脸
+        # 间隔检测人脸（超时防护：冷却期内跳过检测，跟踪器保持上一帧状态）
         face_result = None
         if frame_idx % detect_interval == 0:
-            face_result = detect_face(detector_info, frame,
-                                      min_face_size=min_face_size, max_detect_size=640)
+            if timeout_guard is not None and timeout_guard.should_skip(frame_idx):
+                pass
+            else:
+                if timeout_guard is not None:
+                    timeout_guard.begin()
+                face_result = detect_face(detector_info, frame,
+                                          min_face_size=min_face_size, max_detect_size=640)
+                if timeout_guard is not None:
+                    timeout_guard.end()
+                    if timeout_guard.was_overrun():
+                        print(f"[WARN] 帧 {frame_idx} 人脸检测耗时 >= {timeout_guard.timeout_s:.1f}s, "
+                              f"接下来 {timeout_guard.cooldown_frames} 帧跳过检测")
+                        timeout_guard.cooldown(frame_idx)
 
         # HeadTracker 逐帧更新，返回本帧的裁切坐标（EMA 平滑）
         crop_x, crop_y, crop_size = tracker.update(
@@ -335,6 +399,10 @@ if __name__ == "__main__":
                         help="Face detection interval (every N frames). Lower=slower but more accurate.")
     parser.add_argument("--min_face_size", type=int, default=30,
                         help="Minimum face size in pixels")
+    parser.add_argument("--num_processes", type=int, default=5,
+                        help="工作进程数 (<=1 时串行执行，避免 Windows spawn 重新导入 torch 的崩溃风险)")
+    parser.add_argument("--detect_timeout_s", type=float, default=0.0,
+                        help="单帧人脸检测超时阈值(秒)，0=禁用；超时后冷却期内跳过检测 (Windows WDDM 死锁防护)")
 
     args = parser.parse_args()
 
@@ -350,11 +418,15 @@ if __name__ == "__main__":
                        if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))])
     print(f"Found {len(all_data)} videos in {HDTF_dir}")
 
-    num_processes = 5
-    ctx = multiprocessing.get_context('spawn')
-
-    with ctx.Pool(processes=num_processes) as pool:
-        func = partial(process_single_video, args=args)
-        results = pool.map(func, all_data)
+    num_processes = max(1, args.num_processes)
+    if num_processes <= 1:
+        # 串行模式：直接在主进程执行，避免 spawn 重新导入模块(含 torch)的开销与崩溃风险
+        for name in all_data:
+            process_single_video(name, args)
+    else:
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(processes=num_processes) as pool:
+            func = partial(process_single_video, args=args)
+            pool.map(func, all_data)
 
     print("Done.")

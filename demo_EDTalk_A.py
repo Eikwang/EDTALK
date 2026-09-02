@@ -86,11 +86,12 @@ def get_mel(audio_path):
     indiv_mels = []
     fps = 25
     syncnet_mel_step_size = 16
+    mel_fps = 16000.0 / audio.get_hop_size()
 
 
     for i in range(num_frames):
         start_frame_num = i-2
-        start_idx = int(80. * (start_frame_num / float(fps)))
+        start_idx = int(mel_fps * (start_frame_num / float(fps)))
         end_idx = start_idx + syncnet_mel_step_size
         seq = list(range(start_idx, end_idx))
         seq = [ min(max(item, 0), orig_mel.shape[0]-1) for item in seq ]
