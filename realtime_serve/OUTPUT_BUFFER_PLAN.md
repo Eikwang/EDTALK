@@ -678,3 +678,111 @@ GIL 争用：OutputStreamer 的 send（11MB 拷贝 ~5-10ms）持 GIL 会短暂�
 | Unresolved          | 0（顺序问题留门）                              |
 +====================================================================+
 ```
+
+## 工程双声部（Step 0.5）
+
+CODEX 不可用 → [subagent-only]。
+
+### CLAUDE SUBAGENT（ENG — 独立架构挑战）核心发现
+
+- **[CRITICAL] 生产-显示偏移恒等 = buffer_size（被方案遗漏的核心性质）**：
+  背压下缓冲恒满，生产侧一切决策提前 D/25 秒生效。音频结束→idle 转移在生产
+  侧按墙钟判定，宽限 1.0s < 2s → **每句话结尾嘴先闭 1 秒**。修复 F12：结束
+  判定迁序列号空间且宽限吞掉缓冲深度；或消费侧判定。
+- **[CRITICAL] --no-unitycapture 无消费者 → 服务假死**：生产者填满 50 帧后
+  永久阻塞（比 DX 发现的"音频静默"更彻底）。F7 解耦已覆盖一半，补强制
+  消费者存在 + 测试。
+- **[HIGH] "复用 sender pacing 骨架"与序列号不变式冲突**：落后重锚/异常退避
+  都会打断 tick↔seq 映射 → 永久失步 1 帧。修复 F13：按钟计 tick
+  （target_seq = floor((now-t0)*fps)），追平/丢弃策略显式化。
+- **[HIGH] underrun 重武装自相矛盾 + 持续欠产能最坏行为**。修复 F14：每次
+  空 tick 计数；≥1 帧即恢复；重武装独立默认 2-4 帧；丢帧追音频策略显式化。
+- **[HIGH] /segment/switch 不 flush → 旧段画面滞后 2s（回归）；offset 语义与
+  现有"新段从第 0 帧开始"矛盾；换段非原子**。修复 F15：所有段切换 flush +
+  原子换段 + 保留现有"从第 0 帧开始"语义。
+- **[HIGH] 每次 push flush 制造空窗 → 假 underrun 风暴 + 回填期与 Audio2Lip
+  抢 GPU（恰在唇同步最敏感时刻）**。修复 F16：flush 豁免窗、回填限速
+  ≤2×target_fps、underrun 指标区分空窗/欠产能。
+- [中] preroll=min(preroll,lip) 单位错位（F17 删特判）；stop() 接线缺失
+  （F18 停止序：buffer.close() 先行）；漂移校正跨线程语义/段重置/idle 作用域
+  /振荡风险（F19）；composite 返回 orifra 引用钉住预装载窗口，进程 RSS
+  ~3GB+（F20 总账）。
+- **测试缺口 10 项**，最大缺口：**端到端序列号不变式测试**（随机生产速率+
+  flush+underrun+段切换组合下断言 lip_idx==n）——方案唯一卖点无任何测试
+  验证。定为合并门禁。Condition+deque 选型正确（flush/close/preroll 门
+  Queue 做不到）；真抖动源是回填期内存带宽而非 GIL。
+
+### ENG DUAL VOICES — CONSENSUS TABLE
+```
+═══════════════════════════════════════════════════════════════
+  Dimension                           Claude  Codex  Consensus
+  ──────────────────────────────────── ─────── ─────── ─────────
+  1. Architecture sound?               否(2crit) N/A   DISAGREE→修正
+  2. Test coverage sufficient?         否(10缺口) N/A   DISAGREE→修正
+  3. Performance risks addressed?      部分      N/A   部分确认
+  4. Security threats covered?         是        N/A   CONFIRMED
+  5. Error paths handled?              否        N/A   DISAGREE→修正
+  6. Deployment risk manageable?       是(条件)  N/A   部分确认
+═══════════════════════════════════════════════════════════════
+```
+
+## 工程/跨阶段修正 F12-F20（并入方案）
+
+| # | 修正 | 来源 |
+|---|------|------|
+| F12 | 音频结束/idle 转移迁序列号空间，宽限吞掉缓冲深度；显式不变式"生产侧决策提前 D/25 秒生效"，审计全部生产侧墙钟引用 | ENG 1.1 |
+| F13 | 时钟驱动 tick：target_seq=floor((now-t0)*fps)，追平/丢帧策略显式化；不复用"迭代即 tick"骨架 | ENG 1.2 |
+| F14 | underrun 逐空 tick 计数；≥1 帧即恢复；重武装独立默认 2-4 帧；持续欠产能=丢帧追音频 | ENG 2.2 + DX 3.2 |
+| F15 | 所有段切换（含无音频、预滚期间）flush；offset+total 原子换段；保留"新段从第 0 帧开始"语义 | ENG 2.3 |
+| F16 | flush 豁免窗（不计 underrun）；回填限速 ≤2×target_fps；指标区分空窗/欠产能 | ENG 2.4 |
+| F17 | 删 preroll=min(preroll,lip) 特判；补 1s 音频+preroll50 启动用例 | ENG 2.6 |
+| F18 | 停止序：signal→buffer.close()(notify_all)→线程汇合→关音频/摄像头；main.py 接线任务 | ENG 2.7 |
+| F19 | 漂移校正：每段重置基准、仅激活期测量、消费侧插值或每段限一次、underrun 帧计入 | ENG 1.4 |
+| F20 | composite orifra 引用钉住问题入 S7；RSS 总账 ~3GB；回填期 p99 send 实测入 T0 | ENG 四 |
+
+**关键推论（改变门上选项权重）**：缓冲深度 ≤16 帧（0.64s）时，现有
+AUDIO_END_GRACE_S=1.0s 天然覆盖生产-显示偏移，F12 类问题整个消失；
+深度 4-8 帧时 F12/F15 滞后/F16 空窗全部退化为小量级或不存在。
+**浅缓冲不需要唇同步重写，复杂度等级断崖式下降。**
+
+## 测试计划增补（合并门禁）
+
+端到端序列号不变式测试 = **合并门禁**（随机生产速率 0.5x-2x + flush +
+underrun + 段切换 + 短段组合，断言显示 tick n 的 lip_idx == n）。
+另补 9 项：结束转移时机、无音频段切换、无摄像头消费路径、preroll 校验拒绝、
+underrun 恢复后唇音对齐、漂移方向/段重置、深缓冲 flush 唤醒、标记帧
+resend 仍恰一次、timeBeginPeriod 冒烟。已更新测试计划产物。
+
+## 跨阶段主题（2+ 阶段独立发现 → 高置信信号）
+
+| 主题 | 出现阶段 | 结论 |
+|------|----------|------|
+| **flush/段首空窗 + 欠载重武装 = 体验倒退风险** | CEO 声部发现9、DX 发现3.2、ENG 2.2/2.4 三阶段独立命中 | 默认参数组合会在每次推音频后制造脆弱窗口；F9/F14/F16 修正，且是"浅缓冲"选项的核心论据 |
+| **--no-unitycapture 路径损坏** | DX 发现1.1（音频静默）、ENG 2.1（服务假死） | F7 强制消费者无条件存在；补专项测试 |
+| **内存总账低估** | CEO 声部发现8、ENG 四 | 550MB → 全进程 ~3GB；F5/F20 环形预分配+诚实记账 |
+| **文档/语义变更可发现性** | DX 发现2.3（7 处旧文档）、CEO P6 | T5 扩围 7 处清单 |
+
+## DX 共情叙事（第一人称）
+
+我是这个服务的运营者。我习惯性敲下 `python -m realtime_serve.main
+--character-dir wy --target-fps 25`——命令没变，但今天启动后摄像头多等了
+2 秒才出画，内存多了 550MB，而我毫不知情。三周后我传 `--target-fps 30`
+想复现旧的"快放"现象时，它不快放了——我以为 flag 坏了。凌晨两点画面
+冻结时，控制台只说 "Underflow"，不说为什么、更不说怎么办。**这三段挫败感
+就是 DX 发现 1.2/2.3/3.2 的来源，全部已列为任务验收项。**
+
+## 决策审计表（Decision Audit Trail）
+
+| # | 阶段 | 决策 | 分类 | 原则 | 理由 | 被否 |
+|---|------|------|------|------|------|------|
+| D1 | CEO | 方案B（缓冲池+序列号）为主审推荐 | Taste→门 | P1 | 完整性 9/10 vs A 的 5/10 | A |
+| D2 | CEO | E1 漂移校正、E2 /status 扩展、delight 回显 并入 scope | Mechanical | P2 | 半径内且 <1 天 | — |
+| D3 | CEO | E3 自适应 preroll、E4 帧直方图 → TODOS | Mechanical | P3 | 需运行数据才能设计 | — |
+| D4 | CEO | 跳过 /office-hours 前置提议 | Mechanical | — | repo 已有设计材料+延续性工程 | — |
+| D5 | CEO | 声部技术缺陷 F1-F6 直接修正 | Mechanical | P1 | 代码核实成立，非偏好 | — |
+| D6 | DX | F7-F11 修正并入 | Mechanical | P1 | 操作者第一体验是需求 | — |
+| D7 | ENG | E1 OutputStreamer 单时钟归属 | Mechanical | P5 | 消灭双时钟失败类 | 复用骨架 |
+| D8 | ENG | F12-F20 修正并入 | Mechanical | P1 | 2 critical 代码核实成立 | — |
+| D9 | ENG | 端到端序列号不变式 = 合并门禁 | Mechanical | P1 | 唯一卖点必须可验证 | — |
+| D10 | ALL | **缓冲深度/是否 seq 重写/实施顺序** | **USER CHALLENGE** | — | CEO 声部+ENG 推论挑战用户原案顺序与深度 | — |
+| D11 | ALL | buffer-size 默认 50 vs 浅缓冲默认 | Taste→门 | — | 与 D10 绑定 | — |
