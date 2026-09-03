@@ -48,6 +48,7 @@ python -m realtime_serve.main --character-dir wy --segments auto
 ```
 
 - 每段播完一遍（total_frames/fps 秒）自动切下一段；**边界切换为帧级续接**（M8：不清缓冲、不重布防 preroll，旧段尾帧按序播完接新段）。`POST /segment/switch` 默认 `at=immediate` 为硬切（flush 全弃 + preroll 重布防，≤0.3s 不连续）；`at=segment_end` 入队边界无缝切换。
+- ⚠️ 已知边界语义限制（待办，见 `TODOS.md`「音频感知的段边界切换」）：当前边界按**片段循环周期**判定——音频播到一半切段会保持音频继续、画面跳新段。计划改为"音频合成+播放完毕后才切"，待音频播放功能优化后处理。
 - **启动即从调度首段开播**：`--segments 22 55` 启动后直接播 '22'（不再先播角色默认段一整轮）；调度首段分辨率与默认段不同时，摄像头在启动阶段重建到新段分辨率。
 - 段名区分大小写，以 `orifra/` 下目录实际名称为准（可用 `/status` 的 `available_segments` 查看）。
 - 手动 `POST /segment/switch` 仍可用：切到序列内段 → 调度从该段继续循环；切到序列外段 → 调度挂起（`/status` `position: -1`），切回序列内段恢复。

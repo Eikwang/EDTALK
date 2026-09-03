@@ -5,6 +5,18 @@
 
 ## P2
 
+### 音频感知的段边界切换（播完当前音频再切）
+- **What:** 边界切换的触发条件从"按片段循环周期"（视频墙钟）扩展为"音频播放条件判断"：若当前有音频正在合成（Audio2Lip 异步推理未完成）或正在播放（唇形系数仍在消费），则顺延切换；等音频合成完毕且播放完毕后再切。
+- **Why:** 直播场景中 TTS 音频进行到一半时切段，音频会继续播但画面内容跳变（嘴型突换新段）。用户真机验收（2026-09-03）确认需要此优化——"边界切换需要优化，将按片段循环周期改为按音频播放条件判断"。
+- **Pros:** 切段永不打断"正在说的话"；与 AI-Vtuber 反应段联动（弹幕触发切段）体验正确。
+- **Cons:** 边界判定复杂化（读渲染循环的合成/播放状态）；无音频时回退循环周期语义；连续 TTS 轰炸可能无限顺延——需要顺延上限策略（如最多 N 秒强制切）。
+- **Context:** 当前实现：`RenderLoop._check_segment_schedule` 用视频墙钟判定边界（`elapsed*fps >= total`），调度器 advance 与 pending segment_end 都在此触发（render_loop.py）。音频状态已在 RenderLoop 现成可用：`_lip_filled/_total_lip_frames`（合成进度，合成中 = filled < total）、`_audio_start_time`（播放锚点，`AUDIO_END_GRACE_S=1.0` 播完宽限）。判定建议：`合成中 or 播放中 → 顺延`。落地时需同步更新 EMBEDDING.md 的 `at=segment_end` 语义描述与 RUNBOOK。
+- **Effort:** M（human ~1-2天 / CC ~1h）
+- **Priority:** P2
+- **Depends on:** 音频播放功能优化（用户规划中，先行）。
+
+## P2
+
 ### gaze off→on 懒初始化（corrector 懒构造）
 - **What:** 运行时从 gaze off 热启校正：懒构造 GazeCorrector（载入 ckpt + try_capture_graph）+ set_eyes_enabled(True) + 双槽掩码重算。
 - **Why:** 默认 `--gaze-correction off` 启动后无法运行时开启（主计划 M2 定为 409 拒绝）。直播中"临时想开眼校"需重启。
