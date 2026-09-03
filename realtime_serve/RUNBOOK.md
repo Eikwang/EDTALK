@@ -23,6 +23,11 @@
 | `--no-face-repair` | 默认 | - | 关闭面部修复（推荐，输出最流畅） |
 | `--face-repair on` | - | - | 每帧修复。已改为 **GPU 内联（IOBinding 零拷贝）**，消除了每帧两次 GPU↔CPU 往返；但 GPU 推理本身 ~6-7ms 仍在，产能紧张时仍建议关闭 |
 | `--face-repair adaptive` | - | - | 自适应：仅当输出缓冲深度 ≥6 帧（产能有余量）时修复，紧张时自动跳过。GPU 内联模式下推荐此项 |
+| `--gaze-correction` | off | - | 视线纠正三态：裸 flag=on（向后兼容）、off/on/adaptive。开启后 **compositor mask 扩展双眼区域**——输出眼睛变为 Generator 渲染的纠正眼（off 时为原视频原生眼）。**运行时可热切**：`POST /gaze/params`（off 启动后无法热开，409） |
+| `--gaze-convergence` | 0.05 | [-1,1] | 收敛角。素材人物坐姿/朝向不同时可调整；负值发散。**运行时热更**：`POST /gaze/params {"convergence": x}` 下一帧生效（覆盖 CLI 值，重启后失效） |
+| `--gaze-ckpt` | weights/current_model.ckpt | 路径 | gaze 生成器权重 |
+| `--no-unitycapture` | - | - | 无虚拟摄像头时仍可运行；OutputStreamer 正常 pacing |
+| `--gen-fp16` | 关闭 | - | 开启 Generator fp16 推理。**默认关闭**：实测在 RTX 4080 SUPER 上慢于 fp32+TF32（TF32 已覆盖 Ada 的大部分半精度收益，autocast 只剩 cast 开销） |
 | `--segments` | 不传 | 段名列表 | **段播放调度**（见下方调度章节） |
 | `--host` | 127.0.0.1 | 地址 | **默认回环绑定**（E4 安全默认）。远程消费需显式 `--host 0.0.0.0` 并强烈建议同时设 `--api-token`；从旧版本升级且依赖 0.0.0.0 直连的部署需同步改启动参数 |
 | `--api-token` | 无 | 字符串 | 设置后全路由要求 `Authorization: Bearer <token>`（401）；进程内 facade 调用无需 token |
@@ -42,7 +47,7 @@ python -m realtime_serve.main --character-dir wy --segments 1 55
 python -m realtime_serve.main --character-dir wy --segments auto
 ```
 
-- 每段播完一遍（total_frames/fps 秒）自动切下一段；切换时旧段尾帧全弃 + ~0.16s preroll 重启（轻微跳变属预期）。
+- 每段播完一遍（total_frames/fps 秒）自动切下一段；**边界切换为帧级续接**（M8：不清缓冲、不重布防 preroll，旧段尾帧按序播完接新段）。`POST /segment/switch` 默认 `at=immediate` 为硬切（flush 全弃 + preroll 重布防，≤0.3s 不连续）；`at=segment_end` 入队边界无缝切换。
 - **启动即从调度首段开播**：`--segments 22 55` 启动后直接播 '22'（不再先播角色默认段一整轮）；调度首段分辨率与默认段不同时，摄像头在启动阶段重建到新段分辨率。
 - 段名区分大小写，以 `orifra/` 下目录实际名称为准（可用 `/status` 的 `available_segments` 查看）。
 - 手动 `POST /segment/switch` 仍可用：切到序列内段 → 调度从该段继续循环；切到序列外段 → 调度挂起（`/status` `position: -1`），切回序列内段恢复。
@@ -57,11 +62,46 @@ python -m realtime_serve.main --character-dir wy --segments auto
 - 段切换时 `UnityCaptureSender.update_resolution()` 关闭并按新段原生尺寸重建虚拟摄像头（pyvirtualcam 帧尺寸在创建时固定，重建是唯一途径）。
 - 已在传输的个别过渡帧/重建失败时按摄像头尺寸缩放兜底（限频 `[WARN]`，10s 一次）——若持续出现该告警说明重建失败，输出退化为缩放模式。
 - 消费端注意：Unity Capture 滤镜（DH-Live 定制版）在**连接时**协商分辨率；不重连时滤镜按等比缩放+黑边适配新段画面（DH-Live 版滤镜每帧读取实际尺寸、接受任意分辨率）。要让摄像头以实际分辨率输出，消费端重连一次（或重启拉流端）即可。
-| `--gaze-correction` | off | - | 视线纠正三态：裸 flag=on（向后兼容）、off/on/adaptive。开启后 **compositor mask 扩展双眼区域**——输出眼睛变为 Generator 渲染的纠正眼（off 时为原视频原生眼） |
-| `--gaze-convergence` | 0.05 | [-1,1] | 收敛角。素材人物坐姿/朝向不同时可调整；负值发散。运行时改需重启（阶段 1） |
-| `--gaze-ckpt` | weights/current_model.ckpt | 路径 | gaze 生成器权重 |
-| `--no-unitycapture` | - | - | 无虚拟摄像头时仍可运行；OutputStreamer 正常 pacing |
-| `--gen-fp16` | 关闭 | - | 开启 Generator fp16 推理。**默认关闭**：实测在 RTX 4080 SUPER 上慢于 fp32+TF32（TF32 已覆盖 Ada 的大部分半精度收益，autocast 只剩 cast 开销） |
+
+## 控制面（API 与嵌入）
+
+运行时控制统一走进程内 facade（`realtime_serve/service.py` 的 `RealtimeService`，嵌入契约见 `realtime_serve/EMBEDDING.md`）；HTTP 是它的薄壳。语义错误响应统一三段式 `{"problem","cause","fix"}`；状态码分层：422=请求体 schema、400=语义、404=段不存在、409=启动未启用、413=载荷超限、503=未就绪。
+
+### 快速开始（5 命令）
+
+```bash
+# 1. 启动（默认回环绑定；日志出现 "API server running" 即就绪中）
+python -m realtime_serve.main --character-dir wy --target-fps 25 --face-repair on --gaze-correction on
+
+# 2. 看状态——就绪判据：preroll_state=complete 且 current_segment 非空
+curl http://127.0.0.1:8000/status
+
+# 3. 推一句 TTS 音频（16kHz 单声道 int16，base64）——唇形随音频动
+python push_audio.py some_tts.wav     # 或 POST /audio/push_full {"pcm_base64": "..."}
+
+# 4. 切段：立即硬切（≤0.3s）；at=segment_end 则边界帧级无缝
+curl -X POST http://127.0.0.1:8000/segment/switch -H "Content-Type: application/json" -d "{\"segment\": \"22\", \"at\": \"segment_end\"}"
+
+# 5. gaze 角度热更（下一帧生效）与修复门控热切
+curl -X POST http://127.0.0.1:8000/gaze/params -H "Content-Type: application/json" -d "{\"convergence\": 0.08}"
+curl -X POST http://127.0.0.1:8000/repair/params -H "Content-Type: application/json" -d "{\"mode\": \"adaptive\"}"
+```
+
+### 端点一览
+
+| 端点 | 作用 | 备注 |
+|---|---|---|
+| `POST /audio/push` | 流式音频分块 | 16kHz int16；10MB 上限（413） |
+| `POST /audio/push_full` | 整句 TTS（推荐，唇形最稳） | 异步推理，展示时点开播 |
+| `POST /segment/switch` | 切段 | `at=segment_end` 为 last-write-wins 队列；immediate 会清除挂起 |
+| `POST /segment/schedule` | 运行时改播放调度 | 默认不打断当前段（边界生效）；`align=true` 立即对齐 sequence[0] |
+| `POST /gaze/params` | gaze 角度/门控热更 | 启动 off 时 409（`gaze_capable=false`） |
+| `POST /repair/params` | 面部修复门控热切 | 启动 off 时热开 409（`repair_capable=false`） |
+| `GET /status` | 状态快照 | **只增不改**；新增字段见下表 |
+
+### 嵌入（AI-Vtuber）
+
+对接清单见 AI-Vtuber 仓 `specs/integration/EDTalk实时推理服务对接纪要.md`；方法面契约、三拓扑矩阵与版本规则见 `realtime_serve/EMBEDDING.md`。
 
 ### 参数换算
 
@@ -80,6 +120,13 @@ python -m realtime_serve.main --character-dir wy --segments auto
 | `underruns` | 输出端欠载重发计数 |
 | `preroll_state` | `prerolling` / `complete` |
 | `buffer_full_warn` | 缓冲持续满（检查摄像头消费端） |
+| `segment_sequence` | 调度信息 `{mode, position, sequence}`；`position: -1` = 手动切到序列外、调度暂停 |
+| `pending_switch` | 挂起的 segment_end 切换目标（无挂起则无此字段） |
+| `prefetch` | 无缝切换预取状态 `{state: idle\|loading\|ready\|discarded, segment}` |
+| `gaze_params` | gaze 参数回显 `{convergence, mode, smooth_alpha}`（当前生效值） |
+| `gaze_capable` / `repair_capable` | 组件是否已构造——false 时对应热切端点返回 409 |
+| `repair_mode` | 面部修复当前门控（off/on/adaptive） |
+| `camera_resolution` | 虚拟摄像头当前输出分辨率（段切换时自动重建） |
 
 ## 常见问题与处置
 

@@ -99,6 +99,38 @@ class RealtimeService:
         for key in _COMPONENT_KEYS:
             setattr(self, key, values[key])
 
+        # Render-loop attribute injection — the wiring main.py used to do
+        # after setup_service returned. The facade owns it now. (CHAOS test
+        # E6 caught this missing when mocks couldn't: without it the producer
+        # never sees frame_buffer and silently produces nothing.)
+        rl = self.render_loop
+        if assemble:
+            rl.model_manager = self.model_manager
+            rl.frame_buffer = self.frame_buffer
+            rl.output_streamer = self.output_streamer
+            rl.audio_buffer = self.audio_buffer
+            rl.audio_processor = self.audio_processor
+            rl.compositor = self.compositor
+            rl.face_repair = self.face_repair
+            rl.face_repair_mode = config.face_repair_mode
+            rl.gaze_corrector = self.gaze_corrector
+            rl.gaze_mode = config.gaze_mode
+            rl.audio_player = self.audio_player
+        else:
+            # Components path (tests / exotic embedders): fill in ONLY the
+            # attributes the caller left unset — explicit wiring wins (M5).
+            for attr, value in (('model_manager', self.model_manager),
+                                ('frame_buffer', self.frame_buffer),
+                                ('output_streamer', self.output_streamer),
+                                ('audio_buffer', self.audio_buffer),
+                                ('audio_processor', self.audio_processor),
+                                ('compositor', self.compositor),
+                                ('face_repair', self.face_repair),
+                                ('gaze_corrector', self.gaze_corrector),
+                                ('audio_player', self.audio_player)):
+                if getattr(rl, attr, None) is None and value is not None:
+                    setattr(rl, attr, value)
+
         self._lifecycle_lock = threading.Lock()
         self._started = False
         self._stopped = False

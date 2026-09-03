@@ -43,6 +43,11 @@ svc.stop()                         # 幂等，join 渲染线程
 校验语义一律**拒绝**（ValueError / HTTP 4xx），不做 clamp；错误信息回显合法
 区间与当前值。运行时 API 参数覆盖 CLI 启动值，仅存活至重启。
 
+状态码分层：**422** = 请求体 schema（pydantic 字段/枚举约束）、**400** = 语义
+校验（越界/空列表）、**404** = 对象不存在、**409** = 功能启动未启用、
+**413** = 载荷超限（音频 10MB）、**503** = 服务未就绪。错误体统一
+`{"problem", "cause", "fix"}` 三段式。
+
 ## HTTP 端点规格（进程外驱动面）
 
 默认绑定 `127.0.0.1:8000`（远程需显式 `--host 0.0.0.0`，可选 `--api-token` Bearer）。
@@ -96,3 +101,6 @@ gaze/repair off→on 懒初始化、CHANGELOG。详见仓库 `TODOS.md`。
 ## 变更登记
 
 - v0（2026-09-03）：初版契约冻结（M1 签名表 + M23 repair 热切 + M4 错误包络）。
+- v0.1（2026-09-03，实现定稿）：/gaze/params、/repair/params、/segment/schedule
+  上线；/segment/switch 增 `at=`；默认绑定回环 + 可选 Bearer 鉴权；422/413
+  状态码注记。方法面与 v0 无破坏性变更（快照测试守护）。

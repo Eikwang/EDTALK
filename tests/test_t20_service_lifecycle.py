@@ -274,5 +274,54 @@ class TestGetStatus:
         assert "gaze_params" not in status
 
 
+class TestContractSnapshot:
+    """嵌入契约 v0 快照（M14/T7）：方法面与签名只加不改——任何变更必须
+    先登记 EMBEDDING.md「变更登记」，否则本测试红。"""
+
+    CONTRACT = {
+        'start': [],
+        'stop': ['timeout'],
+        'switch_segment': ['segment', 'at'],
+        'set_schedule': ['sequence', 'align'],
+        'set_gaze_params': ['convergence', 'mode', 'smooth_alpha'],
+        'set_repair_params': ['mode'],
+        'push_audio': ['pcm_int16_bytes', 'seq'],
+        'push_full_audio': ['pcm_int16_bytes'],
+        'get_status': [],
+        'run_api': ['host', 'port'],
+    }
+
+    def test_method_surface_frozen(self):
+        import inspect
+        for name, params in self.CONTRACT.items():
+            fn = getattr(RealtimeService, name, None)
+            assert fn is not None, f"契约方法缺失: {name}"
+            got = [p for p in inspect.signature(fn).parameters if p != 'self']
+            assert got == params, (
+                f"{name} 签名变更: {got} != {params} —— 契约破坏，"
+                f"先登记 EMBEDDING.md 变更登记再改")
+
+    def test_no_undeclared_public_methods(self):
+        public = {n for n in dir(RealtimeService)
+                  if not n.startswith('_') and n not in ('config',)}
+        declared = set(self.CONTRACT) | {'running'}
+        # 允许继承自 object 的方法；新增公开方法 = 契约扩展，须先登记
+        extra = public - declared - set(dir(object))
+        assert not extra, f"未登记的公开方法: {extra}（在 CONTRACT 表登记）"
+
+    def test_status_v0_baseline_superset(self):
+        """只增不改：v0 基线键必须是任何 /status 响应的子集。"""
+        svc = _service(gaze=FakeGaze())
+        status = svc.get_status()
+        baseline = {
+            'state', 'fps', 'production_fps', 'output_fps', 'buffer_depth',
+            'buffer_ms', 'underruns', 'preroll_state', 'current_segment',
+            'frame_index', 'resolution', 'available_segments',
+            'gaze_capable', 'repair_mode', 'repair_capable',
+        }
+        missing = baseline - set(status.keys())
+        assert not missing, f"v0 基线字段丢失: {missing}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
