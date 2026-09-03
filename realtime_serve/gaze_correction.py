@@ -23,6 +23,8 @@ Design notes:
 - Dynamic convergence angle: set_convergence() re-builds the angle tensor;
   effective from the next frame.
 """
+import math
+
 import cv2
 import numpy as np
 import torch
@@ -36,6 +38,11 @@ EAR_CLOSE = 0.12
 EAR_OPEN = 0.16
 OPEN_CONFIRM_FRAMES = 3
 MAX_BLINK_FRAMES = 26
+
+# Convergence change above which the temporal-smoothing history is dropped:
+# a large angle jump would otherwise lerp old-angle eyes for ~2-3 frames
+# (temporal_alpha=0.7 decays the previous frame at 0.3^n).
+CONVERGENCE_GHOST_DELTA = 0.2
 
 
 class GazeCorrector:
@@ -105,11 +112,29 @@ class GazeCorrector:
     # ------------------------------------------------------------------
 
     def set_convergence(self, convergence_h: float) -> None:
-        """Change the convergence angle at runtime (takes effect next frame)."""
-        self._convergence_h = float(convergence_h)
-        self._angles = self._build_angles(self._convergence_h)
+        """Change the convergence angle at runtime (takes effect next frame).
+
+        Validates REJECTIVELY (never clamps): NaN/inf would poison the CUDA
+        graph (every replay reads _static_angles, so one bad copy_ turns every
+        output frame into garbage with no exception raised — M17). The owner
+        layer guards here so direct in-process callers are protected too, not
+        just HTTP clients.
+        """
+        v = float(convergence_h)
+        if not math.isfinite(v):
+            raise ValueError(
+                f"convergence 必须为有限数值（拒绝 NaN/inf），got {convergence_h}")
+        if not (-1.0 <= v <= 1.0):
+            raise ValueError(
+                f"convergence 必须在 [-1, 1] 内，got {v}（当前值 {self._convergence_h}）")
+
+        prev = self._convergence_h
+        self._convergence_h = v
+        self._angles = self._build_angles(v)
         if self._graph_ready:
             self._static_angles.copy_(self._angles)
+        if prev is not None and abs(v - prev) > CONVERGENCE_GHOST_DELTA:
+            self._prev_gen = None  # drop stale-angle smoothing history
 
     def reset(self) -> None:
         """Reset per-segment state (segment switch / character switch)."""

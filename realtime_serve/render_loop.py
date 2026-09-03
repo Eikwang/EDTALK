@@ -663,11 +663,14 @@ class RenderLoop:
     def _repair_allowed(self) -> bool:
         """Whether face repair may run on this frame.
 
+        'off': never (runtime hot switch may set this while the FaceRepair
+        model stays constructed — the gate, not the model, is what turns).
         'on': every frame. 'adaptive': only while the output buffer has
         headroom (production comfortably ahead of consumption) — the
-        ~9ms synchronous GPU wait is unaffordable otherwise. 'off' never
-        reaches here (face_repair is not constructed).
+        ~9ms synchronous GPU wait is unaffordable otherwise.
         """
+        if self.face_repair_mode == 'off':
+            return False
         if self.face_repair_mode != 'adaptive':
             return True
         if self.frame_buffer is None:
@@ -677,10 +680,14 @@ class RenderLoop:
     def _gaze_allowed(self) -> bool:
         """Whether gaze correction may run on this frame (adaptive mode).
 
-        Gaze costs ~2-3ms/frame of GPU work; adaptive shares the repair
-        headroom threshold (REPAIR_MIN_BUFFER) — at that depth production
-        is comfortably ahead of the 25fps output line.
+        'off': never (runtime hot switch may set this while the corrector
+        stays constructed). 'on': every frame. 'adaptive': gaze costs
+        ~2-3ms/frame of GPU work; adaptive shares the repair headroom
+        threshold (REPAIR_MIN_BUFFER) — at that depth production is
+        comfortably ahead of the 25fps output line.
         """
+        if self.gaze_mode == 'off':
+            return False
         if self.gaze_mode != 'adaptive':
             return True
         if self.frame_buffer is None:
