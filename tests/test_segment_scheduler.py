@@ -63,6 +63,13 @@ class FakeCharacterData:
         self.current_segment = segments[0]
         self._frames = dict(zip(segments, frames))
         self.switch_calls = []
+        self.orifra_base = "wy/orifra"
+        self.resolution = (2560, 1440)
+
+    def _build_file_list(self, seg_dir):
+        import os
+        return [os.path.join(seg_dir, f) for f in sorted(os.listdir(seg_dir))
+                if f.endswith(".jpg")]
 
     @property
     def total_frames(self):
@@ -194,7 +201,6 @@ class TestNaturalSort:
     def test_resolve_rejects_unknown(self):
         from realtime_serve.main import _resolve_segment_sequence
         pack = FakeCharacterData(["1", "55"], [10, 10])
-        pack.orifra_base = "unused"
         with pytest.raises(ValueError, match="指定的段不存在"):
             _resolve_segment_sequence(("list", ["1", "nope"]), pack)
 
@@ -203,8 +209,6 @@ class TestNaturalSort:
         # Uses real wy/orifra segments (the resolution check reads the first
         # frame of each scheduled segment).
         pack = FakeCharacterData(["11", "22", "1"], [10, 10, 10])
-        pack.orifra_base = "wy/orifra"
-        pack.resolution = (2560, 1440)
         seq, mode = _resolve_segment_sequence(("auto", None), pack)
         assert seq == ["1", "11", "22"]
         assert mode == "auto"
