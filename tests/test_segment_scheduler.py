@@ -163,6 +163,48 @@ class TestRenderLoopScheduling:
         loop._check_segment_schedule()
         assert pack.switch_calls == []
 
+    def test_set_sequence_aligns_first_segment(self):
+        """安装调度时对齐到 sequence[0]（角色默认段 '1' 不在调度首位）。
+
+        复现 --segments 22 55 启动仍播放 '1' 的缺陷：main.py 加载角色默认
+        段，调度器装上后必须立即切到调度首段，而不是等 '1' 播完一整轮。
+        """
+        loop = RenderLoop(target_fps=25)
+        pack = FakeCharacterData(["1", "55", "22"], [10, 10, 10])
+        loop.set_character_data(pack)
+        loop._clock = lambda: loop._fake_t
+        loop._fake_t = 1000.0
+        loop._video_start_time = loop._fake_t
+
+        loop.set_segment_sequence(["22", "55"])
+
+        # Startup alignment switched to the schedule head immediately.
+        assert pack.current_segment == "22"
+        assert pack.switch_calls == ["22"]
+        assert loop._scheduler.position == 0
+
+        # Playback continues the loop from the schedule: '22' ends → '55'.
+        # (0.5s = 12.5 frames @25fps, safely past the 10-frame boundary —
+        # exact-boundary arithmetic is float-fragile.)
+        loop._fake_t = loop._video_start_time + 0.5
+        loop._check_segment_schedule()
+        assert pack.current_segment == "55"
+        assert pack.switch_calls == ["22", "55"]
+
+    def test_set_sequence_already_aligned_no_switch(self):
+        """调度首段已是当前段（auto 模式常规路径）→ 不产生启动切换。"""
+        loop = RenderLoop(target_fps=25)
+        pack = FakeCharacterData(["1", "55"], [10, 10])
+        loop.set_character_data(pack)
+        loop._clock = lambda: loop._fake_t
+        loop._fake_t = 1000.0
+        loop._video_start_time = loop._fake_t
+
+        loop.set_segment_sequence(["1", "55"])
+
+        assert pack.current_segment == "1"
+        assert pack.switch_calls == []
+
     def test_frame_error_protection(self):
         """A raising _process_frame must not kill the producer loop."""
         loop, pack = self._make_loop(["1"])

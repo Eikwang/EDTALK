@@ -129,6 +129,10 @@ class RenderLoop:
         self.gaze_corrector = None
         self.gaze_mode: str = 'off'  # 'off' | 'on' | 'adaptive'
         self.audio_player = None
+        # Optional callback(width, height) fired after a successful segment
+        # switch: re-opens the virtual camera at the new segment's native
+        # resolution (wired by main.py to UnityCaptureSender.update_resolution).
+        self.resolution_change_cb = None
 
         # Video clock: wall-clock anchored position in the segment.
         # self._clock is injectable (single pacing clock principle — the
@@ -194,8 +198,9 @@ class RenderLoop:
         Args:
             segment: Target segment name.
             source: 'manual' (API/CLI) aligns the scheduler to the new
-                    segment; 'scheduler' (auto-advance) already moved the
-                    scheduler index — re-syncing would fight the advance.
+                    segment; 'scheduler' (auto-advance) and 'startup'
+                    (schedule installation) already point the scheduler at
+                    this segment — re-syncing would fight that.
         """
         with self._segment_lock:
             if self._character_data is None:
@@ -217,6 +222,15 @@ class RenderLoop:
                     self.output_streamer.reset_preroll()
                 if self.gaze_corrector is not None:
                     self.gaze_corrector.reset()
+                # Native-resolution passthrough: the preroll window above
+                # pauses the consumer, so the camera can be re-opened at the
+                # new segment's size without racing the send thread.
+                if self.resolution_change_cb is not None:
+                    try:
+                        h, w = self._character_data.resolution
+                        self.resolution_change_cb(w, h)
+                    except Exception as e:
+                        print(f"[Scheduler] 摄像头分辨率切换失败: {e}")
                 if self._scheduler is not None and source == 'manual':
                     self._scheduler.sync_to(segment)
                 print(f"[Scheduler] segment -> '{segment}' (source: {source})")
@@ -225,10 +239,17 @@ class RenderLoop:
     def set_segment_sequence(self, sequence: list, mode: str = 'list') -> None:
         """Install a segment playback schedule (list/auto mode).
 
-        Must be called BEFORE start(). The first sequence entry should be
-        the already-loaded first segment (no redundant switch at startup).
+        Must be called BEFORE start(). Playback is aligned to the schedule:
+        if the currently loaded segment is not sequence[0] (main.py loads the
+        character's default segment, which only matches for auto mode or
+        lists starting with it, e.g. --segments 22 55), it switches now so
+        the schedule's first entry is what actually plays.
         """
         self._scheduler = SegmentScheduler(sequence, mode=mode)
+        with self._segment_lock:
+            cd = self._character_data
+            if cd is not None and sequence[0] != cd.current_segment:
+                self.switch_segment(sequence[0], source='startup')
 
     def start(self):
         """Start the rendering loop in a separate thread."""

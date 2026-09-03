@@ -41,10 +41,20 @@ python -m realtime_serve.main --character-dir wy --segments auto
 ```
 
 - 每段播完一遍（total_frames/fps 秒）自动切下一段；切换时旧段尾帧全弃 + ~0.16s preroll 重启（轻微跳变属预期）。
+- **启动即从调度首段开播**：`--segments 22 55` 启动后直接播 '22'（不再先播角色默认段一整轮）；调度首段分辨率与默认段不同时，摄像头在启动阶段重建到新段分辨率。
 - 段名区分大小写，以 `orifra/` 下目录实际名称为准（可用 `/status` 的 `available_segments` 查看）。
 - 手动 `POST /segment/switch` 仍可用：切到序列内段 → 调度从该段继续循环；切到序列外段 → 调度挂起（`/status` `position: -1`），切回序列内段恢复。
-- 启动校验：段不存在、orifra 为空、分辨率与首段不一致 → fail-fast 并给出原因。
+- 启动校验：段不存在、orifra 目录为空、段首帧不可读 → fail-fast 并给出原因。
+- 混合分辨率（各段分辨率不同）→ 仅 `[INFO]` 提示，按各段**原生分辨率直出**，见下节。
 - "auto" 是保留字；真有名为 auto 的段时请重命名目录（或仅用 /segment/switch 手动切）。
+
+### 混合分辨率直出
+
+各段分辨率不同（如 1440x2560 与 1080x1080 混排）时不再缩放输出：
+
+- 段切换时 `UnityCaptureSender.update_resolution()` 关闭并按新段原生尺寸重建虚拟摄像头（pyvirtualcam 帧尺寸在创建时固定，重建是唯一途径）。
+- 已在传输的个别过渡帧/重建失败时按摄像头尺寸缩放兜底（限频 `[WARN]`，10s 一次）——若持续出现该告警说明重建失败，输出退化为缩放模式。
+- 消费端注意：Unity Capture 滤镜（DH-Live 定制版）在**连接时**协商分辨率；不重连时滤镜按等比缩放+黑边适配新段画面（DH-Live 版滤镜每帧读取实际尺寸、接受任意分辨率）。要让摄像头以实际分辨率输出，消费端重连一次（或重启拉流端）即可。
 | `--gaze-correction` | off | - | 视线纠正三态：裸 flag=on（向后兼容）、off/on/adaptive。开启后 **compositor mask 扩展双眼区域**——输出眼睛变为 Generator 渲染的纠正眼（off 时为原视频原生眼） |
 | `--gaze-convergence` | 0.05 | [-1,1] | 收敛角。素材人物坐姿/朝向不同时可调整；负值发散。运行时改需重启（阶段 1） |
 | `--gaze-ckpt` | weights/current_model.ckpt | 路径 | gaze 生成器权重 |

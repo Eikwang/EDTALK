@@ -487,8 +487,9 @@ class CharacterDataPack:
         BatchPreloader.BATCH_SIZE = batch_size
         self._preloader = BatchPreloader(self._segment_cache, device)
 
-        # Cached resolution (avoids reading a frame from disk on every call)
-        self._resolution: Optional[tuple] = None
+        # Per-segment resolution cache (avoids re-reading a frame from disk;
+        # keyed by segment because segments may differ in resolution)
+        self._resolution_cache: dict = {}
 
         # Load current segment (only metadata + facemark + file lists)
         self._load_segment(self.current_segment)
@@ -747,13 +748,19 @@ class CharacterDataPack:
 
     @property
     def resolution(self) -> tuple:
-        """Get resolution of current segment frames (cached after first read)."""
-        if self._resolution is None:
-            data = self._segment_cache[self.current_segment]
+        """Get resolution of current segment frames (per-segment cache)."""
+        return self.segment_resolution(self.current_segment)
+
+    def segment_resolution(self, segment: str) -> tuple:
+        """Get (H, W) of a segment's frames, cached after the first read."""
+        res = self._resolution_cache.get(segment)
+        if res is None:
+            data = self._segment_cache[segment]
             # Read one orifra frame to determine resolution
             first_frame = self._read_orifra_frame(data['orifra_files'][0])
-            self._resolution = first_frame.shape[:2]
-        return self._resolution
+            res = first_frame.shape[:2]
+            self._resolution_cache[segment] = res
+        return res
 
     @property
     def preload_stats(self) -> dict:
