@@ -58,7 +58,10 @@ PIPELINE_STEPS = [
     (8,  "唇部姿态特征提取",    "extract_lip_pose_features.py",       "lip_feature/, pose_feature/"),
     (9,  "特征转LMDB",          "prepare_feature_lmdb.py",            "lmdb_features/"),
     (10, "拆帧+面部裁剪",       "crop_head_video.py",                 "orifra/, count/, metadata/, facemark/"),
+    (11, "视线纠正数据",        "prepare_gaze_data.py",               "gaze_data/"),
 ]
+
+TOTAL_STEPS = len(PIPELINE_STEPS)
 
 
 def resolve_script(filename):
@@ -93,7 +96,7 @@ def run_step(step_idx, name, script_file, base_dir, step_specific_args, dry_run=
     cmd.extend(step_specific_args.get(step_idx, []))
 
     print("=" * 70, flush=True)
-    print(f"[Step {step_idx}/10] {name}", flush=True)
+    print(f"[Step {step_idx}/{TOTAL_STEPS}] {name}", flush=True)
     print(f"  脚本: {script_file}", flush=True)
     print(f"  命令: {' '.join(cmd)}", flush=True)
     print("=" * 70, flush=True)
@@ -251,6 +254,8 @@ def main():
             "--output_format", args.output_format,
             "--longest_edge", str(args.longest_edge),
         ],
+        # prepare_gaze_data.py: 从步骤 10 产出的 facemark/ 推导，无额外参数
+        11: [],
     }
     if args.no_landmark:
         step_args[10].append("--no-landmark")
@@ -331,6 +336,7 @@ def main():
         print("    count/             面部裁剪帧")
         print("    metadata/          裁切元数据")
         print("    facemark/          面部关键点")
+        print("    gaze_data/         视线纠正数据(眨眼标签/眼轨迹)")
 
     sys.exit(0 if all(v in ("ok", "skipped") for v in results.values()) else 1)
 

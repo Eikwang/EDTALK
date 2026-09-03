@@ -419,8 +419,10 @@ class RenderLoop:
             # and BEFORE the compositor (mask includes eye regions).
             if self.gaze_corrector is not None and self._gaze_allowed():
                 t_gaze_0 = time.perf_counter()
+                gaze_frame = character_data.get_gaze_frame(video_idx) \
+                    if hasattr(character_data, 'get_gaze_frame') else None
                 rendered_c = self.gaze_corrector.correct(
-                    rendered_c[0], facemark).unsqueeze(0)
+                    rendered_c[0], facemark, gaze_frame).unsqueeze(0)
                 timings['gaze'] = (time.perf_counter() - t_gaze_0) * 1000.0
 
             rendered_post = (rendered_c[0] * 127.5 + 127.5).to(torch.uint8)

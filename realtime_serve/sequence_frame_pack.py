@@ -522,6 +522,24 @@ class CharacterDataPack:
         compositor.set_eyes_enabled(enabled)
         self._preloader.recompute_current_masks()
 
+    def has_gaze_data(self) -> bool:
+        """Whether the current segment has precomputed gaze data (step 11)."""
+        data = self._segment_cache.get(self.current_segment)
+        return data is not None and data.get('gaze_data') is not None
+
+    def get_gaze_frame(self, idx: int) -> Optional[dict]:
+        """Per-frame precomputed gaze data (state/eye centers/eye_size).
+
+        Returns None when the segment has no gaze_data — the corrector then
+        falls back to per-frame realtime landmark math.
+        """
+        data = self._segment_cache[self.current_segment]
+        gd = data.get('gaze_data')
+        if gd is None:
+            return None
+        return {k: gd[k][idx % data['total_frames']]
+                for k in ('state', 'l_center', 'r_center', 'eye_size')}
+
     def _get_segment_paths(self, segment: str) -> dict:
         """Get paths for a specific segment."""
         return {
@@ -561,6 +579,21 @@ class CharacterDataPack:
         metadata = np.load(paths['metadata'])
         facemark = np.load(paths['facemark'])
 
+        # Optional precomputed gaze data (prepare_gaze_data.py step 11):
+        # per-frame blink labels + smoothed eye trajectories for the
+        # gaze corrector. Absent → corrector falls back to realtime
+        # per-frame landmark math (noisy; preprocessing recommended).
+        gaze_data = None
+        gaze_path = os.path.join(
+            os.path.dirname(paths['facemark']), '..', 'gaze_data',
+            f"{segment}.npy")
+        gaze_path = os.path.normpath(gaze_path)
+        if os.path.exists(gaze_path):
+            gaze_data = np.load(gaze_path, allow_pickle=True).item()
+            if gaze_data['state'].shape[0] != facemark.shape[0]:
+                print(f"  [WARN] segment '{segment}': gaze_data length mismatch, ignoring")
+                gaze_data = None
+
         # Build sorted file lists (just paths, no image data)
         orifra_files = self._build_file_list(paths['orifra'])
         crop_files = self._build_file_list(paths['count'])
@@ -583,6 +616,7 @@ class CharacterDataPack:
             'crop_files': crop_files,       # list of file paths (lazy)
             'metadata': metadata,           # numpy array (loaded)
             'facemark': facemark,           # numpy array (loaded)
+            'gaze_data': gaze_data,         # dict of arrays or None
             'total_frames': num_orifra,
         }
 

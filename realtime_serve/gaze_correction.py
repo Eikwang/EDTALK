@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from typing import Optional
 
 from pytorch_gaze_redirection.src.archs import Generator
 
@@ -117,39 +118,67 @@ class GazeCorrector:
         self.error_skips = 0
 
     @torch.inference_mode()
-    def correct(self, rendered: torch.Tensor,
-                facemark_256: np.ndarray) -> torch.Tensor:
+    def correct(self, rendered: torch.Tensor, facemark_256: np.ndarray,
+                gaze_frame: Optional[dict] = None) -> torch.Tensor:
         """Correct both eyes of a rendered 256 crop.
 
         Args:
             rendered: (3,256,256) RGB float [-1,1] on GPU — the Generator output.
             facemark_256: (68,2) 256-space landmarks for this frame (numpy),
                           possibly containing NaN for detection-failure frames.
+                          Only used when gaze_frame is None (legacy realtime path).
+            gaze_frame: optional per-frame dict from precomputed gaze_data
+                        (prepare_gaze_data.py step 11) with keys
+                        state/l_center/r_center/eye_size. When provided the
+                        blink decision and eye trajectory come from the
+                        offline time-series (far more stable than per-frame
+                        realtime landmarks) — the recommended path.
 
         Returns:
             New (3,256,256) tensor. Same device/domain. Never mutates the input.
         """
         try:
-            if facemark_256 is None or np.any(np.isnan(facemark_256)):
-                self.nan_skips += 1
-                return rendered
+            if gaze_frame is not None:
+                state = int(gaze_frame['state'])
+                if state == 1:
+                    self.blink_skips += 1
+                    return rendered
+                if state == 2:
+                    self.nan_skips += 1
+                    return rendered
+                eye_size = int(gaze_frame['eye_size'])
+                lx, ly = gaze_frame['l_center']
+                rx, ry = gaze_frame['r_center']
+                boxes = [(float(lx), float(ly), eye_size),
+                         (float(rx), float(ry), eye_size)]
+            else:
+                if facemark_256 is None or np.any(np.isnan(facemark_256)):
+                    self.nan_skips += 1
+                    return rendered
 
-            l_info, r_info = self._eye_state(facemark_256)
-            if l_info is None:
-                # Blink in progress: bypass entirely.
-                self.blink_skips += 1
-                return rendered
+                l_info, r_info = self._eye_state(facemark_256)
+                if l_info is None:
+                    # Blink in progress: bypass entirely.
+                    self.blink_skips += 1
+                    return rendered
 
-            boxes = []
-            for (cx, cy), eye_size in ((l_info, self._fixed_eye_size),
-                                       (r_info, self._fixed_eye_size)):
-                boxes.append((cx, cy, eye_size))
+                boxes = []
+                for (cx, cy), eye_size in ((l_info, self._fixed_eye_size),
+                                           (r_info, self._fixed_eye_size)):
+                    boxes.append((cx, cy, eye_size))
 
             out = self._correct_eyes(rendered, boxes)
             self.corrected_frames += 1
             return out
-        except Exception:
+        except Exception as e:
             self.error_skips += 1
+            # Rate-limited: a silent bypass loop would hide programming
+            # errors (measured to have happened during development).
+            if self.error_skips == 1:
+                import traceback
+                print(f"[GazeCorrector] correction failed ({e}); "
+                      f"bypassing. Traceback (once):")
+                traceback.print_exc()
             return rendered
 
     # ------------------------------------------------------------------
