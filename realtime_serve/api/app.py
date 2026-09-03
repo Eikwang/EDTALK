@@ -223,6 +223,10 @@ def create_app() -> FastAPI:
             status["current_segment"] = character_data.current_segment
             status["resolution"] = list(character_data.resolution)
             status["available_segments"] = character_data.segments
+            # Seamless-switch prefetch state (M15); guarded for test doubles
+            # that don't carry the prefetcher.
+            if hasattr(character_data, "prefetch_status"):
+                status["prefetch"] = character_data.prefetch_status
 
         if audio_buffer is not None:
             status["buffer_ms"] = round(audio_buffer.buffer_duration_ms(), 1)

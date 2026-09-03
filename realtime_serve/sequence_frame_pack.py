@@ -29,12 +29,23 @@ Directory structure:
 """
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, List, Optional
 
 import numpy as np
 import cv2
 import torch
+
+
+def _transfer_crops_to_device(crop_tensor: torch.Tensor, device: str,
+                              chunk_size: int) -> torch.Tensor:
+    """Move crops to the device in bounded chunks (~8MB each) so one large
+    transfer cannot monopolize the CUDA context and stall render kernels."""
+    chunks = []
+    for i in range(0, crop_tensor.shape[0], chunk_size):
+        chunks.append(crop_tensor[i:i + chunk_size].to(device))
+    return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
 
 class BatchPreloader:
@@ -399,10 +410,8 @@ class BatchPreloader:
         crop_np = np.stack(crop_np_list, axis=0)  # [B, 3, 256, 256]
         crop_tensor = torch.from_numpy(crop_np)
         del crop_np_list, decoded
-        chunks = []
-        for i in range(0, crop_tensor.shape[0], self._TRANSFER_CHUNK):
-            chunks.append(crop_tensor[i:i + self._TRANSFER_CHUNK].to(self._device))
-        crop_batch = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+        crop_batch = _transfer_crops_to_device(
+            crop_tensor, self._device, self._TRANSFER_CHUNK)
 
         if gen != self._gen:
             return  # reset happened while loading — discard
@@ -424,6 +433,193 @@ class BatchPreloader:
     def _is_preloading(self) -> bool:
         """Whether a preload is in flight. Caller holds _state_lock."""
         return self._preload_thread is not None and self._preload_thread.is_alive()
+
+    def publish_prefetch(self, segment: str, orifra_list: List[np.ndarray],
+                         crop_batch: torch.Tensor,
+                         facemark_list: List[Optional[np.ndarray]]) -> bool:
+        """Install a prefetched batch-0 into slot 0 (M15 seamless switching).
+
+        MUST be called right after reset(segment) and before ensure_loaded(0):
+        the caller then proceeds with the normal fast path, which kicks off
+        the batch-1 background preload — the cold-start disk-fallback window
+        disappears entirely.
+
+        Masks are NOT carried by the prefetch (the compositor's landmark EMA
+        is order-sensitive and must not interleave two segments — H2): they
+        are generated here in frame order, only when no preload worker is
+        alive; otherwise slot 0 keeps mask=None and the render loop's
+        per-frame fallback covers the window (~1ms/frame, self-healing).
+
+        Returns False when the preloader has moved to a different segment
+        (stale publish — caller falls back to the normal cold path).
+        """
+        with self._preload_lock:
+            if self._segment != segment:
+                return False
+            n = len(orifra_list)
+            self._orifra_bufs[0] = orifra_list
+            self._crop_bufs[0] = crop_batch
+            self._facemark_bufs[0] = facemark_list
+            self._mask_bufs[0] = [None] * n
+            self._batch_starts[0] = 0
+
+        # Lock-free mask generation in frame order (EMA is order-dependent).
+        # Skipped when a preload worker is alive: its Phase-2 mask generation
+        # would interleave with ours on the shared compositor EMA state.
+        if (self._compositor is not None and not self._is_preloading()):
+            masks = [self._compositor.generate_mask(fm) if fm is not None
+                     else None for fm in facemark_list]
+            with self._preload_lock:
+                if (self._segment == segment and self._batch_starts[0] == 0
+                        and self._mask_bufs[0] is not None
+                        and len(self._mask_bufs[0]) == n
+                        and all(m is None for m in self._mask_bufs[0])):
+                    self._mask_bufs[0] = masks
+        return True
+
+
+class _PrefetchData:
+    """A completed prefetch: raw materials of one segment's batch 0.
+
+    Carries NO masks (H2): the compositor's landmark EMA is order-sensitive
+    and must not see two segments interleaved — masks are generated after
+    publish, in frame order, by BatchPreloader.publish_prefetch.
+    """
+
+    def __init__(self, segment: str, orifra_list: List[np.ndarray],
+                 crop_batch: torch.Tensor, facemark_list: List[Optional[np.ndarray]]):
+        self.segment = segment
+        self.orifra_list = orifra_list
+        self.crop_batch = crop_batch
+        self.facemark_list = facemark_list
+
+
+class PrefetchLoader:
+    """Independent single-flight prefetcher for seamless segment switching (M15).
+
+    Deliberately NOT part of BatchPreloader: the two-slot sliding window is a
+    hard invariant (other = 1 - cur, single _preload_thread, single
+    _preload_done) that a concurrent third buffer would break. This loader
+    holds raw materials only (orifra/crop/facemark — no masks) in its own
+    buffer; CharacterDataPack.switch_segment publishes them into slot 0 via
+    BatchPreloader.publish_prefetch.
+
+    Cancellation: a monotonic token per request; only the newest request's
+    results are kept. Any newer start()/cancel() releases the previous
+    result's references immediately (the ~1.1GB CPU / 79MB GPU transient is
+    bounded and never dangles). Decode yields in chunks of BATCH_SIZE//4
+    frames so the current segment's sliding-window preload keeps priority on
+    the shared decode pool (E5: prefetch must not starve the window loader
+    and re-create batch-boundary stalls elsewhere).
+    """
+
+    _YIELD_S = 0.002
+
+    def __init__(self, character_data: 'CharacterDataPack',
+                 preloader: BatchPreloader, device: str):
+        self._pack = character_data
+        self._preloader = preloader
+        self._device = device
+        self._lock = threading.Lock()
+        self._token = 0
+        self._state = 'idle'      # idle | loading | ready | discarded
+        self._segment: Optional[str] = None
+        self._result: Optional[_PrefetchData] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self, segment: str) -> None:
+        """Start (or supersede) a prefetch for segment. Never blocks long."""
+        with self._lock:
+            if self._state == 'loading' and self._segment == segment:
+                return  # already in flight for this segment
+            self._token += 1
+            token = self._token
+            self._state = 'loading'
+            self._segment = segment
+            self._result = None  # release previous result references now
+            self._thread = threading.Thread(
+                target=self._worker, args=(segment, token), daemon=True)
+            self._thread.start()
+
+    def cancel(self) -> None:
+        """Invalidate any in-flight/completed prefetch and free references."""
+        with self._lock:
+            self._token += 1
+            self._result = None
+            self._state = 'idle'
+            self._segment = None
+
+    def pop(self, segment: str) -> Optional[_PrefetchData]:
+        """Consume the prefetch result for segment if it is ready and current."""
+        with self._lock:
+            if (self._state == 'ready' and self._result is not None
+                    and self._result.segment == segment):
+                data = self._result
+                self._result = None
+                self._state = 'idle'
+                self._segment = None
+                return data
+        return None
+
+    @property
+    def status(self) -> dict:
+        """Snapshot for /status: {'state': ..., 'segment': ...}."""
+        with self._lock:
+            return {'state': self._state, 'segment': self._segment}
+
+    def _stale(self, token: int) -> bool:
+        with self._lock:
+            return token != self._token
+
+    def _worker(self, segment: str, token: int) -> None:
+        try:
+            # Metadata/file lists are cached and idempotent; may raise if the
+            # segment's data is broken — surfaced as a discarded prefetch.
+            self._pack._load_segment(segment)
+            data = self._pack._segment_cache[segment]
+            total = data['total_frames']
+            count = min(self._preloader.BATCH_SIZE, total)
+            if count <= 0:
+                raise ValueError(f"segment '{segment}' has no frames")
+
+            pool = self._preloader._get_decode_pool()
+            files = [(data['orifra_files'][i], data['crop_files'][i])
+                     for i in range(count)]
+            cap = max(1, self._preloader.BATCH_SIZE // 4)
+            decoded = []
+            for s in range(0, count, cap):
+                if self._stale(token):
+                    return
+                decoded.extend(pool.map(BatchPreloader._decode_frame,
+                                        files[s:s + cap]))
+                time.sleep(self._YIELD_S)  # yield pool to the window loader
+            if self._stale(token):
+                return
+
+            crop_np = np.stack([d[1] for d in decoded], axis=0)
+            crop_batch = _transfer_crops_to_device(
+                torch.from_numpy(crop_np), self._device,
+                self._preloader._TRANSFER_CHUNK)
+            facemark = data.get('facemark')
+            facemark_list = [facemark[i] if facemark is not None else None
+                             for i in range(count)]
+            if self._stale(token):
+                return
+
+            with self._lock:
+                if token == self._token:
+                    self._result = _PrefetchData(
+                        segment, [d[0] for d in decoded], crop_batch,
+                        facemark_list)
+                    self._state = 'ready'
+        except Exception as e:
+            # Prefetch is best-effort: a failure degrades the upcoming switch
+            # to the normal cold path — never blocks, never kills anything.
+            print(f"[PrefetchLoader] prefetch '{segment}' failed: {e}")
+            with self._lock:
+                if token == self._token:
+                    self._result = None
+                    self._state = 'discarded'
 
 
 class CharacterDataPack:
@@ -486,6 +682,10 @@ class CharacterDataPack:
         # Batch preloader (replaces LRU cache)
         BatchPreloader.BATCH_SIZE = batch_size
         self._preloader = BatchPreloader(self._segment_cache, device)
+
+        # Seamless-switch prefetcher (M15): independent single-flight loader
+        # whose results are published into the preloader's slot 0 on switch.
+        self._prefetch = PrefetchLoader(self, self._preloader, device)
 
         # Per-segment resolution cache (avoids re-reading a frame from disk;
         # keyed by segment because segments may differ in resolution)
@@ -665,7 +865,8 @@ class CharacterDataPack:
         actual = idx % self._segment_cache[self.current_segment]['total_frames']
         self._preloader.ensure_loaded(actual, self.current_segment)
 
-    def switch_segment(self, segment: str) -> bool:
+    def switch_segment(self, segment: str,
+                       prefetched: Optional[_PrefetchData] = None) -> bool:
         """Switch to a different segment.
 
         Atomic order (autoplan ENG E1): load fully, prepare the preloader,
@@ -674,8 +875,19 @@ class CharacterDataPack:
         a half-loaded one (a KeyError here used to silently kill the render
         thread when a switch landed inside the load window).
 
+        Seamless path (M15): when `prefetched` carries this segment's batch 0
+        (from PrefetchLoader.pop), it is published into slot 0 right after
+        reset — the new segment serves frames from cache immediately and the
+        cold-start disk-fallback window disappears. Without it (no prefetch /
+        discarded / stale) the switch degrades to the normal cold path and
+        still succeeds.
+
+        Any in-flight prefetch is cancelled at entry and its references
+        released (a switch supersedes it by definition).
+
         Args:
             segment: Segment name to switch to
+            prefetched: Optional ready prefetch result for this segment
 
         Returns:
             True if switch was successful
@@ -684,12 +896,41 @@ class CharacterDataPack:
             raise ValueError(f"Segment '{segment}' not found. Available: {self.segments}")
 
         with self._switch_lock:  # concurrent /segment/switch double-load guard
+            self._prefetch.cancel()                   # in-flight prefetch is moot now
             self._load_segment(segment)               # may raise → old segment stays
             self._preloader.reset(segment)
+            if prefetched is not None and prefetched.segment == segment:
+                self._preloader.publish_prefetch(
+                    segment, prefetched.orifra_list, prefetched.crop_batch,
+                    prefetched.facemark_list)
             self._preloader.ensure_loaded(0, segment)
             self.current_segment = segment            # publish LAST
 
         return True
+
+    # ------------------------------------------------------------------
+    # Seamless-switch prefetch (M15) — orchestrated by the control plane
+    # ------------------------------------------------------------------
+
+    def prefetch_segment(self, segment: str) -> None:
+        """Start prefetching a segment's batch 0 (single-flight, token-based).
+
+        Raises ValueError for unknown segments so callers get fail-fast
+        validation at REQUEST time, not at switch time (M16).
+        """
+        if segment not in self.segments:
+            raise ValueError(f"Segment '{segment}' not found. Available: {self.segments}")
+        self._prefetch.start(segment)
+
+    def pop_prefetch(self, segment: str) -> Optional[_PrefetchData]:
+        """Consume a ready prefetch for segment (None if not ready — the
+        caller then switches via the normal cold path)."""
+        return self._prefetch.pop(segment)
+
+    @property
+    def prefetch_status(self) -> dict:
+        """Snapshot for /status: {'state': idle|loading|ready|discarded, 'segment': ...}."""
+        return self._prefetch.status
 
     def get_frame(self, idx: int) -> Tuple:
         """Get frame at index from current segment (batch-preloaded).
@@ -787,6 +1028,7 @@ class CharacterDataPack:
 
     def close(self):
         """Release GPU memory."""
+        self._prefetch.cancel()
         self._preloader.close()
         self._preloader.reset('')
         for segment_data in self._segment_cache.values():
