@@ -200,12 +200,14 @@ def _resolve_segment_sequence(spec, character_data):
 
     Must run AFTER CharacterDataPack construction (segment whitelist exists
     only then) and BEFORE model loading (fail-fast stays fail-fast).
+
+    Returns (sequence_or_None, mode_str).
     """
     if not spec:
-        return None
+        return None, 'off'
     mode, items = spec
     if mode == 'auto':
-        return _natural_sorted(character_data.segments), 'auto'
+        sequence = _natural_sorted(character_data.segments)
     else:
         bad = [s for s in items if s not in character_data.segments]
         if bad:
@@ -215,25 +217,25 @@ def _resolve_segment_sequence(spec, character_data):
                 f"可用 /status available_segments 查看）")
         sequence = list(items)
 
-    # Resolution consistency: UnityCaptureSender is built once from the
-    # first segment — a mismatched segment would freeze the output with
-    # per-frame swallowed sender exceptions.
+    # Empty/unreadable segments are fatal. Resolution mismatch is a WARN +
+    # continue: UnityCaptureSender.resize() adapts the frame, but mismatched
+    # aspect ratios will visibly stretch — the operator judges by eye.
     import cv2
     base_res = tuple(character_data.resolution)
     for seg in sequence:
         seg_dir = os.path.join(character_data.orifra_base, seg)
         files = character_data._build_file_list(seg_dir)
         if not files:
-            raise ValueError(f"段 '{seg}' 的 orifra 目录为空: {seg_dir}")
+            raise ValueError(f"段 '{seg}' 的 orifra 目录为空: {seg_dir}——"
+                             f"请重新预处理该段或从序列中移除")
         img = cv2.imread(files[0])
         if img is None:
             raise ValueError(f"段 '{seg}' 首帧无法读取: {files[0]}")
         if img.shape[:2] != base_res:
-            raise ValueError(
-                f"段 '{seg}' 分辨率 {img.shape[1]}x{img.shape[0]} 与首段 "
-                f"{base_res[1]}x{base_res[0]} 不一致——异分辨率段会导致"
-                f"虚拟摄像头输出冻结，请重新预处理该段")
-    return sequence, 'list'
+            print(f"[WARN] 段 '{seg}' 分辨率 {img.shape[1]}x{img.shape[0]} "
+                  f"与首段 {base_res[1]}x{base_res[0]} 不同——播放时将自动"
+                  f"缩放到相机格式（纵横比不同会拉伸变形）")
+    return sequence, mode
 
 
 def setup_service(config: Config, no_unitycapture: bool = False,
@@ -259,8 +261,9 @@ def setup_service(config: Config, no_unitycapture: bool = False,
     )
 
     # 1b. Segment schedule validation (fail-fast BEFORE the slow model load)
-    scheduler_sequence, scheduler_mode = _resolve_segment_sequence(
-        segment_sequence_spec, character_data)
+    resolved = _resolve_segment_sequence(segment_sequence_spec,
+                                         character_data)
+    scheduler_sequence, scheduler_mode = (resolved if resolved else (None, 'off'))
     if scheduler_sequence:
         print(f"  -> Segment schedule ({scheduler_mode}): {scheduler_sequence}")
 
