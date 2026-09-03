@@ -200,9 +200,13 @@ class TestNaturalSort:
 
     def test_resolve_auto_natural(self):
         from realtime_serve.main import _resolve_segment_sequence
-        pack = FakeCharacterData(["11", "6", "1"], [10, 10, 10])
+        # Uses real wy/orifra segments (the resolution check reads the first
+        # frame of each scheduled segment).
+        pack = FakeCharacterData(["11", "22", "1"], [10, 10, 10])
+        pack.orifra_base = "wy/orifra"
+        pack.resolution = (2560, 1440)
         seq, mode = _resolve_segment_sequence(("auto", None), pack)
-        assert seq == ["1", "6", "11"]
+        assert seq == ["1", "11", "22"]
         assert mode == "auto"
 
 
