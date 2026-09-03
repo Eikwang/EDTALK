@@ -218,6 +218,10 @@ class RenderLoop:
             prefetched: Optional ready PrefetchLoader result — published into
                     the preloader's slot 0 so the new segment serves frames
                     from cache with no cold-start disk-fallback window (M15).
+
+        Returns:
+            Snapshot dict {'segment', 'frame_count', 'resolution'} built
+            inside the switch transaction (E3), or None if the pack refused.
         """
         with self._segment_lock:
             if self._character_data is None:
@@ -233,6 +237,14 @@ class RenderLoop:
             else:
                 ok = self._character_data.switch_segment(segment)
             if ok:
+                # E3/E4: response snapshot built INSIDE the switch transaction
+                # (_segment_lock) — concurrent switches cannot cross-wire
+                # another caller's response.
+                snapshot = {
+                    'segment': segment,
+                    'frame_count': self._character_data.total_frames,
+                    'resolution': list(self._character_data.resolution),
+                }
                 self._video_start_time = self._clock()
                 # S7: if a pushed audio's start-marker frame is about to be
                 # dropped by the flush, re-mark so playback still starts
@@ -266,7 +278,8 @@ class RenderLoop:
                 if self._scheduler is not None and source in ('manual', 'pending'):
                     self._scheduler.sync_to(segment)
                 print(f"[Scheduler] segment -> '{segment}' (source: {source})")
-            return ok
+                return snapshot
+            return None
 
     def set_segment_sequence(self, sequence: list, mode: str = 'list',
                              align: bool = True) -> None:

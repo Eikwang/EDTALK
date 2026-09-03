@@ -175,14 +175,24 @@ def parse_args():
     parser.add_argument(
         "--host",
         type=str,
-        default="0.0.0.0",
-        help="API server host address (default: 0.0.0.0)"
+        default="127.0.0.1",
+        help="API server bind address (default: 127.0.0.1 loopback — "
+             "exposing the unauthenticated-style control plane to the LAN "
+             "is discouraged; pass 0.0.0.0 explicitly AND set --api-token)"
     )
     parser.add_argument(
         "--port",
         type=int,
         default=8000,
         help="API server port (default: 8000)"
+    )
+    parser.add_argument(
+        "--api-token",
+        type=str,
+        default=None,
+        help="Require 'Authorization: Bearer <token>' on every HTTP route "
+             "(recommended when binding beyond loopback). In-process "
+             "facade callers need no token."
     )
     return parser.parse_args()
 
@@ -441,7 +451,8 @@ def main():
         buffer_frames=args.buffer_frames,
         preroll_frames=args.preroll_frames,
         gen_fp16=args.gen_fp16,
-        unitycapture_enabled=(not args.no_unitycapture)
+        unitycapture_enabled=(not args.no_unitycapture),
+        api_token=args.api_token
     )
 
     # Set Windows timer resolution early.
@@ -469,16 +480,8 @@ def main():
         _set_timer_resolution(False)
         sys.exit(1)
 
-    # Create API app with shared state (E5 will switch to create_app(service))
-    api_app = create_api_app()
-
-    # Inject global state into API module
-    import realtime_serve.api.app as api_module
-    api_module.audio_buffer = service.audio_buffer
-    api_module.render_loop = service.render_loop
-    api_module.output_streamer = service.output_streamer
-    api_module.frame_buffer = service.frame_buffer
-    api_module.character_data = service.character_data
+    # Create API app around the facade (constructor injection, E5)
+    api_app = create_api_app(service, api_token=config.api_token)
 
     # Facade start: output streamer first (pacing clock), then render loop.
     service.start()
@@ -493,11 +496,16 @@ def main():
 
     # Start API server (blocks until interrupted)
     print(f"\nAPI server running at http://{args.host}:{args.port}")
+    if args.api_token:
+        print("Auth: Bearer token required (--api-token)")
     print("Endpoints:")
-    print(f"  POST /audio/push      - Push audio chunk (streaming TTS)")
-    print(f"  POST /audio/push_full - Push full audio segment (file-based)")
-    print(f"  POST /segment/switch  - Switch segment")
-    print(f"  GET  /status          - Get service status")
+    print(f"  POST /audio/push        - Push audio chunk (streaming TTS)")
+    print(f"  POST /audio/push_full   - Push full audio segment (file-based)")
+    print(f"  POST /segment/switch    - Switch segment (at=immediate|segment_end)")
+    print(f"  POST /segment/schedule  - Replace playback schedule (align=false default)")
+    print(f"  POST /gaze/params       - Hot-update gaze convergence/mode/smooth_alpha")
+    print(f"  POST /repair/params     - Hot-switch face repair mode")
+    print(f"  GET  /status            - Get service status")
     print("\nPress Ctrl+C to stop.\n")
 
     try:

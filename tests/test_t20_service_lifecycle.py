@@ -133,6 +133,9 @@ class TestSwitchSegment:
     def test_immediate_delegates_to_render_loop(self):
         svc = _service()
         svc.start()
+        # 切换事务快照由 render_loop 在锁内构建（E3）——mock 返回之
+        svc.render_loop.switch_segment.return_value = {
+            "segment": "happy", "frame_count": 5, "resolution": [1920, 1080]}
         resp = svc.switch_segment("happy")
         kwargs = svc.render_loop.switch_segment.call_args.kwargs
         assert kwargs["source"] == "manual"

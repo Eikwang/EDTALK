@@ -38,6 +38,24 @@ _COMPONENT_KEYS = ('model_manager', 'render_loop', 'output_streamer',
                    'audio_player', 'character_data', 'gaze_corrector')
 
 
+class ControlPlaneError(Exception):
+    """Base for control-plane errors — the HTTP layer maps subclasses to
+    status codes (404/400/409/503)."""
+
+
+class NotFoundError(ControlPlaneError, ValueError):
+    """Unknown segment/requested object — HTTP 404."""
+
+
+class ValidationError(ControlPlaneError, ValueError):
+    """Semantically invalid request — HTTP 400 (schema violations are 422
+    at the pydantic layer)."""
+
+
+class NotEnabledError(ControlPlaneError, RuntimeError):
+    """Feature not constructed at startup (gaze/repair off) — HTTP 409."""
+
+
 class RealtimeService:
     """Single control-plane object for the realtime inference service.
 
@@ -71,7 +89,7 @@ class RealtimeService:
         else:
             missing = [k for k in _COMPONENT_KEYS
                        if k in ('render_loop', 'output_streamer', 'frame_buffer',
-                                'audio_buffer', 'character_data')
+                                'audio_buffer')
                        and (components or {}).get(k) is None]
             if missing:
                 raise ValueError(f"components 缺少必需键: {missing}")
@@ -134,11 +152,11 @@ class RealtimeService:
         flush) and may be superseded by a later switch (last-write-wins).
         """
         if at not in ('immediate', 'segment_end'):
-            raise ValueError(
+            raise ValidationError(
                 f"at 必须为 'immediate' 或 'segment_end'，got '{at}'")
         cd = self._require_character_data()
         if segment not in cd.segments:
-            raise ValueError(
+            raise NotFoundError(
                 f"Segment '{segment}' not found. Available: {cd.segments}")
 
         if at == 'segment_end':
@@ -149,12 +167,13 @@ class RealtimeService:
                     'current_segment': cd.current_segment}
 
         prefetched = cd.pop_prefetch(segment)  # 就绪则零冷启动；永不等待（M15）
-        self.render_loop.switch_segment(segment, source='manual',
-                                        seamless=False, prefetched=prefetched)
-        return {'ok': True, 'segment': cd.current_segment,
-                'frame_count': cd.total_frames,
-                'resolution': list(cd.resolution),
-                'queued': False}
+        # E3/E4: 响应快照来自切换事务内部（render_loop 在 _segment_lock 内
+        # 构建），并发切换不会串台。
+        snapshot = self.render_loop.switch_segment(
+            segment, source='manual', seamless=False, prefetched=prefetched)
+        if snapshot is None:
+            raise RuntimeError(f"切换 '{segment}' 失败（详见服务日志）")
+        return {'ok': True, 'queued': False, **snapshot}
 
     def set_schedule(self, sequence, align: bool = False) -> dict:
         """Replace the playback schedule at runtime (M10).
@@ -167,13 +186,13 @@ class RealtimeService:
         """
         cd = self._require_character_data()
         if not isinstance(sequence, (list, tuple)) or not sequence:
-            raise ValueError("sequence 必须为非空段名列表")
+            raise ValidationError("sequence 必须为非空段名列表")
         if len(sequence) > _MAX_SCHEDULE_LEN:
-            raise ValueError(f"sequence 长度上限 {_MAX_SCHEDULE_LEN}")
+            raise ValidationError(f"sequence 长度上限 {_MAX_SCHEDULE_LEN}")
         sequence = list(sequence)
         bad = [s for s in sequence if s not in cd.segments]
         if bad:
-            raise ValueError(
+            raise ValidationError(
                 f"指定的段不存在: {bad}；可用段: {cd.segments}"
                 f"（段名区分大小写，以 orifra/ 下目录实际名称为准）")
 
@@ -200,25 +219,25 @@ class RealtimeService:
         (HTTP 409); lazy off→on init is a registered TODO.
         """
         if convergence is None and mode is None and smooth_alpha is None:
-            raise ValueError("至少提供 convergence / mode / smooth_alpha 之一")
+            raise ValidationError("至少提供 convergence / mode / smooth_alpha 之一")
         if self.gaze_corrector is None:
-            raise RuntimeError(
+            raise NotEnabledError(
                 "gaze 校正未构造——需以 --gaze-correction on|adaptive 启动"
                 "（gaze_capable=false；懒初始化见 TODOS）")
         if convergence is not None:
             v = float(convergence)
             if not math.isfinite(v) or not (-1.0 <= v <= 1.0):
-                raise ValueError(
+                raise ValidationError(
                     f"convergence 必须为 [-1, 1] 内的有限数值，got {convergence}"
                     f"（当前值 {self.gaze_corrector.convergence_h}）")
         if smooth_alpha is not None:
             a = float(smooth_alpha)
             if not math.isfinite(a) or not (0.0 <= a < 1.0):
-                raise ValueError(
+                raise ValidationError(
                     f"smooth_alpha 必须为 [0, 1) 内的有限数值，got {smooth_alpha}"
                     f"（当前值 {self.gaze_corrector.smooth_alpha}）")
         if mode is not None and mode not in _VALID_GAZE_MODES:
-            raise ValueError(
+            raise ValidationError(
                 f"mode 必须为 {_VALID_GAZE_MODES} 之一，got '{mode}'"
                 f"（当前值 {self.render_loop.gaze_mode}）")
         self.render_loop.queue_gaze_params(convergence=convergence,
@@ -230,11 +249,11 @@ class RealtimeService:
         """Hot-switch face repair mode (M23). Pure per-frame gate — no GPU
         state, direct effect on the next frame."""
         if mode not in _VALID_REPAIR_MODES:
-            raise ValueError(
+            raise ValidationError(
                 f"mode 必须为 {_VALID_REPAIR_MODES} 之一，got '{mode}'"
                 f"（当前值 {self.render_loop.face_repair_mode}）")
         if mode != 'off' and self.face_repair is None:
-            raise RuntimeError(
+            raise NotEnabledError(
                 "面部修复未构造——需以 --face-repair on|adaptive 启动"
                 "（repair_capable=false；懒初始化见 TODOS）")
         self.render_loop.face_repair_mode = mode
@@ -347,7 +366,9 @@ class RealtimeService:
             status['current_segment'] = cd.current_segment
             status['resolution'] = list(cd.resolution)
             status['available_segments'] = cd.segments
-            if hasattr(cd, 'prefetch_status'):
+            # dict-guard: test doubles expose the attr as a MagicMock
+            if hasattr(cd, 'prefetch_status') and \
+                    isinstance(cd.prefetch_status, dict):
                 status['prefetch'] = cd.prefetch_status
 
         ab = self.audio_buffer
@@ -370,14 +391,9 @@ class RealtimeService:
         the CLI path in main.py manages its own server)."""
         import uvicorn
         from realtime_serve.api.app import create_app
-        import realtime_serve.api.app as api_module
-        # E5 将改为 create_app(service=self) 构造注入；此为过渡等价注入。
-        api_module.audio_buffer = self.audio_buffer
-        api_module.render_loop = self.render_loop
-        api_module.output_streamer = self.output_streamer
-        api_module.frame_buffer = self.frame_buffer
-        api_module.character_data = self.character_data
-        uvicorn.run(create_app(), host=host or '127.0.0.1', port=port or 8000)
+        token = getattr(self.config, 'api_token', None) if self.config else None
+        uvicorn.run(create_app(self, api_token=token),
+                    host=host or '127.0.0.1', port=port or 8000)
 
     # ------------------------------------------------------------------
     # Internals

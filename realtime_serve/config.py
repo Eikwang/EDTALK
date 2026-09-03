@@ -1,5 +1,6 @@
 """Configuration management for realtime streaming inference service."""
 from dataclasses import dataclass
+from typing import Optional
 import warnings
 from pathlib import Path
 
@@ -23,6 +24,7 @@ class Config:
     gaze_ckpt: str = 'realtime_serve/weights/current_model.ckpt'  # gaze model weights
     unitycapture_enabled: bool = True  # False = 无摄像头运行（原 --no-unitycapture）
     face_repair_weights: str = 'realtime_serve/weights/facefix256.onnx'
+    api_token: Optional[str] = None  # 非空时 HTTP 面要求 Authorization: Bearer <token>
     buffer_frames: int = 16  # output frame buffer capacity (frames, ~11MB each)
     preroll_frames: int = 8  # frames required before output starts
     # Generator fp16 autocast: DISABLED by default. Measured negative on
