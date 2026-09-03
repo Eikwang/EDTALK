@@ -23,6 +23,28 @@
 | `--no-face-repair` | 默认 | - | 关闭面部修复（推荐，输出最流畅） |
 | `--face-repair on` | - | - | 每帧修复。已改为 **GPU 内联（IOBinding 零拷贝）**，消除了每帧两次 GPU↔CPU 往返；但 GPU 推理本身 ~6-7ms 仍在，产能紧张时仍建议关闭 |
 | `--face-repair adaptive` | - | - | 自适应：仅当输出缓冲深度 ≥6 帧（产能有余量）时修复，紧张时自动跳过。GPU 内联模式下推荐此项 |
+| `--segments` | 不传 | 段名列表 | **段播放调度**（见下方调度章节） |
+
+## 段播放调度（--segments）
+
+三种模式：
+
+```bash
+# 默认（不传）：第一个段无限循环（与历史行为一致）
+python -m realtime_serve.main --character-dir wy
+
+# 指定列表：按给定顺序循环（段名 = orifra/ 下目录实际名称，支持中文）
+python -m realtime_serve.main --character-dir wy --segments 1 55
+
+# 自动：全部段按自然排序循环（"6"排在"11"前，数字段按数值比较）
+python -m realtime_serve.main --character-dir wy --segments auto
+```
+
+- 每段播完一遍（total_frames/fps 秒）自动切下一段；切换时旧段尾帧全弃 + ~0.16s preroll 重启（轻微跳变属预期）。
+- 段名区分大小写，以 `orifra/` 下目录实际名称为准（可用 `/status` 的 `available_segments` 查看）。
+- 手动 `POST /segment/switch` 仍可用：切到序列内段 → 调度从该段继续循环；切到序列外段 → 调度挂起（`/status` `position: -1`），切回序列内段恢复。
+- 启动校验：段不存在、orifra 为空、分辨率与首段不一致 → fail-fast 并给出原因。
+- "auto" 是保留字；真有名为 auto 的段时请重命名目录（或仅用 /segment/switch 手动切）。
 | `--gaze-correction` | off | - | 视线纠正三态：裸 flag=on（向后兼容）、off/on/adaptive。开启后 **compositor mask 扩展双眼区域**——输出眼睛变为 Generator 渲染的纠正眼（off 时为原视频原生眼） |
 | `--gaze-convergence` | 0.05 | [-1,1] | 收敛角。素材人物坐姿/朝向不同时可调整；负值发散。运行时改需重启（阶段 1） |
 | `--gaze-ckpt` | weights/current_model.ckpt | 路径 | gaze 生成器权重 |

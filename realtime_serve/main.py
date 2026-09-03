@@ -140,6 +140,16 @@ def parse_args():
         help="Path to the gaze generator checkpoint"
     )
     parser.add_argument(
+        "--segments",
+        nargs="+",
+        default=None,
+        help="Segment playback schedule. Omit: first segment loops (legacy). "
+             "'--segments auto': all segments in natural order. Otherwise a "
+             "list of segment names played in order and looped, e.g. "
+             "'--segments 1 55 开心'. Names are the actual directory names "
+             "under orifra/ (see /status available_segments)."
+    )
+    parser.add_argument(
         "--gen-fp16",
         action="store_true",
         help="Enable Generator fp16 autocast inference. Off by default: "
@@ -176,7 +186,58 @@ def parse_args():
     return parser.parse_args()
 
 
-def setup_service(config: Config, no_unitycapture: bool = False):
+def _natural_sorted(names):
+    """Natural sort: '6' before '11' (digit-runs compared numerically)."""
+    import re
+
+    def key(s):
+        return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s)]
+    return sorted(names, key=key)
+
+
+def _resolve_segment_sequence(spec, character_data):
+    """Resolve and VALIDATE the segment schedule (autoplan D2/S4).
+
+    Must run AFTER CharacterDataPack construction (segment whitelist exists
+    only then) and BEFORE model loading (fail-fast stays fail-fast).
+    """
+    if not spec:
+        return None
+    mode, items = spec
+    if mode == 'auto':
+        return _natural_sorted(character_data.segments), 'auto'
+    else:
+        bad = [s for s in items if s not in character_data.segments]
+        if bad:
+            raise ValueError(
+                f"指定的段不存在: {bad}；可用段: {character_data.segments}"
+                f"（段名区分大小写，以 orifra/ 下目录实际名称为准；"
+                f"可用 /status available_segments 查看）")
+        sequence = list(items)
+
+    # Resolution consistency: UnityCaptureSender is built once from the
+    # first segment — a mismatched segment would freeze the output with
+    # per-frame swallowed sender exceptions.
+    import cv2
+    base_res = tuple(character_data.resolution)
+    for seg in sequence:
+        seg_dir = os.path.join(character_data.orifra_base, seg)
+        files = character_data._build_file_list(seg_dir)
+        if not files:
+            raise ValueError(f"段 '{seg}' 的 orifra 目录为空: {seg_dir}")
+        img = cv2.imread(files[0])
+        if img is None:
+            raise ValueError(f"段 '{seg}' 首帧无法读取: {files[0]}")
+        if img.shape[:2] != base_res:
+            raise ValueError(
+                f"段 '{seg}' 分辨率 {img.shape[1]}x{img.shape[0]} 与首段 "
+                f"{base_res[1]}x{base_res[0]} 不一致——异分辨率段会导致"
+                f"虚拟摄像头输出冻结，请重新预处理该段")
+    return sequence, 'list'
+
+
+def setup_service(config: Config, no_unitycapture: bool = False,
+                  segment_sequence_spec=None):
     """Initialize all service components."""
     print("=" * 60)
     print("EDTalk Realtime Streaming Inference Service")
@@ -196,6 +257,12 @@ def setup_service(config: Config, no_unitycapture: bool = False):
         config.character_dir,
         batch_size=config.batch_size
     )
+
+    # 1b. Segment schedule validation (fail-fast BEFORE the slow model load)
+    scheduler_sequence, scheduler_mode = _resolve_segment_sequence(
+        segment_sequence_spec, character_data)
+    if scheduler_sequence:
+        print(f"  -> Segment schedule ({scheduler_mode}): {scheduler_sequence}")
 
     model_paths = character_data.get_model_paths()
     audio2lip_path = model_paths['audio2lip']
@@ -310,6 +377,11 @@ def setup_service(config: Config, no_unitycapture: bool = False):
     render_loop.gaze_mode = config.gaze_mode
     render_loop.audio_player = audio_player
 
+    # Segment schedule installed before start(): sequence[0] must equal the
+    # already-loaded first segment (no redundant switch at startup).
+    if scheduler_sequence:
+        render_loop.set_segment_sequence(scheduler_sequence, mode=scheduler_mode)
+
     # Audio-start callback: triggered by OutputStreamer at display time.
     def _audio_start_callback():
         pcm = None
@@ -369,7 +441,21 @@ def main():
     global face_repair, audio_player, character_data, api_app, gaze_corrector
 
     try:
-        result = setup_service(config, no_unitycapture=args.no_unitycapture)
+        # Segment schedule spec parsing (syntax layer only — existence is
+        # validated inside setup_service after the DataPack loads, ENG D2).
+        seg_spec = None
+        if args.segments:
+            items = []
+            for part in args.segments:
+                items.extend(p.strip() for p in part.split(',') if p.strip())
+            if len(items) == 1 and items[0] == 'auto':
+                seg_spec = ('auto', None)
+            elif items:
+                seg_spec = ('list', items)
+            # items empty (whitespace/commas only) → legacy default
+
+        result = setup_service(config, no_unitycapture=args.no_unitycapture,
+                               segment_sequence_spec=seg_spec)
         (model_manager, render_loop, output_streamer, frame_buffer,
          unity_capture, audio_buffer, audio_processor, compositor,
          face_repair, audio_player, character_data, gaze_corrector) = result

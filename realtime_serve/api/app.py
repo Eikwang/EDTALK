@@ -183,6 +183,14 @@ def create_app() -> FastAPI:
         if render_loop is not None:
             status["production_fps"] = round(render_loop.actual_fps, 1)
             status["frame_index"] = render_loop.frame_index
+            status["last_error"] = getattr(render_loop, 'last_error', '') or None
+            sched = getattr(render_loop, '_scheduler', None)
+            if sched is not None:
+                status["segment_sequence"] = {
+                    "mode": sched.mode,           # 'list' | 'auto'
+                    "position": sched.position,   # 0-based; -1 = outside sequence
+                    "sequence": sched.sequence,
+                }
 
         if output_streamer is not None:
             streamer_stats = output_streamer.stats()

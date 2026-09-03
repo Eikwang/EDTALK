@@ -20,6 +20,57 @@ import numpy as np
 import torch
 
 
+class SegmentScheduler:
+    """Segment playback sequence state machine (pure; no threads, no clocks).
+
+    Owns the playback ORDER only: which segment plays next when the current
+    one finishes. The completion signal and the actual switch stay in
+    RenderLoop (single pacing clock principle). All state transitions are
+    lock-guarded: advance() runs on the producer thread, sync_to() on API
+    threads.
+    """
+
+    def __init__(self, sequence: list, mode: str = 'list'):
+        if not sequence:
+            raise ValueError("SegmentScheduler requires a non-empty sequence")
+        self._lock = threading.Lock()
+        self._sequence = list(sequence)
+        self.mode = mode  # 'list' | 'auto'
+        self._index = 0
+        self.paused = False  # True while the current segment is outside the sequence
+
+    @property
+    def sequence(self) -> list:
+        with self._lock:
+            return list(self._sequence)
+
+    @property
+    def position(self) -> int:
+        """0-based index into the sequence; -1 while paused (segment outside)."""
+        with self._lock:
+            return -1 if self.paused else self._index
+
+    def advance(self) -> str:
+        with self._lock:
+            self._index = (self._index + 1) % len(self._sequence)
+            self.paused = False
+            return self._sequence[self._index]
+
+    def sync_to(self, segment: str) -> None:
+        """Align the scheduler after a MANUAL switch.
+
+        Segment inside the sequence → continue the loop from there.
+        Segment outside → pause the scheduler until the user switches back
+        into the sequence (the current playback is NOT interrupted).
+        """
+        with self._lock:
+            if segment in self._sequence:
+                self._index = self._sequence.index(segment)
+                self.paused = False
+            else:
+                self.paused = True
+
+
 class RenderLoop:
     """Main rendering loop that produces frames as fast as GPU allows.
 
@@ -60,7 +111,9 @@ class RenderLoop:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._character_data = None
-        self._segment_lock = threading.Lock()
+        # RLock: the scheduler path re-enters (check holds the lock, then
+        # calls switch_segment which takes it again on the same thread).
+        self._segment_lock = threading.RLock()
         self._frame_index = 0
         self.actual_fps = 0.0
 
@@ -78,7 +131,17 @@ class RenderLoop:
         self.audio_player = None
 
         # Video clock: wall-clock anchored position in the segment.
+        # self._clock is injectable (single pacing clock principle — the
+        # scheduler shares it with _video_idx; tests substitute a fake).
+        self._clock = time.perf_counter
         self._video_start_time = time.perf_counter()
+
+        # Segment scheduling (None = legacy single-segment loop)
+        self._scheduler: Optional[SegmentScheduler] = None
+
+        # Frame-error circuit breaker (producer-thread protection)
+        self._frame_errors = 0
+        self.last_error: str = ""
 
         # Audio-driven lip coefficient state
         self._lip_coeffs: Optional[torch.Tensor] = None
@@ -118,25 +181,54 @@ class RenderLoop:
         """Set or replace the character data pack."""
         with self._segment_lock:
             self._character_data = character_data
-            self._video_start_time = time.perf_counter()
+            self._video_start_time = self._clock()
 
     def get_current_pack(self):
         """Get the current character data pack (thread-safe)."""
         with self._segment_lock:
             return self._character_data
 
-    def switch_segment(self, segment: str) -> bool:
-        """Switch to a different segment within the current character."""
+    def switch_segment(self, segment: str, source: str = 'manual') -> bool:
+        """Switch to a different segment within the current character.
+
+        Args:
+            segment: Target segment name.
+            source: 'manual' (API/CLI) aligns the scheduler to the new
+                    segment; 'scheduler' (auto-advance) already moved the
+                    scheduler index — re-syncing would fight the advance.
+        """
         with self._segment_lock:
             if self._character_data is None:
                 raise ValueError("No character data loaded")
             ok = self._character_data.switch_segment(segment)
             if ok:
-                self._video_start_time = time.perf_counter()
-                self._flush_buffer()
+                self._video_start_time = self._clock()
+                # S7: if a pushed audio's start-marker frame is about to be
+                # dropped by the flush, re-mark so playback still starts
+                # (guarded — no double-mark when the marker frame survives).
+                with self._pending_lock:
+                    if self._pending_pcm is not None and not self._pending_audio_start:
+                        self._pending_audio_start = True
+                # E2: drop ALL buffered tail frames of the old segment and
+                # re-arm a controlled preroll (flush(5)+reset_preroll(4) was
+                # a no-op — depth 5 >= threshold 4 passed instantly).
+                self._flush_buffer(keep_reserve=0)
+                if self.output_streamer is not None:
+                    self.output_streamer.reset_preroll()
                 if self.gaze_corrector is not None:
                     self.gaze_corrector.reset()
+                if self._scheduler is not None and source == 'manual':
+                    self._scheduler.sync_to(segment)
+                print(f"[Scheduler] segment -> '{segment}' (source: {source})")
             return ok
+
+    def set_segment_sequence(self, sequence: list, mode: str = 'list') -> None:
+        """Install a segment playback schedule (list/auto mode).
+
+        Must be called BEFORE start(). The first sequence entry should be
+        the already-loaded first segment (no redundant switch at startup).
+        """
+        self._scheduler = SegmentScheduler(sequence, mode=mode)
 
     def start(self):
         """Start the rendering loop in a separate thread."""
@@ -165,12 +257,34 @@ class RenderLoop:
     def _run(self):
         """Producer loop: render as fast as possible."""
         frame_count = 0
-        _fps_timer_start = time.perf_counter()
+        _fps_timer_start = self._clock()
         _fps_frame_count = 0
-        _last_status_time = time.perf_counter()
+        _last_status_time = self._clock()
 
         while self._running:
-            self._process_frame()
+            # Producer-thread protection (ENG E3/F3): a single frame failure
+            # must never kill the thread — log (rate-limited), count, and
+            # trip a circuit breaker after sustained failure.
+            try:
+                self._check_segment_schedule()
+                self._process_frame()
+            except Exception as e:
+                self._frame_errors += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+                if self._frame_errors <= 3 or self._frame_errors % 100 == 0:
+                    import traceback
+                    print(f"[RenderLoop] frame error #{self._frame_errors}: {e}")
+                    traceback.print_exc()
+                if self._frame_errors >= 750:  # ~30s sustained: give up loudly
+                    print(f"[RenderLoop] FATAL: {self._frame_errors} consecutive "
+                          f"frame errors, stopping producer. Last: {self.last_error}")
+                    self._running = False
+                    break
+                time.sleep(0.02)
+                continue
+            else:
+                self._frame_errors = 0
+
             frame_count += 1
             _fps_frame_count += 1
 
@@ -367,6 +481,42 @@ class RenderLoop:
     # Rendering
     # ------------------------------------------------------------------
 
+    def _check_segment_schedule(self) -> None:
+        """Advance to the next scheduled segment when the current one ends.
+
+        MUST run at frame HEAD (before _process_frame): the wrap-around
+        frame an over-elapsed iteration would otherwise produce is kept by
+        the flush reserve and would flash 40ms of the old segment's frame 0
+        after the switch (ENG F5).
+
+        The completion check shares the video clock (_video_start_time) —
+        re-anchoring by a manual switch inside the lock resets elapsed to 0
+        and naturally cancels this advance (ENG S3).
+        """
+        if self._scheduler is None or self._scheduler.paused:
+            return
+        with self._segment_lock:
+            cd = self._character_data
+            if cd is None:
+                return
+            total = cd.total_frames
+            if total <= 0:
+                return
+            elapsed = self._clock() - self._video_start_time
+            if elapsed * self.target_fps < total:
+                return
+            nxt = self._scheduler.advance()
+            try:
+                self.switch_segment(nxt, source='scheduler')
+            except Exception as e:
+                # Re-anchor the CURRENT segment so this failure doesn't
+                # re-trigger every frame (log-storm / chain-advance guard);
+                # advance() already moved the index — the next boundary
+                # naturally skips the broken segment.
+                self._video_start_time = self._clock()
+                print(f"[Scheduler] switch to '{nxt}' failed ({e}); "
+                      f"restarting current segment")
+
     def _video_idx(self, total_frames) -> int:
         """Wall-clock position in the current segment (wraps at the end)."""
         try:
@@ -375,7 +525,7 @@ class RenderLoop:
             return max(0, self._frame_index)
         if total <= 0:
             return 0
-        elapsed = time.perf_counter() - self._video_start_time
+        elapsed = self._clock() - self._video_start_time
         return int(elapsed * self.target_fps) % total
 
     def _process_frame(self) -> None:
@@ -459,17 +609,21 @@ class RenderLoop:
         else:
             composited = orifra
 
-        # Build metadata for the consumer
+        # Build metadata for the consumer. The marker is only CLEARED after
+        # a successful put — a failure between marker-read and put (or in
+        # the put itself) must not orphan the pending PCM (ENG F4a).
         frame_meta = None
         with self._pending_lock:
             if self._pending_audio_start:
                 frame_meta = {'audio_start': True}
-                self._pending_audio_start = False
 
         # Push into the output buffer (blocking when full — backpressure)
         t_put_0 = time.perf_counter()
         if self.frame_buffer is not None:
             self.frame_buffer.put(composited, meta=frame_meta)
+        if frame_meta is not None:
+            with self._pending_lock:
+                self._pending_audio_start = False
         timings['put'] = (time.perf_counter() - t_put_0) * 1000.0
 
         timings['total'] = (time.perf_counter() - t_total_0) * 1000.0
@@ -535,10 +689,15 @@ class RenderLoop:
                 parts.append(f"{key}=p50:{p50:.1f}/p95:{p95:.1f}/p99:{p99:.1f}ms")
             return " ".join(parts)
 
-    def _flush_buffer(self) -> None:
-        """Flush the output buffer, keeping the configured reserve."""
+    def _flush_buffer(self, keep_reserve: int = 0) -> None:
+        """Flush the output buffer.
+
+        keep_reserve=0 (default): drop ALL buffered frames — the buffered
+        tail belongs to the OLD segment/audio, and flush(5)+reset_preroll(4)
+        was a silent no-op (depth 5 >= threshold 4 passed instantly).
+        """
         if self.frame_buffer is not None:
-            dropped = self.frame_buffer.flush()
+            dropped = self.frame_buffer.flush(keep_reserve=keep_reserve)
             if dropped > 0:
                 print(f"[RenderLoop] Flushed {dropped} buffered frames")
 

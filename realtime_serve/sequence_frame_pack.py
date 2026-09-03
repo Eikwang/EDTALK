@@ -480,6 +480,9 @@ class CharacterDataPack:
         # Cache for loaded segment data
         self._segment_cache: dict = {}
 
+        # Serializes concurrent switch_segment calls (double-load guard)
+        self._switch_lock = threading.Lock()
+
         # Batch preloader (replaces LRU cache)
         BatchPreloader.BATCH_SIZE = batch_size
         self._preloader = BatchPreloader(self._segment_cache, device)
@@ -664,9 +667,11 @@ class CharacterDataPack:
     def switch_segment(self, segment: str) -> bool:
         """Switch to a different segment.
 
-        Resets the batch preloader and starts loading the first batch of
-        the new segment in the background (non-blocking; the render loop
-        falls back to single-frame disk reads for the first ~0.5s).
+        Atomic order (autoplan ENG E1): load fully, prepare the preloader,
+        and ONLY THEN publish current_segment. The render thread observes
+        either the complete old segment or the complete new segment — never
+        a half-loaded one (a KeyError here used to silently kill the render
+        thread when a switch landed inside the load window).
 
         Args:
             segment: Segment name to switch to
@@ -677,12 +682,11 @@ class CharacterDataPack:
         if segment not in self.segments:
             raise ValueError(f"Segment '{segment}' not found. Available: {self.segments}")
 
-        self.current_segment = segment
-        self._load_segment(segment)
-
-        # Fast reset + background load of the new segment's first batch
-        self._preloader.reset(segment)
-        self._preloader.ensure_loaded(0, segment)
+        with self._switch_lock:  # concurrent /segment/switch double-load guard
+            self._load_segment(segment)               # may raise → old segment stays
+            self._preloader.reset(segment)
+            self._preloader.ensure_loaded(0, segment)
+            self.current_segment = segment            # publish LAST
 
         return True
 
