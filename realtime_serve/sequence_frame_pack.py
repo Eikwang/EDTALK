@@ -111,6 +111,12 @@ class BatchPreloader:
         # their results if the generation changed (segment switched away).
         self._gen = 0
 
+        # Mask epoch (M18): bumped by invalidate_masks() when a paste-back
+        # setting changes (e.g. eyes_enabled). In-flight batch loads check
+        # the epoch before publishing and drop setting-dependent masks that
+        # were generated under the OLD setting.
+        self._mask_epoch = 0
+
         # Persistent decode pool (cv2.imread releases the GIL)
         self._decode_pool = ThreadPoolExecutor(
             max_workers=min(self._DECODE_WORKERS, os.cpu_count() or 4)
@@ -261,6 +267,20 @@ class BatchPreloader:
                 mask_list.append(None)
         self._mask_bufs[slot] = mask_list
 
+    def invalidate_masks(self) -> None:
+        """Drop all computed masks after a paste-back setting change (M18).
+
+        The two-slot window only recomputed the CURRENT slot before, and a
+        batch load in flight would publish masks generated under the OLD
+        setting — both left ~one batch window pasting the wrong eyes.
+        Clearing everything forces the render loop's per-frame mask
+        fallback (~1ms/frame) until fresh batches land; in-flight loads
+        check the epoch before publishing and drop their stale masks.
+        """
+        with self._preload_lock:
+            self._mask_epoch += 1
+            self._mask_bufs = [None, None]
+
     @property
     def is_preloading(self) -> bool:
         """Whether a background preload is in progress."""
@@ -376,6 +396,11 @@ class BatchPreloader:
         if count <= 0:
             return
 
+        # Mask settings snapshot (M18): if the paste-back setting changes
+        # while this batch decodes, the masks generated here are stale and
+        # get dropped at publish time.
+        mask_epoch = self._mask_epoch
+
         facemark_data = data.get('facemark')  # (total_frames, 68, 2)
 
         # Phase 1: parallel JPEG decode (cv2 releases the GIL)
@@ -415,6 +440,13 @@ class BatchPreloader:
 
         if gen != self._gen:
             return  # reset happened while loading — discard
+
+        if mask_epoch != self._mask_epoch:
+            # Paste-back setting changed mid-load (M18): the orifra/crop
+            # frames are setting-independent and stay; the masks were
+            # generated under the old setting and are dropped — the render
+            # loop's per-frame fallback covers until the next batch.
+            mask_list = [None] * len(mask_list)
 
         with self._preload_lock:
             self._orifra_bufs[slot] = orifra_list
@@ -717,13 +749,17 @@ class CharacterDataPack:
         """Toggle eye regions in the precomputed paste-back masks.
 
         Required for gaze correction: with eyes enabled the rendered eye
-        regions are pasted back onto the original frame. Recomputes the
-        current batch's masks synchronously (fast, ~10ms per 100 frames).
+        regions are pasted back onto the original frame. Masks generated
+        under the previous setting are invalidated across BOTH slots and
+        in-flight loads (M18 mask epoch); the current batch is recomputed
+        synchronously (~10ms per 100 frames), other windows fall back to
+        per-frame mask generation until fresh batches land.
         """
         compositor = self._preloader._compositor
         if compositor is None:
             return
         compositor.set_eyes_enabled(enabled)
+        self._preloader.invalidate_masks()
         self._preloader.recompute_current_masks()
 
     def has_gaze_data(self) -> bool:

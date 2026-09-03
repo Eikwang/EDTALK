@@ -142,6 +142,13 @@ class RenderLoop:
 
         # Segment scheduling (None = legacy single-segment loop)
         self._scheduler: Optional[SegmentScheduler] = None
+        # Queued at=segment_end switch (M16): fires at the next loop/segment
+        # boundary, BEFORE the scheduler guard — works in legacy mode too.
+        self._pending_switch: Optional[str] = None
+        # Frame-boundary gaze param application slot (M2): API threads write,
+        # the render thread applies at frame head — no cross-stream races
+        # with CUDA graph replay.
+        self._pending_gaze_params: Optional[dict] = None
 
         # Frame-error circuit breaker (producer-thread protection)
         self._frame_errors = 0
@@ -192,20 +199,39 @@ class RenderLoop:
         with self._segment_lock:
             return self._character_data
 
-    def switch_segment(self, segment: str, source: str = 'manual') -> bool:
+    def switch_segment(self, segment: str, source: str = 'manual',
+                       seamless: bool = False,
+                       prefetched=None) -> bool:
         """Switch to a different segment within the current character.
 
         Args:
             segment: Target segment name.
             source: 'manual' (API/CLI) aligns the scheduler to the new
-                    segment; 'scheduler' (auto-advance) and 'startup'
-                    (schedule installation) already point the scheduler at
-                    this segment — re-syncing would fight that.
+                    segment; 'pending' (queued segment_end, same sync rule)
+                    and 'scheduler' (auto-advance) / 'startup' (schedule
+                    installation) manage the scheduler index themselves.
+            seamless: True for boundary continuations (M8): buffered tail
+                    frames of the old segment ARE the legitimate continuation,
+                    so nothing is flushed and preroll is NOT re-armed — output
+                    keeps ticking through the switch. False (immediate) keeps
+                    the E2 hard cut: flush + preroll re-arm, ≤~0.3s gap.
+            prefetched: Optional ready PrefetchLoader result — published into
+                    the preloader's slot 0 so the new segment serves frames
+                    from cache with no cold-start disk-fallback window (M15).
         """
         with self._segment_lock:
             if self._character_data is None:
                 raise ValueError("No character data loaded")
-            ok = self._character_data.switch_segment(segment)
+            # L3: any switch supersedes a queued segment_end switch.
+            self._pending_switch = None
+            if prefetched is not None:
+                # M15 seamless path: publish the prefetched batch 0 (kwarg
+                # omitted otherwise — keeps the pack's base contract and
+                # every existing caller/double unchanged).
+                ok = self._character_data.switch_segment(segment,
+                                                         prefetched=prefetched)
+            else:
+                ok = self._character_data.switch_segment(segment)
             if ok:
                 self._video_start_time = self._clock()
                 # S7: if a pushed audio's start-marker frame is about to be
@@ -214,42 +240,115 @@ class RenderLoop:
                 with self._pending_lock:
                     if self._pending_pcm is not None and not self._pending_audio_start:
                         self._pending_audio_start = True
-                # E2: drop ALL buffered tail frames of the old segment and
-                # re-arm a controlled preroll (flush(5)+reset_preroll(4) was
-                # a no-op — depth 5 >= threshold 4 passed instantly).
-                self._flush_buffer(keep_reserve=0)
-                if self.output_streamer is not None:
-                    self.output_streamer.reset_preroll()
+                if seamless:
+                    # M8 boundary continuation: keep the buffer and the output
+                    # clock; buffered old-segment tail frames play out, then
+                    # new-segment frames follow. No freeze, no jump.
+                    pass
+                else:
+                    # E2: drop ALL buffered tail frames of the old segment and
+                    # re-arm a controlled preroll (flush(5)+reset_preroll(4) was
+                    # a no-op — depth 5 >= threshold 4 passed instantly).
+                    self._flush_buffer(keep_reserve=0)
+                    if self.output_streamer is not None:
+                        self.output_streamer.reset_preroll()
                 if self.gaze_corrector is not None:
                     self.gaze_corrector.reset()
-                # Native-resolution passthrough: the preroll window above
-                # pauses the consumer, so the camera can be re-opened at the
-                # new segment's size without racing the send thread.
+                # Native-resolution passthrough: the consumer side is paused
+                # (immediate) or at a natural boundary (seamless), so the
+                # camera can be re-opened at the new segment's size.
                 if self.resolution_change_cb is not None:
                     try:
                         h, w = self._character_data.resolution
                         self.resolution_change_cb(w, h)
                     except Exception as e:
                         print(f"[Scheduler] 摄像头分辨率切换失败: {e}")
-                if self._scheduler is not None and source == 'manual':
+                if self._scheduler is not None and source in ('manual', 'pending'):
                     self._scheduler.sync_to(segment)
                 print(f"[Scheduler] segment -> '{segment}' (source: {source})")
             return ok
 
-    def set_segment_sequence(self, sequence: list, mode: str = 'list') -> None:
-        """Install a segment playback schedule (list/auto mode).
+    def set_segment_sequence(self, sequence: list, mode: str = 'list',
+                             align: bool = True) -> None:
+        """Install/replace a segment playback schedule (list/auto mode).
 
-        Must be called BEFORE start(). Playback is aligned to the schedule:
-        if the currently loaded segment is not sequence[0] (main.py loads the
-        character's default segment, which only matches for auto mode or
-        lists starting with it, e.g. --segments 22 55), it switches now so
-        the schedule's first entry is what actually plays.
+        Scheduler replacement happens ENTIRELY under _segment_lock (M10/E6:
+        an unlocked swap let advance() land on the new scheduler and skip
+        its first segment). `align=False` (runtime replaces, M10) installs
+        the order only — the current segment keeps playing and the new order
+        takes effect at the next boundary; `align=True` (startup semantics)
+        additionally switches to sequence[0] when it differs.
+
+        Any queued segment_end switch is cleared (M3): a replaced schedule
+        supersedes pending intent.
         """
-        self._scheduler = SegmentScheduler(sequence, mode=mode)
         with self._segment_lock:
+            self._scheduler = SegmentScheduler(sequence, mode=mode)
+            self._pending_switch = None
             cd = self._character_data
-            if cd is not None and sequence[0] != cd.current_segment:
+            if align and cd is not None and sequence[0] != cd.current_segment:
                 self.switch_segment(sequence[0], source='startup')
+
+    # ------------------------------------------------------------------
+    # Queued segment_end switch (M16)
+    # ------------------------------------------------------------------
+
+    def queue_segment_switch(self, segment: str) -> None:
+        """Queue a switch that fires at the next segment boundary.
+
+        The caller MUST validate the segment name at request time (M16) —
+        this queue stores intent only. Last-write-wins; any immediate
+        switch clears it.
+        """
+        self._pending_switch = segment
+
+    def clear_pending_switch(self) -> None:
+        self._pending_switch = None
+
+    @property
+    def pending_switch(self) -> Optional[str]:
+        return self._pending_switch
+
+    # ------------------------------------------------------------------
+    # Frame-boundary gaze param application (M2)
+    # ------------------------------------------------------------------
+
+    def queue_gaze_params(self, convergence: Optional[float] = None,
+                          smooth_alpha: Optional[float] = None,
+                          mode: Optional[str] = None) -> None:
+        """Stage gaze param changes; the render thread applies them at the
+        next frame head (no cross-stream copy_/replay races). Values must be
+        validated by the caller BEFORE queueing."""
+        params = {}
+        if convergence is not None:
+            params['convergence'] = convergence
+        if smooth_alpha is not None:
+            params['smooth_alpha'] = smooth_alpha
+        if mode is not None:
+            params['mode'] = mode
+        if params:
+            self._pending_gaze_params = params
+
+    def _apply_pending_params(self) -> None:
+        """Apply staged gaze params at frame head (render thread only)."""
+        pending = self._pending_gaze_params
+        if not pending:
+            return
+        self._pending_gaze_params = None
+        mode = pending.get('mode')
+        if mode is not None and mode != self.gaze_mode:
+            self.gaze_mode = mode
+            # on→off must restore native eyes (mask loses eye regions);
+            # off→on re-enables them. Mask epoch invalidation (M18) covers
+            # the already-loaded batches.
+            if self._character_data is not None:
+                self._character_data.set_eyes_enabled(mode != 'off')
+        gc = self.gaze_corrector
+        if gc is not None:
+            if 'convergence' in pending:
+                gc.set_convergence(pending['convergence'])
+            if 'smooth_alpha' in pending:
+                gc.smooth_alpha = pending['smooth_alpha']
 
     def start(self):
         """Start the rendering loop in a separate thread."""
@@ -503,17 +602,42 @@ class RenderLoop:
     # ------------------------------------------------------------------
 
     def _check_segment_schedule(self) -> None:
-        """Advance to the next scheduled segment when the current one ends.
+        """Fire queued segment_end switches, then advance the scheduler.
 
         MUST run at frame HEAD (before _process_frame): the wrap-around
         frame an over-elapsed iteration would otherwise produce is kept by
         the flush reserve and would flash 40ms of the old segment's frame 0
         after the switch (ENG F5).
 
+        Ordering (M16/L1/L2): the queued segment_end switch is checked
+        BEFORE the scheduler None/paused early-return — it must fire in
+        legacy mode too — and BEFORE scheduler.advance(), which would
+        otherwise steal the boundary.
+
         The completion check shares the video clock (_video_start_time) —
         re-anchoring by a manual switch inside the lock resets elapsed to 0
         and naturally cancels this advance (ENG S3).
         """
+        if self._pending_switch is not None:
+            with self._segment_lock:
+                nxt = self._pending_switch
+                cd = self._character_data
+                if cd is None:
+                    return
+                total = cd.total_frames
+                elapsed = self._clock() - self._video_start_time
+                if elapsed * self.target_fps < total:
+                    return
+                self._pending_switch = None
+                try:
+                    self.switch_segment(nxt, source='pending', seamless=True)
+                except Exception as e:
+                    # Same log-storm guard as the scheduler path: re-anchor.
+                    self._video_start_time = self._clock()
+                    print(f"[Scheduler] pending switch to '{nxt}' failed "
+                          f"({e}); restarting current segment")
+                return
+
         if self._scheduler is None or self._scheduler.paused:
             return
         with self._segment_lock:
@@ -528,7 +652,7 @@ class RenderLoop:
                 return
             nxt = self._scheduler.advance()
             try:
-                self.switch_segment(nxt, source='scheduler')
+                self.switch_segment(nxt, source='scheduler', seamless=True)
             except Exception as e:
                 # Re-anchor the CURRENT segment so this failure doesn't
                 # re-trigger every frame (log-storm / chain-advance guard);
@@ -560,6 +684,10 @@ class RenderLoop:
         if character_data is None:
             print("[RenderLoop] ERROR: No character data!")
             return
+
+        # Frame-boundary param application (M2): staged by API threads,
+        # applied here on the render thread — serialized with graph replay.
+        self._apply_pending_params()
 
         total = character_data.total_frames
         video_idx = self._video_idx(total)

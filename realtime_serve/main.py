@@ -35,6 +35,7 @@ from realtime_serve.face_repair import FaceRepair
 from realtime_serve.audio_player import AudioPlayer
 from realtime_serve.gaze_correction import GazeCorrector
 from realtime_serve.output_buffer import FrameBuffer, OutputStreamer
+from realtime_serve.service import RealtimeService
 from realtime_serve.api.app import create_app as create_api_app
 
 
@@ -292,7 +293,7 @@ def setup_service(config: Config, no_unitycapture: bool = False,
     face_repair = None
     if config.face_repair_mode in ('on', 'adaptive'):
         print(f"\n[4/7] Initializing face repair (mode: {config.face_repair_mode})...")
-        face_repair = FaceRepair(model_path='realtime_serve/weights/facefix256.onnx',
+        face_repair = FaceRepair(model_path=config.face_repair_weights,
                                  alpha=0.7, use_cuda=True)
         face_repair.warmup()
     else:
@@ -439,16 +440,12 @@ def main():
         gaze_ckpt=args.gaze_ckpt,
         buffer_frames=args.buffer_frames,
         preroll_frames=args.preroll_frames,
-        gen_fp16=args.gen_fp16
+        gen_fp16=args.gen_fp16,
+        unitycapture_enabled=(not args.no_unitycapture)
     )
 
     # Set Windows timer resolution early.
     _set_timer_resolution(True)
-
-    # Setup service components
-    global model_manager, render_loop, output_streamer, frame_buffer
-    global unity_capture, audio_buffer, audio_processor, compositor
-    global face_repair, audio_player, character_data, api_app, gaze_corrector
 
     try:
         # Segment schedule spec parsing (syntax layer only — existence is
@@ -464,47 +461,32 @@ def main():
                 seg_spec = ('list', items)
             # items empty (whitespace/commas only) → legacy default
 
-        result = setup_service(config, no_unitycapture=args.no_unitycapture,
-                               segment_sequence_spec=seg_spec)
-        (model_manager, render_loop, output_streamer, frame_buffer,
-         unity_capture, audio_buffer, audio_processor, compositor,
-         face_repair, audio_player, character_data, gaze_corrector) = result
+        # Control-plane facade owns assembly, lifecycle order (M12), the
+        # audio-start callback and every control method (M1 contract).
+        service = RealtimeService(config, segment_sequence_spec=seg_spec)
     except Exception as e:
         print(f"\nError initializing service: {e}")
         _set_timer_resolution(False)
         sys.exit(1)
 
-    # Create API app with shared state
+    # Create API app with shared state (E5 will switch to create_app(service))
     api_app = create_api_app()
 
     # Inject global state into API module
     import realtime_serve.api.app as api_module
-    api_module.audio_buffer = audio_buffer
-    api_module.render_loop = render_loop
-    api_module.output_streamer = output_streamer
-    api_module.frame_buffer = frame_buffer
-    api_module.character_data = character_data
+    api_module.audio_buffer = service.audio_buffer
+    api_module.render_loop = service.render_loop
+    api_module.output_streamer = service.output_streamer
+    api_module.frame_buffer = service.frame_buffer
+    api_module.character_data = service.character_data
 
-    # Start output streamer before render loop so it owns pacing immediately.
-    print("\nStarting output streamer...")
-    output_streamer.start()
-
-    # Start render loop in background thread
-    print("Starting render loop...")
-    render_loop.start()
+    # Facade start: output streamer first (pacing clock), then render loop.
+    service.start()
 
     # Setup signal handler for graceful shutdown
     def signal_handler(signum, frame):
-        print("\nShutting down service...")
-        render_loop.stop()
-        if output_streamer is not None:
-            output_streamer.stop()
-        if audio_player is not None:
-            audio_player.close()
-        if unity_capture is not None:
-            unity_capture.close()
+        service.stop()
         _set_timer_resolution(False)
-        print("Service stopped.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)

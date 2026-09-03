@@ -111,6 +111,11 @@ class GazeCorrector:
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def convergence_h(self) -> float:
+        """Public read-only echo for /status (H4: never read the _private)."""
+        return self._convergence_h
+
     def set_convergence(self, convergence_h: float) -> None:
         """Change the convergence angle at runtime (takes effect next frame).
 

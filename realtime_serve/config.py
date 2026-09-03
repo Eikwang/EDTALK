@@ -21,6 +21,8 @@ class Config:
     gaze_mode: str = 'off'  # 'off' | 'on' | 'adaptive' (gaze correction on rendered output)
     gaze_convergence: float = 0.05  # convergence angle [-1,1] space (dynamic via set_convergence)
     gaze_ckpt: str = 'realtime_serve/weights/current_model.ckpt'  # gaze model weights
+    unitycapture_enabled: bool = True  # False = 无摄像头运行（原 --no-unitycapture）
+    face_repair_weights: str = 'realtime_serve/weights/facefix256.onnx'
     buffer_frames: int = 16  # output frame buffer capacity (frames, ~11MB each)
     preroll_frames: int = 8  # frames required before output starts
     # Generator fp16 autocast: DISABLED by default. Measured negative on

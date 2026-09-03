@@ -75,7 +75,7 @@ class FakeCharacterData:
     def total_frames(self):
         return self._frames[self.current_segment]
 
-    def switch_segment(self, seg):
+    def switch_segment(self, seg, prefetched=None):
         if seg not in self.segments:
             raise ValueError(f"Segment '{seg}' not found. Available: {self.segments}")
         self.switch_calls.append(seg)
