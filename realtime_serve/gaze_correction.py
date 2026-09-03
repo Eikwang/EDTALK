@@ -82,6 +82,12 @@ class GazeCorrector:
         self._low_ear_count = 0
         self._open_confirm = 0
 
+        # Temporal smoothing of the generated eyes (GAN outputs jitter
+        # frame-to-frame even for identical inputs). New-frame weight.
+        self._temporal_alpha = 0.7
+        self._prev_gen = None
+        self._skip_run = 0
+
         # Observability counters (reset per segment).
         self.corrected_frames = 0
         self.blink_skips = 0
@@ -112,6 +118,8 @@ class GazeCorrector:
         self._fixed_eye_size = None
         self._low_ear_count = 0
         self._open_confirm = 0
+        self._prev_gen = None
+        self._skip_run = 0
         self.corrected_frames = 0
         self.blink_skips = 0
         self.nan_skips = 0
@@ -142,9 +150,11 @@ class GazeCorrector:
                 state = int(gaze_frame['state'])
                 if state == 1:
                     self.blink_skips += 1
+                    self._note_skip()
                     return rendered
                 if state == 2:
                     self.nan_skips += 1
+                    self._note_skip()
                     return rendered
                 eye_size = int(gaze_frame['eye_size'])
                 lx, ly = gaze_frame['l_center']
@@ -154,12 +164,14 @@ class GazeCorrector:
             else:
                 if facemark_256 is None or np.any(np.isnan(facemark_256)):
                     self.nan_skips += 1
+                    self._note_skip()
                     return rendered
 
                 l_info, r_info = self._eye_state(facemark_256)
                 if l_info is None:
                     # Blink in progress: bypass entirely.
                     self.blink_skips += 1
+                    self._note_skip()
                     return rendered
 
                 boxes = []
@@ -169,6 +181,7 @@ class GazeCorrector:
 
             out = self._correct_eyes(rendered, boxes)
             self.corrected_frames += 1
+            self._skip_run = 0
             return out
         except Exception as e:
             self.error_skips += 1
@@ -184,6 +197,13 @@ class GazeCorrector:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _note_skip(self) -> None:
+        """Track consecutive skip frames; invalidate the temporal-smoothing
+        history after a long gap so resuming correction doesn't ghost."""
+        self._skip_run += 1
+        if self._skip_run > 3:
+            self._prev_gen = None
 
     def _build_angles(self, convergence_h: float) -> torch.Tensor:
         return torch.tensor([[-convergence_h, 0.0, -1.0],
@@ -270,6 +290,13 @@ class GazeCorrector:
 
         batch = torch.cat(tensors, dim=0)  # [2,3,64,64]
         gen = self._forward(batch)
+
+        # Temporal smoothing: lerp with the previous generated eyes. GAN
+        # outputs jitter frame-to-frame even for near-identical inputs;
+        # blink/skip frames don't touch the history (see _note_skip).
+        if self._prev_gen is not None and self._prev_gen.shape == gen.shape:
+            gen = self._temporal_alpha * gen + (1.0 - self._temporal_alpha) * self._prev_gen
+        self._prev_gen = gen.detach().clone()
 
         for i, (x1c, y1c, w, h) in enumerate(coords):
             eye = gen[i]

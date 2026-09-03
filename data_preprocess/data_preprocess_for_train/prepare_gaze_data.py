@@ -97,27 +97,32 @@ def remove_short_runs(state: np.ndarray, min_len: int = 3) -> np.ndarray:
     return s
 
 
-def mark_skip_frames(ear_s: np.ndarray):
+def mark_skip_frames(ear_s: np.ndarray, skip_ratio: float = 0.6):
     """标记"不适合施加视线纠正"的帧。
 
-    判定不是固定 EAR 阈值，而是相对本段睁眼度（自适应）：
-        skip_th = 0.75 × median(ear_s)
-    头部俯仰/低头会让 256 空间眼睛整体变窄、EAR 基线漂移——相对比例
-    天然吸收这种漂移。低于阈值的帧（闭眼、慢速眨眼全程、微眯）跳过
-    纠正——gaze 生成模型只对明显睁眼的输入有可靠输出，对半闭眼施加
-    收敛角修正会产生劣质假眼。
+    判定是相对本段睁眼度的自适应阈值：
+        skip_th = skip_ratio × median(ear_s)     （默认 0.6）
+    相对比例吸收头部俯仰造成的 EAR 基线漂移。
+
+    0.6 的取值权衡（用户实测校准）：
+    - 往下看（眼睑自然下垂，EAR ≈ 中位数的 0.5-0.7）应继续纠正
+      ——瞳孔清晰可见，纠正有效且符合预期；
+    - 真眨眼的深闭期（EAR < 0.45×中位）仍被跳过，避免生成假眼；
+    - 深度微眯（EAR < 0.5×中位）被跳过；浅微眯可能被纠正，实测可接受。
+    偏高（如 0.75）会把正常往下看误判为眨眼并跳过纠正。
 
     Returns:
         (state, skip_th): state 1=跳过 0=正常；skip_th 为实际使用阈值。
     """
     med = float(np.median(ear_s))
-    skip_th = max(0.06, 0.75 * med)
+    skip_th = max(0.06, skip_ratio * med)
     state = (ear_s < skip_th).astype(np.uint8)
     state = remove_short_runs(state, min_len=3)
     return state, skip_th
 
 
-def process_asset(asset_dir: str) -> bool:
+def process_asset(asset_dir: str, skip_ratio: float = 0.6,
+                  smooth_alpha: float = 0.15) -> bool:
     facemark_dir = os.path.join(asset_dir, "facemark")
     if not os.path.isdir(facemark_dir):
         return False
@@ -147,10 +152,10 @@ def process_asset(asset_dir: str) -> bool:
         # 2) NaN 帧（检测失败）先行标记；EAR 时序插值 + 中值滤波去量化噪声
         nan_mask = np.isnan(ear_raw)
         ear_filled = interp_nan(ear_raw)
-        ear_s = median_filter(ear_filled, 5)
+        ear_s = median_filter(ear_filled, 7)
 
         # 3) 跳过帧标记（相对睁眼度自适应阈值）
-        state, skip_th = mark_skip_frames(ear_s)
+        state, skip_th = mark_skip_frames(ear_s, skip_ratio=skip_ratio)
         state[nan_mask] = 2  # 无数据帧跳过纠正
 
         # 4) 眼中心：外包络中心 → NaN 插值 → 中值滤波 → 零相位平滑
@@ -161,8 +166,8 @@ def process_asset(asset_dir: str) -> bool:
             c = (mn + mx) / 2.0  # (N,2)
             c[:, 0] = interp_nan(c[:, 0])
             c[:, 1] = interp_nan(c[:, 1])
-            c[:, 0] = smooth_zero_phase(median_filter(c[:, 0], 5))
-            c[:, 1] = smooth_zero_phase(median_filter(c[:, 1], 5))
+            c[:, 0] = smooth_zero_phase(median_filter(c[:, 0], 7), smooth_alpha)
+            c[:, 1] = smooth_zero_phase(median_filter(c[:, 1], 7), smooth_alpha)
             return c.astype(np.float32)
 
         l_center = center_series(L_EYE)
@@ -213,6 +218,11 @@ def main():
                         help="数据集根目录（扫描含 facemark/ 的子目录）")
     parser.add_argument("--asset_dir", default=None,
                         help="单角色资产目录（直接含 facemark/，如 wy）")
+    parser.add_argument("--skip_ratio", type=float, default=0.6,
+                        help="跳过纠正的相对睁眼度阈值（×段中位 EAR）。越低越少跳过："
+                             "0.6=往下看仍纠正、深眨眼跳过；调高（如 0.75）会更早跳过微眯")
+    parser.add_argument("--smooth_alpha", type=float, default=0.15,
+                        help="眼中心零相位 EMA 系数（越小越平滑）")
     args = parser.parse_args()
 
     target = args.asset_dir or args.base_dir
@@ -231,7 +241,8 @@ def main():
     failed = []
     for a in assets:
         print(f"[gaze_data] asset: {a}")
-        if not process_asset(a):
+        if not process_asset(a, skip_ratio=args.skip_ratio,
+                             smooth_alpha=args.smooth_alpha):
             failed.append(a)
             print(f"  [FAIL] {a}")
     if failed:
