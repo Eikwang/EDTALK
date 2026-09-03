@@ -154,18 +154,22 @@ class RenderLoop:
         self._frame_errors = 0
         self.last_error: str = ""
 
-        # Audio-driven lip coefficient state
+        # Audio-driven lip state — FRAME-LOCKED SYNC: the CONSUMER paces
+        # audio. Each produced frame consumes the next lip coefficient and
+        # carries its 640-sample audio chunk (16kHz / 25fps); the
+        # OutputStreamer pushes the chunk to the player exactly when the
+        # frame is DISPLAYED. Audio position ≡ displayed-frame position ≡
+        # lip position by construction (lead = DAC latency ≤ ~40ms); when
+        # inference is behind, NO chunk is allocated and the audio waits —
+        # lips can never lag the audio.
         self._lip_coeffs: Optional[torch.Tensor] = None
-        self._audio_start_time: float = 0.0
+        self._audio_chunks: Optional[list] = None   # per-frame 640-sample PCM
         self._total_lip_frames: int = 0
         self._lip_filled: int = 0
+        self._last_rendered_lip_idx: int = -1
+        self._audio_arm_start: bool = False   # first advancing frame → audio_start
+        self._audio_hold_frames: int = int(self.AUDIO_END_GRACE_S * target_fps)
         self._audio_lock = threading.Lock()
-
-        # Pending PCM for the current audio segment. Playback is triggered
-        # by OutputStreamer at display time of the segment's first frame.
-        self._pending_pcm: Optional[np.ndarray] = None
-        self._pending_audio_start: bool = False
-        self._pending_lock = threading.Lock()
 
         # Serializes full-audio pushes (each push resets the player).
         self._push_lock = threading.Lock()
@@ -246,12 +250,10 @@ class RenderLoop:
                     'resolution': list(self._character_data.resolution),
                 }
                 self._video_start_time = self._clock()
-                # S7: if a pushed audio's start-marker frame is about to be
-                # dropped by the flush, re-mark so playback still starts
-                # (guarded — no double-mark when the marker frame survives).
-                with self._pending_lock:
-                    if self._pending_pcm is not None and not self._pending_audio_start:
-                        self._pending_audio_start = True
+                # (Old S7 re-mark removed with the wall-clock sync: the
+                # audio-start arm flag survives flushes by design — the
+                # first advancing lip frame after a push carries the reset
+                # marker regardless of intervening switches.)
                 if seamless:
                     # M8 boundary continuation: keep the buffer and the output
                     # clock; buffered old-segment tail frames play out, then
@@ -448,9 +450,10 @@ class RenderLoop:
         """Run Audio2Lip on a full audio segment.
 
         The audio is processed in chunks so the GPU is never monopolized.
-        Playback is not started here; instead the PCM is stored and playback
-        is triggered by OutputStreamer when the segment's first frame is
-        popped for display.
+        Playback is NOT started here: the PCM is split into per-frame 640
+        sample chunks that ride the produced frames' meta — the OutputStreamer
+        pushes chunk[n] to the player exactly when lip coefficient[n] is
+        displayed (frame-locked sync; the audio waits for the lips).
         """
         if self.audio_processor is None or self.model_manager is None:
             return
@@ -475,18 +478,24 @@ class RenderLoop:
             print(f"[RenderLoop] Full audio: pcm={pcm_duration:.3f}s, T={T} frames, "
                   f"lip_dur={lip_duration:.3f}s")
 
+            # Frame-locked audio chunks: one 640-sample slice per lip frame.
+            samples_per_frame = 16000 // self.target_fps
+            needed = T * samples_per_frame
+            pcm_f = np.asarray(pcm_float, dtype=np.float32)
+            if len(pcm_f) < needed:
+                pcm_f = np.pad(pcm_f, (0, needed - len(pcm_f)))
+            chunks = [pcm_f[i * samples_per_frame:(i + 1) * samples_per_frame]
+                      for i in range(T)]
+
             # Progressive lip buffer
             lip_all = torch.zeros(T, 20, dtype=torch.float32)
             with self._audio_lock:
-                self._audio_start_time = 0.0
                 self._lip_coeffs = None
+                self._audio_chunks = chunks
                 self._total_lip_frames = T
                 self._lip_filled = 0
                 self._last_rendered_lip_idx = -1
-
-            with self._pending_lock:
-                self._pending_pcm = pcm_float
-                self._pending_audio_start = True
+                self._audio_arm_start = True
 
             chunk = self.LIP_CHUNK_FRAMES
             for s in range(0, T, chunk):
@@ -512,72 +521,54 @@ class RenderLoop:
                   f"audio duration: {pcm_duration:.2f}s, "
                   f"lip duration: {duration_s:.2f}s")
 
-    def _get_audio_elapsed(self) -> float:
-        """Get elapsed audio playback time in seconds using wall-clock."""
-        if self._audio_start_time <= 0:
-            return 0.0
-        return time.perf_counter() - self._audio_start_time
+    def _next_lip_frame(self) -> Optional[tuple]:
+        """Consume the next lip frame — FRAME-LOCKED audio (consumer-paced).
 
-    def _output_latency(self) -> float:
-        """Audio output latency (callback -> DAC), for lip-sync offset."""
-        ap = self.audio_player
-        if ap is None:
-            return 0.0
-        try:
-            lat = getattr(ap, 'output_latency_s', 0.0)
-        except Exception:
-            return 0.0
-        if isinstance(lat, (int, float)) and 0.0 < lat < 1.0:
-            return float(lat)
-        return 0.0
+        Called once per PRODUCED frame. Returns one of:
+          None                          — no audio stream active (idle mouth)
+          ('hold',)                     — inference behind: keep the idle
+                                          (closed) mouth this frame and
+                                          allocate NO audio chunk — the audio
+                                          waits for the lips (never lags)
+          ('play', coeff, idx, first,   — advance: coeff[idx] for the frame,
+                 chunk)                   chunk[idx] rides the frame's meta;
+                                          first=True only on the first
+                                          advancing frame after a push
+                                          (carries the player reset marker);
+                                          chunk=None on the post-speech hold
 
-    def _buffer_latency_s(self) -> float:
-        """Forward-looking latency introduced by the output buffer.
-
-        Frames are displayed ~depth/fps seconds after they are produced, so
-        lip coefficients are chosen for the audio position at display time.
+        The OutputStreamer pushes chunk[idx] to the player at DISPLAY time
+        (its precision 40ms clock), so audio position ≡ displayed-frame
+        position ≡ lip position by construction. The old wall-clock scheme
+        (audio free-runs on the device, lips chase it via elapsed-time
+        compensation) froze/zeroed the lips whenever inference lagged —
+        the 1-2s desync this replaces.
         """
-        if self.frame_buffer is None:
-            return 0.0
-        depth = self.frame_buffer.depth
-        # Clamp to a small multiple of interval to avoid over-correction
-        # during fill / flush transient states.
-        max_depth = max(8, self.frame_buffer.capacity)
-        depth = min(depth, max_depth)
-        return depth / max(1, self.target_fps)
-
-    def _get_lip_coeff_for_current_audio(self) -> Optional[tuple]:
-        """Get the lip coefficient for the audio position at display time."""
         with self._audio_lock:
             if self._lip_coeffs is None or self._total_lip_frames == 0:
                 return None
-
-            # Compensate for DAC latency and buffer depth so the lip shape
-            # matches the audio when the frame is actually displayed.
-            elapsed = (self._get_audio_elapsed()
-                       - self._output_latency()
-                       - self._buffer_latency_s())
-            if elapsed < 0:
-                elapsed = 0.0
-
-            audio_end = self._total_lip_frames / self.target_fps
-            if elapsed > audio_end + self.AUDIO_END_GRACE_S:
+            nxt = self._last_rendered_lip_idx + 1
+            total = self._total_lip_frames
+            if nxt >= total + self._audio_hold_frames:
+                # speech finished and the hold window elapsed → back to idle
                 self._lip_coeffs = None
-                self._lip_filled = 0
+                self._audio_chunks = None
                 return None
-
-            frame_idx = int(elapsed * self.target_fps)
-            frame_idx = max(0, frame_idx)
-            if frame_idx >= self._total_lip_frames:
-                frame_idx = self._total_lip_frames - 1
-
-            filled = self._lip_filled if self._lip_filled > 0 else self._total_lip_frames
-            if frame_idx >= filled:
-                frame_idx = filled - 1
-            if frame_idx < 0:
-                return None
-
-            return (self._lip_coeffs[frame_idx:frame_idx + 1], frame_idx)
+            if nxt >= total:
+                # speech ended — hold the final mouth shape ~1s (no audio)
+                self._last_rendered_lip_idx = nxt
+                return ('play', self._lip_coeffs[total - 1:total],
+                        total - 1, False, None)
+            if nxt >= self._lip_filled:
+                # progressive inference behind this frame: HOLD — no advance,
+                # no chunk (the audio will wait for the lips)
+                return ('hold',)
+            self._last_rendered_lip_idx = nxt
+            first = self._audio_arm_start
+            self._audio_arm_start = False
+            chunk = (self._audio_chunks[nxt]
+                     if self._audio_chunks is not None else None)
+            return ('play', self._lip_coeffs[nxt:nxt + 1], nxt, first, chunk)
 
     def _pad_mel_chunk(self, mel_rows: torch.Tensor) -> torch.Tensor:
         """Pad a mel chunk [n, 1, 80, 16] to the fixed inference batch size."""
@@ -705,12 +696,22 @@ class RenderLoop:
         total = character_data.total_frames
         video_idx = self._video_idx(total)
 
-        # Pick lip coefficient: audio-driven or idle
-        lip_result = self._get_lip_coeff_for_current_audio()
-        if lip_result is not None:
-            alpha_D_lip, lip_idx = lip_result
-        else:
+        # Pick lip coefficient: frame-locked audio consumption or idle.
+        # The consumed frame's audio chunk rides the frame meta — the
+        # OutputStreamer pushes it to the player at display time, so the
+        # audio position IS the displayed lip position (never lags).
+        audio_meta = None
+        lip_result = self._next_lip_frame()
+        if lip_result is None:
             alpha_D_lip = self._get_idle_lip_coeff()
+        elif lip_result[0] == 'hold':
+            # Progressive inference behind this frame: closed mouth, no
+            # chunk allocated — the audio waits for the lips.
+            alpha_D_lip = self._get_idle_lip_coeff()
+        else:
+            _, alpha_D_lip, _lip_idx, first, chunk = lip_result
+            if chunk is not None:
+                audio_meta = {'audio': chunk, 'audio_start': bool(first)}
 
         # Load frame data (never blocks on batch I/O)
         character_data.ensure_loaded(video_idx)
@@ -771,21 +772,14 @@ class RenderLoop:
         else:
             composited = orifra
 
-        # Build metadata for the consumer. The marker is only CLEARED after
-        # a successful put — a failure between marker-read and put (or in
-        # the put itself) must not orphan the pending PCM (ENG F4a).
-        frame_meta = None
-        with self._pending_lock:
-            if self._pending_audio_start:
-                frame_meta = {'audio_start': True}
+        # Frame meta: the audio chunk rides the frame — the OutputStreamer
+        # pushes it at display time (frame-locked sync; no wall clock).
+        frame_meta = audio_meta
 
         # Push into the output buffer (blocking when full — backpressure)
         t_put_0 = time.perf_counter()
         if self.frame_buffer is not None:
             self.frame_buffer.put(composited, meta=frame_meta)
-        if frame_meta is not None:
-            with self._pending_lock:
-                self._pending_audio_start = False
         timings['put'] = (time.perf_counter() - t_put_0) * 1000.0
 
         timings['total'] = (time.perf_counter() - t_total_0) * 1000.0

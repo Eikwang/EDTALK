@@ -371,12 +371,11 @@ def setup_service(config: Config, no_unitycapture: bool = False,
     render_loop = RenderLoop(target_fps=config.target_fps)
     render_loop.set_character_data(character_data)
 
-    # Create output streamer
+    # Create output streamer (frame-locked audio sink wired by the facade)
     output_streamer = OutputStreamer(
         frame_buffer=frame_buffer,
         target_fps=config.target_fps,
         sender=sender_fn,
-        audio_start_callback=None,  # wired below after audio_player exists
         preroll_frames=config.preroll_frames
     )
 
@@ -402,21 +401,6 @@ def setup_service(config: Config, no_unitycapture: bool = False,
     # when the schedule starts elsewhere, e.g. --segments 22 55).
     if scheduler_sequence:
         render_loop.set_segment_sequence(scheduler_sequence, mode=scheduler_mode)
-
-    # Audio-start callback: triggered by OutputStreamer at display time.
-    def _audio_start_callback():
-        pcm = None
-        with render_loop._pending_lock:
-            pcm = render_loop._pending_pcm
-            render_loop._pending_pcm = None
-        if pcm is not None and audio_player is not None:
-            audio_player.reset()
-            audio_player.push_pcm(pcm)
-            with render_loop._audio_lock:
-                render_loop._audio_start_time = time.perf_counter()
-            print("[OutputStreamer] Audio playback started at display time")
-
-    output_streamer.audio_start_callback = _audio_start_callback
 
     print("\nService initialized successfully!")
     print("-" * 60)

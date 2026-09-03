@@ -144,8 +144,15 @@ curl -X POST http://127.0.0.1:8000/repair/params -H "Content-Type: application/j
 
 ### 推音频后嘴型延迟
 
-- 阶段 1 已做缓冲深度前视补偿 + DAC 延迟补偿。
-- 若仍感觉不同步，检查 `AudioPlayer.output_latency_s` 是否被正确估计。
+- **同步机制（2026-09-03 重构：消费端帧锁定）**：音频按 640 采样/帧切片随帧出，
+  OutputStreamer 在**展示该帧的时刻**推给播放器——音频位置 ≡ 展示帧位置 ≡ 唇形
+  位置（按构造锁定）。口型领先量 = DAC 延迟（~20-40ms ≤ 100ms），**绝不滞后**。
+- 推理未就绪时音频自动等待（HOLD：闭嘴、不分配音频块），推理补上后从断点继续
+  推进——不跳帧、不重复。
+- 旧墙钟追音频机制（elapsed + `_buffer_latency_s`/`_output_latency` 补偿）已删除。
+- 若仍感觉不同步：检查音频输出设备延迟是否异常（`AudioPlayer.output_latency_s`
+  平滑值，正常 < 0.1s）；underrun 重发帧不推音频属预期（音画同步停顿）。
+- 音频感知的段边界切换（播完当前音频再切）为待办，见 `TODOS.md`。
 
 ### 无摄像头模式测试
 

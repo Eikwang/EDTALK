@@ -11,8 +11,10 @@ Provides two core components:
 2. OutputStreamer — the single pacing clock that consumes frames from the
    FrameBuffer and forwards them to the video sink at a steady target FPS.
    - Exists unconditionally, even when no virtual camera is available.
-   - Triggers an optional audio_start callback when the first frame of a
-     new audio segment reaches the display point.
+   - FRAME-LOCKED AUDIO: each displayed frame carries its 640-sample audio
+     chunk in meta; the streamer pushes it to the audio player at display
+     time — audio position ≡ displayed lip position by construction (the
+     audio waits for the lips when inference is behind, never the reverse).
    - Re-sends the previous frame on underrun and counts occurrences.
    - Limits catch-up rate to avoid bursts after a preroll / recovery window.
 """
@@ -206,9 +208,9 @@ class OutputStreamer:
         target_fps: Output frame rate. Also used to compute backfill limits.
         sender: Callable that receives a BGR frame, or None if no sink.
                 When None frames are dropped after accounting.
-        audio_start_callback: Optional callable invoked once when the frame
-                              marked as the start of a new audio segment is
-                              popped for display.
+        audio_player: Frame-locked audio sink — the 640-sample chunk riding
+                      each displayed frame's meta is pushed here at display
+                      time (audio position ≡ displayed lip position).
         preroll_frames: Frames required in the buffer before output starts.
                         A value of 0 disables preroll.
     """
@@ -220,7 +222,7 @@ class OutputStreamer:
                  frame_buffer: FrameBuffer,
                  target_fps: int = 25,
                  sender: Optional[Callable[[np.ndarray], bool]] = None,
-                 audio_start_callback: Optional[Callable[[], None]] = None,
+                 audio_player: Optional[Any] = None,
                  preroll_frames: int = 4):
         if target_fps <= 0:
             raise ValueError(f"target_fps must be positive, got {target_fps}")
@@ -228,7 +230,9 @@ class OutputStreamer:
         self.target_fps = target_fps
         self.interval = 1.0 / target_fps
         self.sender = sender
-        self.audio_start_callback = audio_start_callback
+        # Frame-locked audio sink (E-sync): receives the 640-sample chunk of
+        # each displayed frame — audio position ≡ displayed lip position.
+        self.audio_player = audio_player
         self.preroll_frames = max(0, min(preroll_frames, frame_buffer.capacity))
 
         self._running = False
@@ -347,14 +351,19 @@ class OutputStreamer:
             frame, meta = item if item is not None else (None, None)
 
             if frame is not None:
-                # Audio-start marker: trigger callback exactly once at display time.
-                if meta and meta.get('audio_start') and self.audio_start_callback:
+                # Frame-locked audio (E-sync): push this display tick's audio
+                # chunk NOW — audio position ≡ displayed lip position, with
+                # only the DAC latency (~20-40ms) between them. audio_start
+                # clears any stale audio from the previous segment first.
+                if meta and self.audio_player is not None:
                     try:
-                        self.audio_start_callback()
+                        if meta.get('audio_start'):
+                            self.audio_player.reset()
+                        chunk = meta.get('audio')
+                        if chunk is not None:
+                            self.audio_player.push_pcm(chunk)
                     except Exception as e:
-                        print(f"[OutputStreamer] audio_start callback error: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        print(f"[OutputStreamer] audio push error: {e}")
 
                 if self.sender is not None:
                     try:

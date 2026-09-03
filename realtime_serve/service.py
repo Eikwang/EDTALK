@@ -21,7 +21,6 @@
 """
 import math
 import threading
-import time
 from typing import Optional
 
 import numpy as np
@@ -134,7 +133,7 @@ class RealtimeService:
         self._lifecycle_lock = threading.Lock()
         self._started = False
         self._stopped = False
-        self._wire_audio_start_callback()
+        self._wire_audio_player()
 
     # ------------------------------------------------------------------
     # Lifecycle（M12：次序复刻 main.py——streamer 先于渲染线程）
@@ -437,22 +436,9 @@ class RealtimeService:
             raise RuntimeError("character_data 未初始化")
         return cd
 
-    def _wire_audio_start_callback(self) -> None:
-        """Audio playback triggered by OutputStreamer at display time
-        (moved verbatim from main.py — the facade owns the wiring)."""
-        rl = self.render_loop
-        player = self.audio_player
-
-        def _audio_start_callback():
-            pcm = None
-            with rl._pending_lock:
-                pcm = rl._pending_pcm
-                rl._pending_pcm = None
-            if pcm is not None and player is not None:
-                player.reset()
-                player.push_pcm(pcm)
-                with rl._audio_lock:
-                    rl._audio_start_time = time.perf_counter()
-                print("[OutputStreamer] Audio playback started at display time")
-
-        self.output_streamer.audio_start_callback = _audio_start_callback
+    def _wire_audio_player(self) -> None:
+        """Frame-locked audio sink wiring (E-sync): the OutputStreamer pushes
+        each displayed frame's 640-sample chunk to the player at display
+        time — audio position ≡ displayed lip position (lead = DAC latency
+        only, ≤ ~40ms; the audio waits for the lips, never the reverse)."""
+        self.output_streamer.audio_player = self.audio_player
