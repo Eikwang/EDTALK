@@ -537,8 +537,13 @@ class CharacterDataPack:
         gd = data.get('gaze_data')
         if gd is None:
             return None
-        return {k: gd[k][idx % data['total_frames']]
-                for k in ('state', 'l_center', 'r_center', 'eye_size')}
+        i = idx % data['total_frames']
+        return {
+            'state': gd['state'][i],
+            'l_center': gd['l_center'][i],
+            'r_center': gd['r_center'][i],
+            'eye_size': gd['eye_size'],  # segment-level scalar
+        }
 
     def _get_segment_paths(self, segment: str) -> dict:
         """Get paths for a specific segment."""
