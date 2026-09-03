@@ -40,7 +40,7 @@ class ModelManager:
     """
 
     def __init__(self, model_path: str, audio2lip_model_path: str, device: str = 'cuda',
-                 use_fp16: bool = True):
+                 use_fp16: bool = False):
         """Initialize ModelManager.
 
         Args:
@@ -48,8 +48,8 @@ class ModelManager:
             audio2lip_model_path: Path to Audio2Lip model weights
             device: Device to load models on ('cuda' or 'cpu')
             use_fp16: Run Generator inference under fp16 autocast (CUDA only).
-                      Halves Generator latency in practice; disable with
-                      --no-gen-fp16 if output quality regresses.
+                      Default False: measured SLOWER than fp32+TF32 on
+                      RTX 4080 SUPER (see config.gen_fp16 note).
         """
         self.model_path = model_path
         self.audio2lip_model_path = audio2lip_model_path

@@ -190,6 +190,19 @@ def create_app() -> FastAPI:
             status["underruns"] = streamer_stats.get('underruns', 0)
             status["preroll_state"] = streamer_stats.get('preroll_state', 'unknown')
 
+        if render_loop is not None and getattr(render_loop, 'gaze_corrector', None) is not None:
+            gc = render_loop.gaze_corrector
+            status["gaze_state"] = render_loop.gaze_mode
+            status["gaze_graph"] = 'captured' if gc._graph_ready else 'eager'
+            status["gaze_frames"] = {
+                'corrected': gc.corrected_frames,
+                'blink_skips': gc.blink_skips,
+                'nan_skips': gc.nan_skips,
+                'error_skips': gc.error_skips,
+            }
+        else:
+            status["gaze_state"] = "off"
+
         # Deprecated alias kept for one version.
         status["fps"] = status["output_fps"]
 

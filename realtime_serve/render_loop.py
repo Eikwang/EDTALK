@@ -73,6 +73,8 @@ class RenderLoop:
         self.compositor = None
         self.face_repair = None
         self.face_repair_mode: str = 'off'  # 'off' | 'on' | 'adaptive'
+        self.gaze_corrector = None
+        self.gaze_mode: str = 'off'  # 'off' | 'on' | 'adaptive'
         self.audio_player = None
 
         # Video clock: wall-clock anchored position in the segment.
@@ -104,6 +106,7 @@ class RenderLoop:
         self._timing_window = 240
         self._timings = {
             'gen': [],
+            'gaze': [],
             'comp': [],
             'repair': [],
             'put': [],
@@ -131,6 +134,8 @@ class RenderLoop:
             if ok:
                 self._video_start_time = time.perf_counter()
                 self._flush_buffer()
+                if self.gaze_corrector is not None:
+                    self.gaze_corrector.reset()
             return ok
 
     def start(self):
@@ -404,11 +409,24 @@ class RenderLoop:
         # download happens once, after repair, below.
         rendered_gpu_chw = None
         t_gen_0 = time.perf_counter()
+        rendered_c = None
         if self.model_manager is not None and cropped is not None and alpha_D_lip is not None:
             rendered = self.model_manager.infer_frame(cropped, alpha_D_lip, cropped)
-            rendered_post = rendered.clamp(-1, 1)
-            rendered_post = (rendered_post[0] * 127.5 + 127.5).to(torch.uint8)
+            rendered_c = rendered.clamp(-1, 1)
+
+            # Gaze correction on the rendered output (Route C', GPU-inline).
+            # Must run AFTER the generator (it erases input-side corrections)
+            # and BEFORE the compositor (mask includes eye regions).
+            if self.gaze_corrector is not None and self._gaze_allowed():
+                t_gaze_0 = time.perf_counter()
+                rendered_c = self.gaze_corrector.correct(
+                    rendered_c[0], facemark).unsqueeze(0)
+                timings['gaze'] = (time.perf_counter() - t_gaze_0) * 1000.0
+
+            rendered_post = (rendered_c[0] * 127.5 + 127.5).to(torch.uint8)
             rendered_gpu_chw = rendered_post[[2, 1, 0], :, :].contiguous()
+        if 'gaze' not in timings:
+            timings['gaze'] = 0.0
         timings['gen'] = (time.perf_counter() - t_gen_0) * 1000.0
 
         # CPU prep: resolve mask and resize ori crop for blending.
@@ -479,6 +497,19 @@ class RenderLoop:
             return True
         return self.frame_buffer.depth >= self.REPAIR_MIN_BUFFER
 
+    def _gaze_allowed(self) -> bool:
+        """Whether gaze correction may run on this frame (adaptive mode).
+
+        Gaze costs ~2-3ms/frame of GPU work; adaptive shares the repair
+        headroom threshold (REPAIR_MIN_BUFFER) — at that depth production
+        is comfortably ahead of the 25fps output line.
+        """
+        if self.gaze_mode != 'adaptive':
+            return True
+        if self.frame_buffer is None:
+            return True
+        return self.frame_buffer.depth >= self.REPAIR_MIN_BUFFER
+
     def _record_timings(self, timings: dict):
         """Append timings to rolling histogram."""
         with self._timing_lock:
@@ -494,7 +525,7 @@ class RenderLoop:
             if not self._timings['total']:
                 return ""
             parts = []
-            for key in ['gen', 'comp', 'repair', 'put', 'total']:
+            for key in ['gen', 'gaze', 'comp', 'repair', 'put', 'total']:
                 vals = self._timings[key]
                 if not vals:
                     continue

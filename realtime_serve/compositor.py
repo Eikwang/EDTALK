@@ -45,8 +45,11 @@ class MouthCompositor:
     JAW_IDS = list(range(0, 17))           # face contour
     NOSE_ALAR_IDS = list(range(31, 36))    # nose bottom / alar
     OUTER_LIP_IDS = list(range(48, 60))    # outer lip contour
+    L_EYE_IDS = list(range(36, 42))        # left eye contour
+    R_EYE_IDS = list(range(42, 48))        # right eye contour
 
-    def __init__(self, blur_px: int = 7, landmark_smooth: float = 0.3):
+    def __init__(self, blur_px: int = 7, landmark_smooth: float = 0.3,
+                 eyes_enabled: bool = False):
         """Initialize MouthCompositor.
 
         Args:
@@ -56,9 +59,15 @@ class MouthCompositor:
                              0 = no smoothing (use raw landmarks each frame)
                              0.3 = moderate smoothing (default, good anti-flicker)
                              1.0 = frozen (never updates from first frame)
+            eyes_enabled: Include the eye regions in the paste-back mask.
+                          Required for gaze correction to reach the output
+                          frame (the rendered eye replaces the orifra eye
+                          when enabled). When False the mask is mouth-only
+                          and the output eyes are the original video's.
         """
         self.blur_px = blur_px if blur_px % 2 == 1 else blur_px + 1
         self.landmark_smooth = landmark_smooth
+        self.eyes_enabled = eyes_enabled
 
         # EMA-smoothed facemark (in 256x256 space), persists across frames
         self._smoothed_facemark: np.ndarray | None = None
@@ -215,6 +224,25 @@ class MouthCompositor:
         prepared = self.prepare_crop(orifra_frame, meta)
         return self.blend(orifra_frame, rendered_frame_256, mask_256, prepared)
 
+    def set_eyes_enabled(self, enabled: bool) -> None:
+        """Toggle eye regions in the paste-back mask.
+
+        Invalidates the cached mask; the caller must recompute the preloaded
+        batch masks (CharacterDataPack.set_eyes_enabled wires this).
+        """
+        if self.eyes_enabled == enabled:
+            return
+        self.eyes_enabled = enabled
+        with self._state_lock:
+            self._cached_mask = None
+            self._cached_mask_facemark = None
+
+    @staticmethod
+    def _expand_pts(pts: np.ndarray, factor: float) -> np.ndarray:
+        """Expand a point set outward from its centroid (hull pre-scaling)."""
+        center = pts.mean(axis=0)
+        return center + (pts - center) * factor
+
     def _smooth_landmarks(self, facemark_256: np.ndarray) -> np.ndarray:
         """Apply EMA smoothing to facemark landmarks to prevent edge flickering.
 
@@ -316,6 +344,35 @@ class MouthCompositor:
             # Apply smoothstep for smoother falloff
             alpha = alpha * alpha * (3.0 - 2.0 * alpha)
             mask[transition_zone] = alpha
+
+        # --- Eye regions (gaze correction paste-back) ---
+        if self.eyes_enabled:
+            for eye_ids in (self.L_EYE_IDS, self.R_EYE_IDS):
+                eye_pts = facemark[eye_ids].astype(np.float32)
+                eye_inner = cv2.convexHull(
+                    self._expand_pts(eye_pts, 1.2)).astype(np.int32)
+                eye_outer = cv2.convexHull(
+                    self._expand_pts(eye_pts, 1.7)).astype(np.int32)
+                eye_inner_mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillPoly(eye_inner_mask, [eye_inner], 255)
+                eye_outer_mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.fillPoly(eye_outer_mask, [eye_outer], 255)
+
+                d_in = cv2.distanceTransform(
+                    255 - eye_inner_mask, cv2.DIST_L2, 5).astype(np.float32)
+                d_out = cv2.distanceTransform(
+                    eye_outer_mask, cv2.DIST_L2, 5).astype(np.float32)
+
+                eye_mask = np.zeros((height, width), dtype=np.float32)
+                eye_mask[eye_inner_mask > 0] = 1.0
+                zone = (eye_inner_mask == 0) & (eye_outer_mask > 0)
+                if np.any(zone):
+                    di = d_in[zone]
+                    do = d_out[zone]
+                    a = do / np.maximum(di + do, 1e-6)
+                    a = a * a * (3.0 - 2.0 * a)
+                    eye_mask[zone] = a
+                np.maximum(mask, eye_mask, out=mask)
 
         # --- Gaussian blur for sub-pixel smoothness ---
         if self.blur_px > 1:

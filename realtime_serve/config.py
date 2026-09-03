@@ -18,7 +18,9 @@ class Config:
     batch_size: int = 100  # frames per preload batch (window = 2 × batch_size)
     face_repair_enabled: bool = True  # enable face repair post-processing
     face_repair_mode: str = 'off'  # 'off' | 'on' | 'adaptive' (repair only with buffer headroom)
-    gaze_correction_enabled: bool = False  # enable gaze correction (placeholder)
+    gaze_mode: str = 'off'  # 'off' | 'on' | 'adaptive' (gaze correction on rendered output)
+    gaze_convergence: float = 0.05  # convergence angle [-1,1] space (dynamic via set_convergence)
+    gaze_ckpt: str = 'realtime_serve/weights/current_model.ckpt'  # gaze model weights
     buffer_frames: int = 16  # output frame buffer capacity (frames, ~11MB each)
     preroll_frames: int = 8  # frames required before output starts
     # Generator fp16 autocast: DISABLED by default. Measured negative on
@@ -45,6 +47,14 @@ class Config:
             raise ValueError(
                 f"face_repair_mode must be 'off', 'on' or 'adaptive', "
                 f"got '{self.face_repair_mode}'"
+            )
+        if self.gaze_mode not in ('off', 'on', 'adaptive'):
+            raise ValueError(
+                f"gaze_mode must be 'off', 'on' or 'adaptive', got '{self.gaze_mode}'"
+            )
+        if not (-1.0 <= self.gaze_convergence <= 1.0):
+            raise ValueError(
+                f"gaze_convergence must be within [-1, 1], got {self.gaze_convergence}"
             )
 
         if self.buffer_frames < 1:

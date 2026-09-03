@@ -12,6 +12,7 @@ Important semantic change:
     output pacing from rendering jitter.
 """
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -32,6 +33,7 @@ from realtime_serve.audio_processor import AudioProcessor
 from realtime_serve.compositor import MouthCompositor
 from realtime_serve.face_repair import FaceRepair
 from realtime_serve.audio_player import AudioPlayer
+from realtime_serve.gaze_correction import GazeCorrector
 from realtime_serve.output_buffer import FrameBuffer, OutputStreamer
 from realtime_serve.api.app import create_app as create_api_app
 
@@ -46,6 +48,7 @@ audio_buffer: AudioBuffer = None
 audio_processor: AudioProcessor = None
 compositor: MouthCompositor = None
 face_repair: FaceRepair = None
+gaze_corrector = None
 audio_player: AudioPlayer = None
 character_data: CharacterDataPack = None
 api_app: FastAPI = None
@@ -116,8 +119,25 @@ def parse_args():
     )
     parser.add_argument(
         "--gaze-correction",
-        action="store_true",
-        help="Enable gaze correction (placeholder)"
+        nargs="?",
+        const="on",
+        default="off",
+        choices=["off", "on", "adaptive"],
+        help="Gaze correction mode. 'on': every frame. 'adaptive': only when "
+             "the output buffer has headroom. Bare flag = on (backward "
+             "compatible). Default off — output eyes are the original video's."
+    )
+    parser.add_argument(
+        "--gaze-convergence",
+        type=float,
+        default=0.05,
+        help="Gaze convergence angle in [-1,1] (default 0.05). Tune per "
+             "character material; negative values diverge."
+    )
+    parser.add_argument(
+        "--gaze-ckpt",
+        default="realtime_serve/weights/current_model.ckpt",
+        help="Path to the gaze generator checkpoint"
     )
     parser.add_argument(
         "--gen-fp16",
@@ -167,6 +187,8 @@ def setup_service(config: Config, no_unitycapture: bool = False):
     print(f"\n[Config] target_fps={config.target_fps} output pacing only")
     print(f"[Config] buffer_frames={config.buffer_frames} (~{memory_mb}MB)")
     print(f"[Config] preroll_frames={config.preroll_frames} (~{preroll_s:.2f}s startup delay)")
+    print(f"[Config] face_repair={config.face_repair_mode}  "
+          f"gaze={config.gaze_mode} (convergence={config.gaze_convergence})")
 
     # 1. Load character data
     print(f"\n[1/7] Loading character data: {config.character_dir}...")
@@ -204,10 +226,28 @@ def setup_service(config: Config, no_unitycapture: bool = False):
     else:
         print("\n[4/7] Face repair disabled")
 
-    # 5. Initialize compositor
+    # 5. Initialize compositor (+ eye paste-back regions when gaze enabled)
     print("\n[5/7] Initializing mouth compositor...")
     compositor = MouthCompositor(blur_px=7, landmark_smooth=0.3)
     character_data.set_compositor(compositor)
+
+    # 5b. Gaze corrector (Route C': corrects the rendered output AFTER the
+    # generator — input-side corrections are erased by the redraw. The
+    # compositor mask gains eye regions so corrected eyes reach the frame.)
+    gaze_corrector = None
+    if config.gaze_mode != 'off':
+        if not os.path.exists(config.gaze_ckpt):
+            raise FileNotFoundError(
+                f"gaze checkpoint not found: {config.gaze_ckpt} — required by "
+                f"--gaze-correction {config.gaze_mode}. Check the path or run "
+                f"with the default --gaze-correction off.")
+        print(f"[5b] Initializing gaze corrector (mode: {config.gaze_mode}, "
+              f"convergence: {config.gaze_convergence})...")
+        gaze_corrector = GazeCorrector(config.gaze_ckpt,
+                                       convergence_h=config.gaze_convergence)
+        captured = gaze_corrector.try_capture_graph()
+        print(f"[5b] gaze CUDA graph: {'captured' if captured else 'eager fallback'}")
+        character_data.set_eyes_enabled(True)
 
     # 6. Initialize output buffer and streamer
     print("\n[6/7] Initializing output buffer and streamer...")
@@ -266,6 +306,8 @@ def setup_service(config: Config, no_unitycapture: bool = False):
     render_loop.compositor = compositor
     render_loop.face_repair = face_repair
     render_loop.face_repair_mode = config.face_repair_mode
+    render_loop.gaze_corrector = gaze_corrector
+    render_loop.gaze_mode = config.gaze_mode
     render_loop.audio_player = audio_player
 
     # Audio-start callback: triggered by OutputStreamer at display time.
@@ -288,7 +330,7 @@ def setup_service(config: Config, no_unitycapture: bool = False):
 
     return (model_manager, render_loop, output_streamer, frame_buffer,
             unity_capture, audio_buffer, audio_processor, compositor,
-            face_repair, audio_player, character_data)
+            face_repair, audio_player, character_data, gaze_corrector)
 
 
 def main():
@@ -310,7 +352,9 @@ def main():
         batch_size=args.batch_size,
         face_repair_enabled=(repair_mode != 'off'),
         face_repair_mode=repair_mode,
-        gaze_correction_enabled=args.gaze_correction,
+        gaze_mode=args.gaze_correction,
+        gaze_convergence=args.gaze_convergence,
+        gaze_ckpt=args.gaze_ckpt,
         buffer_frames=args.buffer_frames,
         preroll_frames=args.preroll_frames,
         gen_fp16=args.gen_fp16
@@ -322,13 +366,13 @@ def main():
     # Setup service components
     global model_manager, render_loop, output_streamer, frame_buffer
     global unity_capture, audio_buffer, audio_processor, compositor
-    global face_repair, audio_player, character_data, api_app
+    global face_repair, audio_player, character_data, api_app, gaze_corrector
 
     try:
         result = setup_service(config, no_unitycapture=args.no_unitycapture)
         (model_manager, render_loop, output_streamer, frame_buffer,
          unity_capture, audio_buffer, audio_processor, compositor,
-         face_repair, audio_player, character_data) = result
+         face_repair, audio_player, character_data, gaze_corrector) = result
     except Exception as e:
         print(f"\nError initializing service: {e}")
         _set_timer_resolution(False)

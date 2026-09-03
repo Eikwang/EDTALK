@@ -509,6 +509,19 @@ class CharacterDataPack:
         # Recompute masks for already-loaded frames
         self._preloader.recompute_current_masks()
 
+    def set_eyes_enabled(self, enabled: bool):
+        """Toggle eye regions in the precomputed paste-back masks.
+
+        Required for gaze correction: with eyes enabled the rendered eye
+        regions are pasted back onto the original frame. Recomputes the
+        current batch's masks synchronously (fast, ~10ms per 100 frames).
+        """
+        compositor = self._preloader._compositor
+        if compositor is None:
+            return
+        compositor.set_eyes_enabled(enabled)
+        self._preloader.recompute_current_masks()
+
     def _get_segment_paths(self, segment: str) -> dict:
         """Get paths for a specific segment."""
         return {

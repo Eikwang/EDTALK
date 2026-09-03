@@ -23,6 +23,9 @@
 | `--no-face-repair` | 默认 | - | 关闭面部修复（推荐，输出最流畅） |
 | `--face-repair on` | - | - | 每帧修复。已改为 **GPU 内联（IOBinding 零拷贝）**，消除了每帧两次 GPU↔CPU 往返；但 GPU 推理本身 ~6-7ms 仍在，产能紧张时仍建议关闭 |
 | `--face-repair adaptive` | - | - | 自适应：仅当输出缓冲深度 ≥6 帧（产能有余量）时修复，紧张时自动跳过。GPU 内联模式下推荐此项 |
+| `--gaze-correction` | off | - | 视线纠正三态：裸 flag=on（向后兼容）、off/on/adaptive。开启后 **compositor mask 扩展双眼区域**——输出眼睛变为 Generator 渲染的纠正眼（off 时为原视频原生眼） |
+| `--gaze-convergence` | 0.05 | [-1,1] | 收敛角。素材人物坐姿/朝向不同时可调整；负值发散。运行时改需重启（阶段 1） |
+| `--gaze-ckpt` | weights/current_model.ckpt | 路径 | gaze 生成器权重 |
 | `--no-unitycapture` | - | - | 无虚拟摄像头时仍可运行；OutputStreamer 正常 pacing |
 | `--gen-fp16` | 关闭 | - | 开启 Generator fp16 推理。**默认关闭**：实测在 RTX 4080 SUPER 上慢于 fp32+TF32（TF32 已覆盖 Ada 的大部分半精度收益，autocast 只剩 cast 开销） |
 
@@ -69,6 +72,25 @@ python -m realtime_serve.main --character-dir test_data/wy --no-unitycapture
 ```
 
 输出 pacing 和音频触发仍正常工作，只是不向摄像头送帧。
+
+### 视线纠正（gaze）排查
+
+开启命令：
+
+```bash
+python -m realtime_serve.main --character-dir wy --target-fps 25 --gaze-correction on
+```
+
+| 现象 | 诊断 | 对策 |
+|------|------|------|
+| 启动报 "gaze checkpoint not found" | 权重路径错误 | 检查 `--gaze-ckpt` 路径，或去掉 flag 用默认 off |
+| 眼睛无变化且 `gaze_frames.nan_skips` 持续增长 | 资产 facemark 全 NaN（Windows safe_mode 预处理产物） | 不带 `--safe_mode` 重跑预处理步骤 10 |
+| 眼睛偶尔不修正（`blink_skips` 增长） | 正常眨眼旁路 | 无需处理；素材本身眨眼少则该计数低 |
+| `gaze_graph: eager` | CUDA Graph 捕获失败（已回退 eager，略慢 ~1ms） | 无需处理；性能敏感时检查驱动 |
+| 开 gaze 后 repair 触发率下降 | 两者共享 buffer 余量门控（adaptive） | 对比 `gaze_frames.corrected` 与 `/status` repair 指标；必要时 gaze 用 on、repair 用 off 明确优先级 |
+
+架构说明：纠正作用于 **Generator 输出**（rendered 256，GPU 内联）——输入端纠正会被 Generator 重绘
+抹除（probe 实测 1.8x 噪声 vs rendered 端 29x）。mask 双眼区域随 `--gaze-correction` 开关自动启用/回退。
 
 ### 快速开始（跳过 preroll 的测试捷径）
 
