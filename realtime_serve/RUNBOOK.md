@@ -187,6 +187,45 @@ python -m realtime_serve.main --character-dir wy --target-fps 25 --gaze-correcti
 python -m realtime_serve.main --character-dir test_data/wy --preroll-frames=0
 ```
 
+## 单角色微调（Generator）操作手册（2026-09-04，wy2 验证通过）
+
+> 完整计划与根因分析见 `FINE_TUNE_FIX_PLAN.md`。wy1（旧配置）失败的教训与 wy2 成功的配方都在这里。
+
+### 成功配方（wy2 实测，全指标过评估门槛）
+
+```bash
+python train_fine_tune.py --datapath wy --exp_name wy2 --only_fine_tune_dec --iter 30000
+# 新默认已内置: lr 1e-4 / batch 4 / 四路采样(near±64 60%+self 10%+far 30%) /
+# held-out 末10%剔除 / 嘴区加权 vgg·l1 ×4 / GAN 全图 / ortho 0
+```
+
+**选型**：训练后用评估定版，不要默认取最后一个 ckpt —— D 过 14k 步即饱和，20k-40k 指标几乎持平，wy2 定版 `030000.pt`（40k 略差）。
+
+### 语义备忘（为什么是这些参数）
+
+- **`--only_fine_tune_dec` 是主模式**：冻结 enc/fc/direction 保住 Audio2Lip 接口与 pose 解耦。`lip_space/pose_space` 余弦损失在冻结配置下梯度为零（死代码）— 别照搬底模 step2 的损失清单。
+- **同帧自对 10% 是解耦的关键**：推理时 pose alpha 来自 source 自身（`render_loop.py:727`），训练必须显式覆盖这个恒等条件，否则 dec 的 pose 响应被重写 → 姿势漂移 → 贴回错位。
+- **GAN 不加权是结构决定的**：全图 Discriminator 单 logit 输出，无空间维度可加权；嘴区裁剪送 D 会破坏底模 dis 感受野。
+- **背景权重固定 1.0**：背景锚定压制 direction 膨胀；降背景权重会反噬背景 SSIM 门槛。
+
+### 评估流程（训练完必须跑，别凭目测定版）
+
+```bash
+python tools/eval_finetune.py --cand-ckpt ckpt_models/<exp>/checkpoint/<iter>.pt --num-frames 100
+```
+门槛（底模校准值见 `FINE_TUNE_FIX_PLAN.md` 第 4 节）：姿势 MAE ≤ 11.1px、贴回代理 ≤ 3.6px、背景 SSIM 降幅 ≤ 0.02、开合比 0.8-1.25。基线噪声底 ~0.3px。
+
+### 训练环境判读
+
+- **显存悬崖**：step 耗时突然 ×3 阶跃（如 782ms→2535ms）= WDDM 溢出共享内存指纹，不是线性变慢。batch≤4-6 安全区（batch4 实测 5.79GB only_dec / 12.03GB 三路编码），batch=8 禁区（15.05GB 贴 16GB 上限，大概率是历史崩溃的真凶）。
+- **D 饱和**：d loss 趋零（<0.001）从某步持续 → 对抗项失效，训练进入平台期，更长训练无收益。
+- **只加载自产 ckpt**：`torch.load(weights_only=False)`（ckpt 内嵌 args Namespace）是 pickle RCE 面 — 不要加载外部来源的 ckpt。
+- runtime312 环境的 tensorboard 曾出现"dist-info 在、包目录失"的半安装 — 修复：`python -m pip install --force-reinstall --no-deps tensorboard`。
+
+### 时间盒
+
+batch4 + 4080S：50k iter 计划约 5-6h；D 饱和后（~15-20k）进入平台期，30k 是经济截断点。若评估不过门槛：先查 `--gan_weight 0` 消融（D 过拟合干扰），仍不过再启动 cross_recon 锚定（计划 T6，需 `data_preprocess/mouth_transplant.py` 嘴部移植管线）。
+
 ## 回滚
 
 本阶段改动集中在 `realtime_serve/output_buffer.py` 和渲染管线。若需要回退，可用 git revert 最近一次提交。
