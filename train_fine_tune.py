@@ -225,7 +225,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--iter", type=int, default=800000)
     parser.add_argument("--size", type=int, default=256)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help='批大小 (默认 4; 实测 batch=8 含 VGG 峰值 15.05GB/16GB 已在 '
+                             'WDDM 溢出悬崖上 — 3.2x 耗时阶跃即溢出信号; batch=4 为 12.03GB 安全区)')
     parser.add_argument("--only_fine_tune_dec", action='store_true',
                         help='仅微调 Decoder (冻结 Encoder+Direction+fc)')
     parser.add_argument("--freeze_direction", action='store_true',
@@ -235,8 +237,9 @@ if __name__ == "__main__":
     parser.add_argument("--resume_ckpt", type=str, default='ckpts/EDTalk_lip_pose.pt')
     parser.add_argument("--datapath", type=str, required=True,
                         help='Dataset directory (must contain count/ subdirectory with frame images)')
-    parser.add_argument("--lr", type=float, default=0.001,
-                        help='学习率 (默认 0.0001, 较低 lr 减少对预训练权重的扰动)')
+    parser.add_argument("--lr", type=float, default=0.0001,
+                        help='学习率 (默认 0.0001; 底模训练用 0.002, 微调取其 1/20 '
+                             '减少对预训练权重的扰动)')
     parser.add_argument("--start_iter", type=int, default=0)
     parser.add_argument("--display_freq", type=int, default=1000)
     parser.add_argument("--save_freq", type=int, default=5000,
@@ -250,12 +253,19 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=str, default='12345')
     parser.add_argument("--num_workers", type=int, default=2,
                         help='DataLoader worker 进程数 (0=主线程加载)')
-    parser.add_argument("--direction_lr_ratio", type=float, default=5.0,
-                        help='Direction 模块学习率倍数 (无冻结训练时生效, 默认 5.0, 帮助 Direction 快速适应新数据)')
+    parser.add_argument("--direction_lr_ratio", type=float, default=1.0,
+                        help='Direction 模块学习率倍数 (仅全量微调且未冻结 Direction 时生效, '
+                             '默认 1.0; 历史 5.0 会快速改写 Direction 语义, 破坏与 Audio2Lip '
+                             '输出的接口一致性, 不建议调高)')
     parser.add_argument("--self_recon_weight", type=float, default=0.5,
                         help='自重建正则化权重 (默认 0.5, 防止 Decoder 跨身份训练时漂移; 0=禁用)')
     parser.add_argument("--same_identity_ratio", type=float, default=0.8,
                         help='同身份采样比例 (默认 0.8, 从同一视频选source/target帧; 0=全部跨身份)')
+    parser.add_argument("--ortho_weight", type=float, default=0.0,
+                        help='Direction 正交正则化权重 (默认 0.0 = 底模训练行为; '
+                             '底模 step2 无此项, 微调时不建议开启)')
+    parser.add_argument("--gan_weight", type=float, default=1.0,
+                        help='GAN 损失权重 (默认 1.0; 单人小数据集 D 过拟合劣化纹理时置 0 消融验证)')
 
     # deprecated params (backward compat, ignored)
     parser.add_argument("--warmup_iters", type=int, default=0, help=argparse.SUPPRESS)

@@ -143,17 +143,28 @@ class Trainer(nn.Module):
             self_recon_loss = torch.tensor(0.0, device=img_source.device)
 
         # ---- 计算损失 ----
-        img_recon_pred = dis_fwd(img_target_recon)
-
         vgg_loss = self.criterion_vgg(img_target_recon, img_target).mean()
         l1_loss = F.l1_loss(img_target_recon, img_target)
-        gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
+
+        # GAN 消融开关 (--gan_weight, 默认 1.0): 单人小数据集 D 过拟合劣化纹理时置 0;
+        # 置 0 时跳过 D 前向 (省一次判别器推理)
+        gan_weight = getattr(self.args, 'gan_weight', 1.0)
+        if gan_weight > 0:
+            img_recon_pred = dis_fwd(img_target_recon)
+            gan_g_loss = self.g_nonsaturating_loss(img_recon_pred)
+        else:
+            gan_g_loss = torch.tensor(0.0, device=img_source.device)
 
         # 正交正则化: 约束 Direction 权重矩阵保持正交性
-        # 防止微调过程中 lip/pose 方向纠缠导致背景变形
-        ortho_loss = gen_fwd.orthogonality_loss()
+        # 默认权重 0.0 — 底模 step2 训练无此项, 微调时开启会把 QR 基拉离底模几何;
+        # 仅全量微调且显式 --ortho_weight > 0 时才计算
+        ortho_weight = getattr(self.args, 'ortho_weight', 0.0)
+        if ortho_weight > 0:
+            ortho_loss = gen_fwd.orthogonality_loss()
+        else:
+            ortho_loss = torch.tensor(0.0, device=img_source.device)
 
-        g_loss = vgg_loss + l1_loss + gan_g_loss + 0.01 * ortho_loss + self_recon_weight * self_recon_loss
+        g_loss = vgg_loss + l1_loss + gan_weight * gan_g_loss + ortho_weight * ortho_loss + self_recon_weight * self_recon_loss
 
         g_loss.backward()
         self.g_optim.step()
