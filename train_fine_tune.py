@@ -93,6 +93,13 @@ def main(rank, world_size, args):
     )
 
     dataset = Finetune256(count_dir, transform=transform,
+                          facemark_dir=args.facemark_dir,
+                          near_window=args.near_window,
+                          near_ratio=args.near_ratio,
+                          self_ratio=args.self_ratio,
+                          far_ratio=args.far_ratio,
+                          held_out_ratio=args.held_out_ratio,
+                          mouth_weight=args.mouth_weight,
                           same_identity_ratio=args.same_identity_ratio)
 
     if args.distributed:
@@ -138,12 +145,14 @@ def main(rank, world_size, args):
             i = idx + args.start_iter
 
             # loading data
-            img_source, img_target = next(loader)
+            img_source, img_target, weight_map = next(loader)
             img_source = img_source.to(device, non_blocking=True)
             img_target = img_target.to(device, non_blocking=True)
+            weight_map = weight_map.to(device, non_blocking=True)
 
             # update generator
-            vgg_loss, l1_loss, gan_g_loss, img_recon = trainer.gen_update(img_source, img_target)
+            vgg_loss, l1_loss, gan_g_loss, img_recon = trainer.gen_update(
+                img_source, img_target, weight_map)
 
             # update discriminator
             gan_d_loss = trainer.dis_update(img_target, img_recon)
@@ -171,7 +180,7 @@ def main(rank, world_size, args):
                 # display 样本图: 从训练集随机抽样（覆盖所有视频）
                 try:
                     with torch.no_grad():
-                        img_test_source, img_test_target = next(loader)
+                        img_test_source, img_test_target, _w_test = next(loader)
                         img_test_source = img_test_source.to(device, non_blocking=True)
                         img_test_target = img_test_target.to(device, non_blocking=True)
 
@@ -259,8 +268,22 @@ if __name__ == "__main__":
                              '输出的接口一致性, 不建议调高)')
     parser.add_argument("--self_recon_weight", type=float, default=0.5,
                         help='自重建正则化权重 (默认 0.5, 防止 Decoder 跨身份训练时漂移; 0=禁用)')
-    parser.add_argument("--same_identity_ratio", type=float, default=0.8,
-                        help='同身份采样比例 (默认 0.8, 从同一视频选source/target帧; 0=全部跨身份)')
+    parser.add_argument("--same_identity_ratio", type=float, default=None,
+                        help=argparse.SUPPRESS)  # deprecated: 已由 near/self/far 四路采样取代
+    parser.add_argument("--near-window", type=int, default=64,
+                        help='时序近邻采样窗口 ±K 帧 (默认 64; 近邻对=姿势差小口型差大, 对齐推理分布)')
+    parser.add_argument("--near-ratio", type=float, default=0.6,
+                        help='时序近邻对采样比例 (默认 0.6)')
+    parser.add_argument("--self-ratio", type=float, default=0.1,
+                        help='同帧自对采样比例 (默认 0.1; 显式训练 pose alpha 来自自身的恒等条件)')
+    parser.add_argument("--far-ratio", type=float, default=0.3,
+                        help='跨视频远对采样比例 (默认 0.3; 保持 lip alpha 方差, 不低于 0.3)')
+    parser.add_argument("--held-out-ratio", type=float, default=0.1,
+                        help='每视频末 N 比例帧从训练采样池剔除 (默认 0.1; 与 eval_finetune 划分口径一致)')
+    parser.add_argument("--mouth-weight", type=float, default=4.0,
+                        help='嘴区损失权重 (默认 4.0; 仅作用于 vgg/l1, GAN 保持全图; 背景/脸部固定 1.0)')
+    parser.add_argument("--facemark-dir", type=str, default=None,
+                        help='facemark npy 目录 (默认 datapath 同级 facemark/; 行序=帧数字序, 行数不符 fail-fast)')
     parser.add_argument("--ortho_weight", type=float, default=0.0,
                         help='Direction 正交正则化权重 (默认 0.0 = 底模训练行为; '
                              '底模 step2 无此项, 微调时不建议开启)')

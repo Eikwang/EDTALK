@@ -85,7 +85,14 @@ class VGGLoss(nn.Module):
         self.vgg = Vgg19().cuda()
         self.weights = (10, 10, 10, 10, 10)
 
-    def forward(self, img_recon, img_real):
+    def forward(self, img_recon, img_real, weight_map=None):
+        """VGG pyramid 感知损失。
+
+        weight_map: 可选 (B,1,H,W) 区域权重（嘴区加权，FINE_TUNE_FIX_PLAN H）。
+        每尺度双线性下采样到特征图尺寸，加权后除以该尺度权重均值 —
+        归一化保证 weight_map≡1 时与未加权逐位一致（不改变总损失量纲，
+        不污染学习率/消融对照）。
+        """
         # recon path: needs gradients for G backward
         pyramid_recon = self.pyramid(img_recon)
 
@@ -102,7 +109,14 @@ class VGGLoss(nn.Module):
                 real_vgg = self.vgg(pyramid_real['prediction_' + str(scale)])
 
             for i, weight in enumerate(self.weights):
-                value = torch.abs(recon_vgg[i] - real_vgg[i]).mean()
+                diff = torch.abs(recon_vgg[i] - real_vgg[i])
+                if weight_map is not None:
+                    w = torch.nn.functional.interpolate(
+                        weight_map, size=diff.shape[-2:],
+                        mode='bilinear', align_corners=False)
+                    value = (diff * w).mean() / w.mean().clamp_min(1e-6)
+                else:
+                    value = diff.mean()
                 vgg_loss += value * self.weights[i]
 
         return vgg_loss

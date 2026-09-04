@@ -13,6 +13,13 @@ def requires_grad(net, flag=True):
         p.requires_grad = flag
 
 
+def weighted_l1(pred, target, w):
+    """嘴区加权 L1（方案 H）：除以权重均值保持量纲 — 权重全 1 时与
+    F.l1_loss 逐位一致（不污染学习率与消融对照）。GAN 不加权（全图
+    判别器无空间维度可加权 — 计划 H1 写死）。"""
+    return (((pred - target).abs()) * w).mean() / w.mean().clamp_min(1e-6)
+
+
 class Trainer(nn.Module):
     def __init__(self, args, device, rank=0):
         super(Trainer, self).__init__()
@@ -104,7 +111,7 @@ class Trainer(nn.Module):
         fake_loss = F.softplus(fake_pred)
         return real_loss.mean() + fake_loss.mean()
 
-    def gen_update(self, img_source, img_target):
+    def gen_update(self, img_source, img_target, weight_map=None):
         self.gen.train()
         self.gen.zero_grad()
 
@@ -138,13 +145,20 @@ class Trainer(nn.Module):
         if self_recon_weight > 0:
             latent_self = wa_t + directions
             recon_self = gen_fwd.dec(latent_self, None, feats_t)
-            self_recon_loss = F.l1_loss(recon_self, img_target)
+            self_recon_loss = (weighted_l1(recon_self, img_target, weight_map)
+                               if weight_map is not None
+                               else F.l1_loss(recon_self, img_target))
         else:
             self_recon_loss = torch.tensor(0.0, device=img_source.device)
 
         # ---- 计算损失 ----
-        vgg_loss = self.criterion_vgg(img_target_recon, img_target).mean()
-        l1_loss = F.l1_loss(img_target_recon, img_target)
+        # vgg/l1 嘴区加权（方案 H）；GAN 保持全图（计划 H1）
+        if weight_map is not None:
+            vgg_loss = self.criterion_vgg(img_target_recon, img_target, weight_map).mean()
+            l1_loss = weighted_l1(img_target_recon, img_target, weight_map)
+        else:
+            vgg_loss = self.criterion_vgg(img_target_recon, img_target).mean()
+            l1_loss = F.l1_loss(img_target_recon, img_target)
 
         # GAN 消融开关 (--gan_weight, 默认 1.0): 单人小数据集 D 过拟合劣化纹理时置 0;
         # 置 0 时跳过 D 前向 (省一次判别器推理)
