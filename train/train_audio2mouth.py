@@ -703,6 +703,10 @@ if __name__ == "__main__":
                         help="嘴部 crop 从脸部 96x96 crop 顶部截掉的比例 (0.4=取下 60%%，含嘴+下巴)")
     parser.add_argument("--smooth_weight", type=float, default=0.2,
                         help="recon_smooth 帧间平滑损失权重 (原 0.5 硬编码；降低可减少对爆破音快速唇形的抑制)")
+    parser.add_argument("--lip_dims", type=str, default='2,13,16',
+                        help="lip feature 中开合度相关维度 (teacher forcing 扰动实验确认，0=禁用加权)")
+    parser.add_argument("--lip_dim_weight", type=float, default=3.0,
+                        help="开合度维度的 MSE 权重倍数 (默认 3.0；1.0 或 lip_dims=空 = 普通等权 MSE)")
     parser.add_argument("--disable_vgg", action='store_true',
                         help="完全关闭 VGG loss (专注于 L1 和 Sync loss, 适合需要口型细节的场景)")
     parser.add_argument("--amp", action='store_true',

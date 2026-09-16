@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--mouth_vgg_weight", type=float, default=0.1)
     parser.add_argument("--mouth_vgg_crop_top", type=float, default=0.4)
     parser.add_argument("--smooth_weight", type=float, default=0.2)
+    parser.add_argument("--lip_dims", type=str, default='2,13,16')
+    parser.add_argument("--lip_dim_weight", type=float, default=3.0)
     parser.add_argument("--amp", action='store_true')
     parser.add_argument("--lr_schedule", type=str, default=None)
     parser.add_argument("--sync_schedule", type=str, default=None)

@@ -186,6 +186,22 @@ class Trainer(nn.Module):
         # 降到 0.2 减少对快速唇动的抑制。
         self.smooth_weight = getattr(args, 'smooth_weight', 0.2)
 
+        # 开合度维度加权 MSE：teacher forcing 诊断确认 audio2lip 预测误差集中在
+        # 唇部开合度维度 (默认 2,13,16 —— 扰动渲染证实这三维控制嘴部开合)，
+        # 且误差方向是向训练集统计先验收缩（该闭不闭/该张不张）。
+        # 对这些维度加权让模型重点学习开合定位。
+        lip_dims = getattr(args, 'lip_dims', '2,13,16')
+        lip_dim_weight = getattr(args, 'lip_dim_weight', 3.0)
+        self.lip_dim_weight_vec = None
+        if lip_dims and lip_dim_weight > 1.0:
+            dims = [int(d) for d in lip_dims.split(',')]
+            w = torch.ones(20)
+            for d in dims:
+                if 0 <= d < 20:
+                    w[d] = lip_dim_weight
+            self.lip_dim_weight_vec = w.to('cuda')
+            print(f'[INFO] lip 开合度维度加权: dims={dims}, weight={lip_dim_weight}')
+
         self.sync_weight = args.sync_weight
 
         if self.sync_weight != 0:
@@ -289,7 +305,12 @@ class Trainer(nn.Module):
             batch_size, T = audio_features.shape[0], audio_features.shape[1]
             audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
             lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
-            G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
+            # 开合度维度加权 MSE（lip_dim_weight_vec 为 None 时退化为普通 MSE）
+            if self.lip_dim_weight_vec is not None:
+                diff_sq = (lip_features_predict - lip_features) ** 2
+                G_losses['recon_l2_loss'] = (diff_sq * self.lip_dim_weight_vec).mean()
+            else:
+                G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
             G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*self.smooth_weight
 
             wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
@@ -420,7 +441,12 @@ class Trainer(nn.Module):
             batch_size, T = audio_features.shape[0], audio_features.shape[1]
             audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
             lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
-            G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
+            # 开合度维度加权 MSE（lip_dim_weight_vec 为 None 时退化为普通 MSE）
+            if self.lip_dim_weight_vec is not None:
+                diff_sq = (lip_features_predict - lip_features) ** 2
+                G_losses['recon_l2_loss'] = (diff_sq * self.lip_dim_weight_vec).mean()
+            else:
+                G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
             G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*self.smooth_weight
 
             wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
