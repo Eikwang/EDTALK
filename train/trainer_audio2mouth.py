@@ -28,7 +28,36 @@ class Trainer(nn.Module):
         self.audio2lip = Audio2Lip().to(device)
         self.train_generator = True
 
-        requires_grad(self.audio2lip.audio_encoder, False)
+        # ============================================================
+        # audio_encoder 分层解冻
+        # ============================================================
+        # audio_encoder 为 nn.Sequential, 共 13 个 Conv2d block:
+        #   blocks 0-2 : 32 通道浅层, 学习低级谱特征 (与 speaker 无关, 保持冻结)
+        #   blocks 3-5 : 64 通道, 过渡层
+        #   blocks 6-8 : 128 通道
+        #   blocks 9   : 256 通道下采样
+        #   blocks 10  : 256 通道残差
+        #   blocks 11-12: 512 通道深层, 靠近语义输出
+        #   mapping    : Linear(512->20), 必须训练以适配目标 speaker
+        #
+        # --audio_encoder_unfreeze_from=N: 从第 N 个 block 开始解冻 (0=全部解冻, 13=只解冻 mapping)
+        # 默认 9: 只解冻深层 (blocks 9-12) + mapping, 保留浅层 Wav2Lip 预训练特征
+        # ============================================================
+        audio_encoder_blocks = list(self.audio2lip.audio_encoder.children())
+        unfreeze_from = getattr(args, 'audio_encoder_unfreeze_from', 9)
+        unfreeze_from = max(0, min(unfreeze_from, len(audio_encoder_blocks)))
+
+        for i, block in enumerate(audio_encoder_blocks):
+            freeze = (i < unfreeze_from)
+            requires_grad(block, not freeze)
+            if not freeze:
+                print(f'[audio_encoder] block {i} unfrozen ({type(block).__name__})')
+
+        # mapping 层始终训练: 把 512 维音频特征映射到 20 维 lip features
+        requires_grad(self.audio2lip.mapping, True)
+        self.audio_encoder_unfreeze_from = unfreeze_from
+        self.audio_encoder_lr_mult = getattr(args, 'audio_encoder_lr_mult', 0.1)
+        self.mapping_lr_mult = getattr(args, 'mapping_lr_mult', 1.0)
 
         self.gen = Generator(args.size, args.latent_dim_style, args.latent_dim_lip, args.latent_dim_pose, args.channel_multiplier).to(
             device)
@@ -74,18 +103,54 @@ class Trainer(nn.Module):
             self.gen = self.gen.module
 
 
-        net_parameters = filter(lambda p: p.requires_grad, self.audio2lip.parameters())
-        train_parameters = list(net_parameters)
-        net_parameters2 = filter(lambda p: p.requires_grad, self.gen.parameters())
-        train_parameters += list(net_parameters2)
+        # ============================================================
+        # 优化器参数分组: 为 audio_encoder 深层、mapping、generator 分别设置学习率
+        # ============================================================
+        base_lr = args.lr * g_reg_ratio
+
+        # audio_encoder 深层参数
+        ae_unfrozen_params = []
+        for i, block in enumerate(audio_encoder_blocks):
+            if i >= unfreeze_from:
+                ae_unfrozen_params.extend(block.parameters())
+
+        # mapping 层参数
+        mapping_params = list(self.audio2lip.mapping.parameters())
+
+        # generator 可训练参数 (主要是 gen.dec)
+        gen_params = list(filter(lambda p: p.requires_grad, self.gen.parameters()))
+
+        param_groups = []
+        if ae_unfrozen_params:
+            param_groups.append({
+                'params': ae_unfrozen_params,
+                'lr': base_lr * self.audio_encoder_lr_mult,
+                'name': 'audio_encoder',
+            })
+        param_groups.append({
+            'params': mapping_params,
+            'lr': base_lr * self.mapping_lr_mult,
+            'name': 'mapping',
+        })
+        if gen_params:
+            param_groups.append({
+                'params': gen_params,
+                'lr': base_lr,
+                'name': 'generator',
+            })
+
         # 修正: 原 betas=(0 ** g_reg_ratio, 0.99 ** g_reg_ratio) 导致 beta1=0.0,
         # Adam 无一阶动量退化为类 RMSProp, 训练不稳定。
         # 改为标准 Adam betas (0.9, 0.999), lr 已通过 g_reg_ratio 缩放。
         self.g_optim = optim.Adam(
-            train_parameters,
-            lr=args.lr * g_reg_ratio,
+            param_groups,
+            lr=base_lr,
             betas=(0.9, 0.999)
         )
+        print(f'[Optimizer] {len(param_groups)} param groups | '
+              f'audio_encoder lr={base_lr * self.audio_encoder_lr_mult:.6f} '
+              f'(from block {unfreeze_from}), mapping lr={base_lr * self.mapping_lr_mult:.6f}, '
+              f'generator lr={base_lr:.6f}')
 
 
 
@@ -99,10 +164,27 @@ class Trainer(nn.Module):
 
         self.criterion_vgg = VGGLoss().to('cuda')
 
-        # VGG 稀疏计算：每 vgg_sparse_freq 个 iter 计算一次 VGG，权重乘以 N 补偿
-        self.vgg_sparse_freq = getattr(args, 'vgg_sparse_freq', 0)
+        # VGG 稀疏计算：每 vgg_sparse_freq 个 iter 计算一次 VGG
+        # 注意：默认不再做权重 ×N 补偿。经验上补偿会放大单步梯度，导致模型崩坏；
+        #      关闭补偿后 VGG 总贡献下降，但单步梯度更稳定。
+        #      如需恢复旧行为，可传 --vgg_sparse_compensate。
+        self.vgg_sparse_freq = getattr(args, 'vgg_sparse_freq', 30)
+        self.vgg_weight = getattr(args, 'vgg_weight', 0.15)
+        self.vgg_sparse_compensate = getattr(args, 'vgg_sparse_compensate', False)
         self.disable_vgg = getattr(args, 'disable_vgg', False)
         self._train_iter = 0
+
+        # 嘴部 crop VGG：对脸部 96x96 crop 的下半区（嘴+下巴）每 iter 计算 VGG。
+        # 背景: 全图 VGG 稀疏 50 后有效权重 ≈0.003，牙齿/口腔等高频细节的感知信号
+        # 几乎为零，L1×25 主导推动均值化。96x96 crop 的 VGG 计算量约为全图 1/7，
+        # 可承受每 iter 计算，把感知细节信号恢复到正常量级。
+        self.mouth_vgg_weight = getattr(args, 'mouth_vgg_weight', 0.1)
+        self.mouth_vgg_crop_top = getattr(args, 'mouth_vgg_crop_top', 0.4)
+
+        # recon_smooth 权重: 惩罚预测帧间变化与真实帧间变化的偏差。
+        # 原 0.5 硬编码会抑制爆破音所需的快速唇形变化（1-2 帧内完成闭口），
+        # 降到 0.2 减少对快速唇动的抑制。
+        self.smooth_weight = getattr(args, 'smooth_weight', 0.2)
 
         self.sync_weight = args.sync_weight
 
@@ -208,7 +290,7 @@ class Trainer(nn.Module):
             audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
             lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
             G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
-            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*0.5
+            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*self.smooth_weight
 
             wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
             lip_features_predict = lip_features_predict.reshape([batch_size*T, 20])
@@ -228,17 +310,24 @@ class Trainer(nn.Module):
                 recon_pred = self.dis(recon)
             target_img = target_img.reshape([batch_size*T, 3, 256, 256])
 
-            # VGG 感知损失：支持稀疏计算 + 权重补偿
-            # vgg_sparse_freq=0: 每 iter 计算 VGG，权重 0.5
-            # vgg_sparse_freq=N: 每 N iter 计算一次 VGG，权重 0.5×N（保持平均贡献不变）
+            # VGG 感知损失：支持稀疏计算 + 可控权重
+            # vgg_sparse_freq=0: 每 iter 计算 VGG，权重 --vgg_weight
+            # vgg_sparse_freq=N: 每 N iter 计算一次 VGG，权重 --vgg_weight（默认不补偿）
             # disable_vgg=True: 完全关闭 VGG loss
             if self.disable_vgg:
                 G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
             elif self.vgg_sparse_freq > 0 and self._train_iter % self.vgg_sparse_freq != 0:
                 G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
             else:
-                vgg_weight = 0.15 * (self.vgg_sparse_freq if self.vgg_sparse_freq > 0 else 1)
+                vgg_weight = self.vgg_weight
+                if self.vgg_sparse_compensate and self.vgg_sparse_freq > 0:
+                    vgg_weight *= self.vgg_sparse_freq
                 G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean() * vgg_weight
+
+            # 嘴部 crop VGG：每 iter 计算，恢复牙齿/口腔细节的感知信号
+            if self.mouth_vgg_weight > 0:
+                G_losses['mouth_vgg_loss'] = self.mouth_vgg_loss(recon, target_img, bbox, batch_size, T)
+
             if self.dis_weight !=0:
                 G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 
@@ -288,6 +377,25 @@ class Trainer(nn.Module):
         loss = (1 - F.cosine_similarity(a, v)).mean()
         return loss
 
+    def mouth_vgg_loss(self, recon, target_img, bbox, batch_size, T):
+        """嘴部 crop VGG：脸部 96x96 crop 的下半区（嘴+下巴）的感知损失。
+
+        每 iter 计算，恢复被全图 VGG 稀疏化稀释的细节信号（牙齿/口腔高频纹理）。
+        crop 逻辑与 sync loss 一致（crop_bbox_batch 96x96），额外取下半区聚焦嘴部。
+        下半区高度约 58px，VGG19 池化 5 次会越界，先上采样到 128x128 再进 VGG。
+        """
+        preds = bbox.reshape(batch_size*T, 4)
+        preds = preds.to('cuda')/256.
+        box_to_feat = torch.from_numpy(np.array([i for i in range(batch_size*T)]))
+        gt_bbox = crop_bbox_batch(target_img, preds, box_to_feat, 96)
+        pre_bbox = crop_bbox_batch(recon, preds, box_to_feat, 96)
+        top = int(96 * self.mouth_vgg_crop_top)
+        gt_mouth = gt_bbox[:, :, top:, :]
+        pre_mouth = pre_bbox[:, :, top:, :]
+        gt_mouth = F.interpolate(gt_mouth, size=(128, 128), mode='bilinear', align_corners=False)
+        pre_mouth = F.interpolate(pre_mouth, size=(128, 128), mode='bilinear', align_corners=False)
+        return self.criterion_vgg(pre_mouth, gt_mouth).mean() * self.mouth_vgg_weight
+
 
     def dis_update(self, img_real, img_recon):
         self.dis.zero_grad()
@@ -313,7 +421,7 @@ class Trainer(nn.Module):
             audio_features = audio_features.view(-1, 80, 16).unsqueeze(dim=1)
             lip_features_predict = self.audio2lip(audio_features, batch_size, T) # batch, T, 20
             G_losses['recon_l2_loss'] = F.mse_loss(lip_features_predict, lip_features)
-            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*0.5
+            G_losses['recon_smooth'] = F.mse_loss(lip_features_predict[:,1:]-lip_features_predict[:,:-1], lip_features[:,1:]-lip_features[:,:-1])*self.smooth_weight
 
             wa_identity, _, feats_identity, _ = self.gen.enc(identity_img)
             lip_features_predict = lip_features_predict.reshape([batch_size*T, 20])
@@ -337,6 +445,9 @@ class Trainer(nn.Module):
                 G_losses['recon_vgg_loss'] = torch.tensor(0.0, device=recon.device)
             else:
                 G_losses['recon_vgg_loss'] = self.criterion_vgg(recon, target_img).mean() * 0.15
+            # eval 与训练目标保持一致：嘴部 VGG 参与 best model 选择
+            if self.mouth_vgg_weight > 0:
+                G_losses['mouth_vgg_loss'] = self.mouth_vgg_loss(recon, target_img, bbox, batch_size, T)
             if self.dis_weight !=0:
                 G_losses['recon_gan_g_loss'] = self.g_nonsaturating_loss(recon_pred)
 

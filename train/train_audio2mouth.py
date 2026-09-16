@@ -302,9 +302,10 @@ def main(args):
     if args.disable_vgg:
         print('[INFO] VGG loss 已完全禁用 (专注于 L1 和 Sync loss)')
     elif args.vgg_sparse_freq > 0:
-        print(f'[INFO] VGG 稀疏模式: 每 {args.vgg_sparse_freq} iter 计算一次, 权重补偿 ×{args.vgg_sparse_freq} (预计节省 ~{100-100//args.vgg_sparse_freq:.0f}% VGG 计算)')
+        comp_msg = f', 权重补偿 ×{args.vgg_sparse_freq}' if args.vgg_sparse_compensate else ', 无权重补偿'
+        print(f'[INFO] VGG 稀疏模式: 每 {args.vgg_sparse_freq} iter 计算一次{comp_msg}, 基础权重 {args.vgg_weight} (预计节省 ~{100-100//args.vgg_sparse_freq:.0f}% VGG 计算)')
     else:
-        print(f'[INFO] VGG 全量模式: 每 iter 计算 4 尺度 x 8 次 VGG19 forward')
+        print(f'[INFO] VGG 全量模式: 每 iter 计算 4 尺度 x 8 次 VGG19 forward, 权重 {args.vgg_weight}')
     print(f'[INFO] 初始内存状态: {check_memory_pressure()}')
 
     # === LR & Sync Weight 调度 ===
@@ -677,6 +678,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_freq", type=int, default=2000)
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--audio2lip_ckpt", type=str, default=None)
+    parser.add_argument("--audio_encoder_unfreeze_from", type=int, default=9,
+                        help="audio_encoder 从第 N 个 block 开始解冻 (0=全部解冻, 9=深层, 13=只解冻 mapping)。默认 9，保留浅层 Wav2Lip 特征")
+    parser.add_argument("--audio_encoder_lr_mult", type=float, default=0.1,
+                        help="audio_encoder 解冻层的学习率倍数 (相对 --lr，默认 0.1)")
+    parser.add_argument("--mapping_lr_mult", type=float, default=1.0,
+                        help="mapping 层学习率倍数 (相对 --lr，默认 1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=4, help="梯度累积步数（单卡显存不足时使用，等效 batch_size = batch_size * accumulation_steps）")
     parser.add_argument("--data_path", type=str, default='HDTF', help="Dataset base directory path")
     parser.add_argument("--log_freq", type=int, default=1000, help="每 N 个 batch 打印一次滚动日志（0=只在 epoch 结束打印）")
@@ -684,8 +691,18 @@ if __name__ == "__main__":
                         help="将所有特征 preload_features 预加载到内存 (小数据集微调推荐, 大数据集慎用)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 进程数 (0=主线程加载, 默认4)")
-    parser.add_argument("--vgg_sparse_freq", type=int, default=0,
-                        help="VGG 稀疏计算频率 (0=每 iter 都算, N=每 N iter 算一次。微调推荐 30~100, 可节省 VGG 计算)")
+    parser.add_argument("--vgg_sparse_freq", type=int, default=50,
+                        help="VGG 稀疏计算频率 (0=每 iter 都算, N=每 N iter 算一次。默认 50, 可节省 VGG 计算且避免崩坏)")
+    parser.add_argument("--vgg_weight", type=float, default=0.15,
+                        help="VGG loss 基础权重 (默认 0.15。稀疏模式下默认不做 ×N 补偿，避免单步梯度爆炸)")
+    parser.add_argument("--vgg_sparse_compensate", action='store_true',
+                        help="VGG 稀疏时启用 ×N 权重补偿（旧行为）。经验上补偿易致崩坏，默认关闭")
+    parser.add_argument("--mouth_vgg_weight", type=float, default=0.1,
+                        help="嘴部 crop VGG 权重 (每 iter 计算 96x96 脸部 crop 下半区，恢复牙齿/口腔细节。0=禁用。稳态目标: mouth_vgg_loss 占总 loss 5-15%%)")
+    parser.add_argument("--mouth_vgg_crop_top", type=float, default=0.4,
+                        help="嘴部 crop 从脸部 96x96 crop 顶部截掉的比例 (0.4=取下 60%%，含嘴+下巴)")
+    parser.add_argument("--smooth_weight", type=float, default=0.2,
+                        help="recon_smooth 帧间平滑损失权重 (原 0.5 硬编码；降低可减少对爆破音快速唇形的抑制)")
     parser.add_argument("--disable_vgg", action='store_true',
                         help="完全关闭 VGG loss (专注于 L1 和 Sync loss, 适合需要口型细节的场景)")
     parser.add_argument("--amp", action='store_true',
