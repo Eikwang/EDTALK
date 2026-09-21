@@ -48,6 +48,39 @@ def _transfer_crops_to_device(crop_tensor: torch.Tensor, device: str,
     return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
 
+def extract_pristine_crop(orifra: np.ndarray, meta) -> Optional[np.ndarray]:
+    """Extract the 256x256 pristine crop region from an orifra frame.
+
+    Replicates MouthCompositor.prepare_crop's clamp geometry (x/y clamped to
+    frame bounds, padded when the crop runs past an edge) so the result lives
+    in the SAME 256 space as the count crops / facemark. Returns a FRESH array
+    (cv2.resize always allocates) — callers may mutate orifra afterwards
+    without aliasing this crop (GAZE_TIMING_PLAN F5).
+    """
+    crop_x = float(meta['crop_x'])
+    crop_y = float(meta['crop_y'])
+    crop_size = float(meta['crop_size'])
+    if crop_size <= 0:
+        return None
+    size = int(round(crop_size))
+    if size <= 0:
+        return None
+    x1, y1 = int(round(crop_x)), int(round(crop_y))
+    x2, y2 = x1 + size, y1 + size
+    x1c, y1c = max(0, x1), max(0, y1)
+    x2c = min(orifra.shape[1], x2)
+    y2c = min(orifra.shape[0], y2)
+    if x2c - x1c <= 0 or y2c - y1c <= 0:
+        return None
+    crop = orifra[y1c:y2c, x1c:x2c]
+    if crop.shape[0] < size or crop.shape[1] < size:
+        padded = np.zeros((size, size, 3), dtype=np.uint8)
+        padded[y1c - y1:y1c - y1 + crop.shape[0],
+               x1c - x1:x1c - x1 + crop.shape[1]] = crop
+        crop = padded
+    return cv2.resize(crop, (256, 256), interpolation=cv2.INTER_LINEAR)
+
+
 class BatchPreloader:
     """Batched sliding-window preloader for video frames.
 
@@ -87,6 +120,13 @@ class BatchPreloader:
         self._crop_bufs: List[Optional[torch.Tensor]] = [None, None]  # [B, 3, 256, 256]
         self._mask_bufs: List[Optional[List[np.ndarray]]] = [None, None]  # precomputed masks
         self._facemark_bufs: List[Optional[List[np.ndarray]]] = [None, None]  # stored facemark for mask recompute
+        # Pristine 256 crop per frame ((256,256,3) BGR uint8, GAZE_TIMING_PLAN T1):
+        # decoded ONCE at batch load from the untouched orifra JPEG — blend()
+        # writes the composited result into the orifra buffer in place, so the
+        # eye-source for gaze correction must come from a copy that blend can
+        # never reach (loop-wrap double-render would otherwise stack gaze
+        # corrections, ENG A-3 / GAZE_TIMING_PLAN F5).
+        self._pristine_bufs: List[Optional[List[np.ndarray]]] = [None, None]
 
         # Each batch's start frame index
         self._batch_starts: List[int] = [-1, -1]
@@ -246,6 +286,24 @@ class BatchPreloader:
             return None
         return masks[offset]
 
+    def get_pristine(self, frame_idx: int) -> Optional[np.ndarray]:
+        """Get the pristine 256 crop from the preloaded buffer (T1).
+
+        Returns:
+            (256, 256, 3) BGR uint8 decoded from the untouched orifra JPEG,
+            or None when the frame is outside the current window (caller
+            falls back to extract_pristine_crop + pristine_fallback counter).
+        """
+        slot = self._current_slot
+        start = self._batch_starts[slot]
+        if start < 0 or not (start <= frame_idx < start + self.BATCH_SIZE):
+            return None
+        offset = frame_idx - start
+        pristine = self._pristine_bufs[slot]
+        if pristine is None or offset >= len(pristine):
+            return None
+        return pristine[offset]
+
     def recompute_current_masks(self):
         """Recompute masks for the currently loaded batch using the compositor.
 
@@ -313,6 +371,7 @@ class BatchPreloader:
         self._crop_bufs = [None, None]
         self._mask_bufs = [None, None]
         self._facemark_bufs = [None, None]
+        self._pristine_bufs = [None, None]
         self._batch_starts = [-1, -1]
         self._current_slot = 0
         self._preload_target_start = -1
@@ -364,8 +423,13 @@ class BatchPreloader:
 
     @staticmethod
     def _decode_frame(job):
-        """Decode one frame pair (pure function, GIL-released in cv2)."""
-        orifra_path, crop_path = job
+        """Decode one frame triple (pure function, GIL-released in cv2).
+
+        job = (orifra_path, crop_path, meta). The third element also yields
+        the pristine 256 crop (GAZE_TIMING_PLAN T1) — computed here on the
+        decode pool from the freshly read, never-yet-blended orifra.
+        """
+        orifra_path, crop_path, meta = job
         img = cv2.imread(orifra_path)
         if img is None:
             raise ValueError(f"Failed to read orifra: {orifra_path}")
@@ -377,7 +441,8 @@ class BatchPreloader:
         crop_np = np.ascontiguousarray(
             crop_rgb.astype(np.float32).transpose(2, 0, 1) / 127.5 - 1.0
         )
-        return img, crop_np
+        pristine = extract_pristine_crop(img, meta)
+        return img, crop_np, pristine
 
     def _load_batch_sync(self, slot: int, start_idx: int, segment: str,
                          gen: int):
@@ -407,7 +472,8 @@ class BatchPreloader:
         jobs = []
         for i in range(count):
             idx = (start_idx + i) % total
-            jobs.append((data['orifra_files'][idx], data['crop_files'][idx]))
+            jobs.append((data['orifra_files'][idx], data['crop_files'][idx],
+                         data['metadata'][idx]))
         pool = self._get_decode_pool()
         decoded = list(pool.map(self._decode_frame, jobs))
 
@@ -416,6 +482,7 @@ class BatchPreloader:
 
         orifra_list = [d[0] for d in decoded]
         crop_np_list = [d[1] for d in decoded]
+        pristine_list = [d[2] for d in decoded]
 
         # Phase 2: mask precomputation (serial — the compositor's landmark
         # EMA is order-dependent, so masks must be generated in frame order)
@@ -453,6 +520,7 @@ class BatchPreloader:
             self._crop_bufs[slot] = crop_batch
             self._mask_bufs[slot] = mask_list
             self._facemark_bufs[slot] = facemark_list
+            self._pristine_bufs[slot] = pristine_list
             self._batch_starts[slot] = start_idx
 
     def _is_in_batch(self, frame_idx: int, slot: int) -> bool:
@@ -468,7 +536,8 @@ class BatchPreloader:
 
     def publish_prefetch(self, segment: str, orifra_list: List[np.ndarray],
                          crop_batch: torch.Tensor,
-                         facemark_list: List[Optional[np.ndarray]]) -> bool:
+                         facemark_list: List[Optional[np.ndarray]],
+                         pristine_list: Optional[List[Optional[np.ndarray]]] = None) -> bool:
         """Install a prefetched batch-0 into slot 0 (M15 seamless switching).
 
         MUST be called right after reset(segment) and before ensure_loaded(0):
@@ -482,6 +551,10 @@ class BatchPreloader:
         alive; otherwise slot 0 keeps mask=None and the render loop's
         per-frame fallback covers the window (~1ms/frame, self-healing).
 
+        pristine_list (T1): the prefetcher's pristine 256 crops; None entries
+        (or a missing list) leave those frames to the render loop's
+        extract_pristine_crop fallback.
+
         Returns False when the preloader has moved to a different segment
         (stale publish — caller falls back to the normal cold path).
         """
@@ -493,6 +566,9 @@ class BatchPreloader:
             self._crop_bufs[0] = crop_batch
             self._facemark_bufs[0] = facemark_list
             self._mask_bufs[0] = [None] * n
+            self._pristine_bufs[0] = (list(pristine_list)
+                                      if pristine_list is not None
+                                      else [None] * n)
             self._batch_starts[0] = 0
 
         # Lock-free mask generation in frame order (EMA is order-dependent).
@@ -516,14 +592,19 @@ class _PrefetchData:
     Carries NO masks (H2): the compositor's landmark EMA is order-sensitive
     and must not see two segments interleaved — masks are generated after
     publish, in frame order, by BatchPreloader.publish_prefetch.
+    pristine_list (T1) carries the pristine 256 crops (None entries allowed —
+    the render loop's extract fallback covers those frames).
     """
 
     def __init__(self, segment: str, orifra_list: List[np.ndarray],
-                 crop_batch: torch.Tensor, facemark_list: List[Optional[np.ndarray]]):
+                 crop_batch: torch.Tensor,
+                 facemark_list: List[Optional[np.ndarray]],
+                 pristine_list: Optional[List[Optional[np.ndarray]]] = None):
         self.segment = segment
         self.orifra_list = orifra_list
         self.crop_batch = crop_batch
         self.facemark_list = facemark_list
+        self.pristine_list = pristine_list
 
 
 class PrefetchLoader:
@@ -615,7 +696,8 @@ class PrefetchLoader:
                 raise ValueError(f"segment '{segment}' has no frames")
 
             pool = self._preloader._get_decode_pool()
-            files = [(data['orifra_files'][i], data['crop_files'][i])
+            files = [(data['orifra_files'][i], data['crop_files'][i],
+                      data['metadata'][i])
                      for i in range(count)]
             cap = max(1, self._preloader.BATCH_SIZE // 4)
             decoded = []
@@ -635,6 +717,7 @@ class PrefetchLoader:
             facemark = data.get('facemark')
             facemark_list = [facemark[i] if facemark is not None else None
                              for i in range(count)]
+            pristine_list = [d[2] for d in decoded]
             if self._stale(token):
                 return
 
@@ -642,7 +725,7 @@ class PrefetchLoader:
                 if token == self._token:
                     self._result = _PrefetchData(
                         segment, [d[0] for d in decoded], crop_batch,
-                        facemark_list)
+                        facemark_list, pristine_list)
                     self._state = 'ready'
         except Exception as e:
             # Prefetch is best-effort: a failure degrades the upcoming switch
@@ -723,6 +806,11 @@ class CharacterDataPack:
         # keyed by segment because segments may differ in resolution)
         self._resolution_cache: dict = {}
 
+        # Pristine-crop fallback counter (GAZE_TIMING_PLAN DX 发现6): frames
+        # whose eye source came from the extract path instead of the preloaded
+        # window — exposed as /status gaze_frames.pristine_fallback.
+        self.pristine_fallbacks = 0
+
         # Load current segment (only metadata + facemark + file lists)
         self._load_segment(self.current_segment)
 
@@ -784,6 +872,28 @@ class CharacterDataPack:
             'r_center': gd['r_center'][i],
             'eye_size': gd['eye_size'],  # segment-level scalar
         }
+
+    def get_pristine_crop(self, idx: int, orifra: np.ndarray,
+                          meta) -> Optional[np.ndarray]:
+        """Pristine 256 crop for the gaze eye-source (GAZE_TIMING_PLAN T1/F5).
+
+        Preloaded window first; on a window miss (disk-fallback frame right
+        after a switch/jump) extracts from the freshly provided orifra frame
+        via extract_pristine_crop (FRESH memory — cv2.resize always allocates,
+        never a view of the blend-mutated buffer) and counts the fallback.
+
+        Returns None only when the crop geometry is unusable (meta broken) —
+        the caller then skips the eye paste for this frame.
+        """
+        pristine = self._preloader.get_pristine(idx % self._segment_cache[self.current_segment]['total_frames'])
+        if pristine is not None:
+            return pristine
+        pristine = extract_pristine_crop(orifra, meta)
+        if pristine is not None:
+            self.pristine_fallbacks += 1
+            print(f"[CharacterDataPack] pristine fallback "
+                  f"(frame {idx}) — [{self.pristine_fallbacks}]")
+        return pristine
 
     def _get_segment_paths(self, segment: str) -> dict:
         """Get paths for a specific segment."""
@@ -938,7 +1048,7 @@ class CharacterDataPack:
             if prefetched is not None and prefetched.segment == segment:
                 self._preloader.publish_prefetch(
                     segment, prefetched.orifra_list, prefetched.crop_batch,
-                    prefetched.facemark_list)
+                    prefetched.facemark_list, prefetched.pristine_list)
             self._preloader.ensure_loaded(0, segment)
             self.current_segment = segment            # publish LAST
 
