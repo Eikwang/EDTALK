@@ -4,10 +4,14 @@ Corrects the eye gaze on the Generator's rendered 256x256 output BEFORE the
 compositor pastes it back. The compositor mask must include the eye regions
 for the correction to reach the final frame (see compositor.py eyes_enabled).
 
-Pipeline position (probe-verified 2026-09-03):
-    count crop -> Generator -> rendered(256,GPU) -> [HERE] -> repair -> composite
+Pipeline position (GAZE_TIMING_PLAN 最终门裁决 2, 2026-09-21):
+    count crop -> Generator -> rendered(256,GPU) -> [HERE: eye_source 分流] -> repair -> composite
+    'ori' 模式: eye_source=pristine orifra 原生眼, 贴回 rendered——纠正后的整脸
+    随后进 face repair（眼与嘴鼻同一遍修复锐化）; 'rendered' 模式: 自纠正
+    （legacy Route C'，逐位现状）。
 Correction applied on the Generator INPUT (count crop) was measured to be
-erased by the generator redraw (eye diff 1.8x noise vs 29x here).
+erased by the generator redraw (eye diff 1.1x noise on the current checkpoint,
+2026-09-21 re-verification vs 29x at the output side).
 
 Design notes:
 - All tensor work stays on the GPU; the caller passes the rendered [-1,1]
@@ -209,7 +213,9 @@ class GazeCorrector:
                 donor. Pristine orifra crop ('ori' mode) or the rendered crop
                 itself ('rendered' legacy mode).
             canvas: (3,256,256) RGB float [-1,1] on GPU — the paste target
-                (repaired rendered crop in 'ori' mode). NEVER mutated.
+                (the rendered crop in 'ori' mode — both eye-source modes paste
+                BEFORE face repair so the whole face shares one GPEN pass,
+                最终门裁决 2). NEVER mutated.
             facemark_256: (68,2) 256-space landmarks for this frame (numpy),
                 possibly NaN on detection-failure frames. Legacy geometry
                 path when gaze_frame is None.

@@ -76,22 +76,23 @@ RenderLoop._run() ─ 每迭代 ─▶ _check_segment_schedule() → _process_fr
                    facemark 68点(256空间) / 预计算 mask(嘴[+眼])
  ⑥ Generator     CUDA Graph replay: (cropped, lip20, cropped) → rendered 256² [-1,1]
                  [gen p50 8.9ms；CUDA graph 静态缓冲，输出须当帧消费]
- ⑦ ★视线纠正     按 eye_source 分流（GAZE_TIMING_PLAN，ENG F1a）:
-                    'rendered'(legacy C')：此处调用（repair 前），
-                      _gaze_allowed 整体门控，逐位复现旧行为（U11 回归）
-                    'ori'(路线 B, 默认)：⑩修复之后调用（见下）——
-                      correct(eye_source=pristine原生眼, canvas=repaired)
-                      原生贴回不受门控（ENG F2），生成段受 _gaze_allowed
+ ⑦ ★视线纠正     单调用点，repair 之前（GAZE_TIMING_PLAN 最终门裁决 2:
+   眼源分流         全脸统一修复）。差异只剩眼源张量:
+                    'rendered'(legacy C')：自纠正，_gaze_allowed 整体门控，
+                      逐位复现旧行为（U11 回归）
+                    'ori'(默认)：correct(eye_source=pristine原生眼,
+                      canvas=rendered)——调用不受门控（ENG F2），
+                      生成段受 _gaze_allowed；纠正后的整脸随后进 GPEN
                     位置不变式：输入端修正会被 Generator 重绘抹除
-                    （probe 实测 1.1x 噪声 vs 输出端强信号，2026-09-21 复验）
+                    （probe 实测 1.1x 噪声，2026-09-21 复验）
  ⑧ 量化          [-1,1] → uint8 CHW BGR（GPU）
  ⑨ CPU 准备      mask 解析（预载 mask 优先 / compositor 回退生成）
                  + prepare_crop（ori 裁剪区域预缩放 256²，供混合）
- ⑩ 面部修复      if repair≠off 且 _repair_allowed()（adaptive: buffer≥6）:
+ ⑧' 面部修复     if repair≠off 且 _repair_allowed()（adaptive: buffer≥6）:
    GPEN-256         ORT IOBinding GPU 内联，α=0.7 [repair p50 7.2ms]
- ⑦' ori 视线纠正 gaze on(ori) 时在此执行（GPEN 不再触碰最终可见眼像素）：
-   Route B          uint8 BGR→float RGB → correct(pristine, repaired) →
-                    uint8；timing gaze 键=上传+转换+correct+贴回全程（F8）
+                    ⚠ 整脸统一处理（最终门裁决 2）：视线纠正后的眼睛随整脸
+                    进 GPEN——眼与嘴鼻同一遍修复锐化（GPEN 保结构，
+                    legacy 模式数周生产验证纠正方向经修复保留）
  ⑪ 下载          唯一一次 GPU→CPU（256² 渲染结果）
  ⑫ 贴回合成      compositor.blend: rendered×mask + ori_crop×(1-mask) → 贴回全帧
                  mask = 嘴部 hull(α=1) → 下颌+鼻翼(α=0) 平滑过渡；

@@ -233,9 +233,10 @@ batch4 + 4080S：50k iter 计划约 5-6h；D 饱和后（~15-20k）进入平台�
 
 ## 视线纠正眼源切换（GAZE_TIMING_PLAN，2026-09-21）
 
-- `--gaze-eye-source ori|rendered`（默认 ori）：ori=纠正工作在 orifra 原生眼上、
-  贴回在面部修复之后（GPEN 不触碰最终可见眼像素）；rendered=legacy Route C'
-  行为（repair 前自纠正）——即行为回滚路径 D，逐位复现旧管线。
+- `--gaze-eye-source ori|rendered`（默认 ori）：两种模式都在面部修复**之前**
+  贴回（最终门裁决 2：全脸统一修复——纠正后的眼睛随整脸进 GPEN，眼与嘴鼻
+  同一遍锐化）；ori=眼源为 orifra 原生眼，rendered=legacy Route C' 自纠正
+  （行为回滚路径 D，逐位复现旧管线）。
 - 运行时热切：`POST /gaze/params {"eye_source": "rendered"}`（无需重启）。
 - bypass 不变式：gaze on（ori）时眨眼/门关帧贴未修正原生眼——最终眼永远原生源。
 - 观测：`GET /status` → `gaze_params.eye_source`、`gaze_frames.pristine_fallback`
