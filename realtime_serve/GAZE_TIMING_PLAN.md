@@ -812,3 +812,25 @@ CEO 0B 清单经代码核实全部成立。新增确认：repair_gpu 独立输�
 - **VERDICT:** CEO + DX + ENG CLEARED（经最终门用户裁决 A）— ready to implement（T4 probe 复验先行）
 
 NO UNRESOLVED DECISIONS
+
+---
+
+# 最终门裁决 2（2026-09-21，实施后用户生产指令）：全脸统一修复
+
+用户生产观测：ori 模式眼睛 = 原生像素未经修复，相对 GPEN 修复过的嘴/鼻偏糊
+（修复网锐化增益只覆盖下半脸）。用户指令：视线修正贴回后整脸进面部修复，
+再贴回原始帧——全脸统一清晰度。
+
+**裁决：采纳。** Route B 原不变式"GPEN 不触碰最终可见眼像素"由用户显式废止；
+新不变式：**眼源原生域 + 全脸统一修复**。
+
+- 安全性先例：legacy rendered 模式数周生产即"纠正眼→GPEN"顺序，视线方向经
+  修复保留（GPEN 为保结构修复网，非重绘网）；且 GPEN 输入从 Generator 劣化眼
+  升级为原生眼，身份风险低于问题起源时的三重生成链。
+- 结构简化：ori 与 rendered 收敛到同一调用点（repair 前），差异只剩眼源张量；
+  ENG F1a 双调用点降级为单调用点分流；canvas=rendered 免 uint8↔float 往返
+  （较 post-repair 变体省 ~0.2ms）。
+- F8 timing 键定义更新：= pristine 上传 + 域转换 + correct（gen 输出→repair 之间）。
+- U11 rendered 逐位回归不变；U7 系 corrector 级断言不受调用点影响。
+- 验收：用户在生产域目检（功能运行 + 25fps 已确认；本轮验收眼清晰度均匀性
+  与全脸一致观感）。
