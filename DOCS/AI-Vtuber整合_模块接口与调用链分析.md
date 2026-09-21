@@ -1,8 +1,10 @@
 # AI-Vtuber 整合 · 模块接口与调用链分析
 
 > **基线**：EDTalk commit `c013414`（main，2026-09-21）。本文档所有 file:line 与行为描述均以该基线为准；EDTalk 后续变更请在「§14 变更登记」补记，防止文档静默腐烂。
-> **用途**：EDTalk 四个模块整合进 AI-Vtuber 的实施依据。对接 realtime_serve 的方法面/HTTP 契约以 `realtime_serve/EMBEDDING.md`（v0.3，冻结）为单一来源，本文档不重复其内容，只补整合视角的补充事实。
-> **深度约定**：本文档写"接缝"（参数/协议/依赖方向/产物路径），不逐行复述内部实现。机制细节见 DOCS/ 现有文档（§15 索引）。
+> **工作区漂移防护（Eng A2）**：基线 SHA 锚定的是已提交状态；整合实施时若工作区存在未提交变更（当前 fine_tune/、train/、data_preprocess/、realtime_serve 均有），**实施前先执行 T1（收尾提交 + 打 tag `integrate-prep-20260921`）**，以 tag 为实施起点。工作区漂移不构成契约变更——接口以 tag 时刻为准，变更走 §14 登记。
+> **契约单一来源声明（Eng A3）**：realtime_serve 方法面/HTTP 契约以 `realtime_serve/EMBEDDING.md`（v0.3，冻结）为单一事实来源；本文 §3 是整合视角的补充与差异登记（§3.3）。**两者冲突时：§3.3 已登记的差异以本文为准，其余一律以 EMBEDDING.md 为准**——禁止在第三处文档新增接口事实。
+> **fastrag 分析边界（Eng A4）**：fastrag 为已编译 Rust 二进制，本文只覆盖**进程边界**（HTTP/文件/环境变量/退出码）可分析面；内部行为（推理细节、异常返回格式）按黑盒对待，行为级差异发现时登记进 §14。
+> **用途**：EDTalk 四个模块整合进 AI-Vtuber 的实施依据。深度约定：写"接缝"（参数/协议/依赖方向/产物路径），不逐行复述内部实现。机制细节见 DOCS/ 现有文档（§15 索引）。
 
 ---
 
@@ -74,12 +76,19 @@
 
 ### 2.2 端口/进程速查表
 
-| 服务 | 进程/入口 | 端口 | 绑定 | 解释器 | 启动脚本 |
-|---|---|---|---|---|---|
-| AI-Vtuber 中枢 | `main.py` / `webui.py` | 8086 (webui) | 本机 | Miniconda3 py3.10 | `D:\AI\start\start_aivtuber.bat` |
-| realtime_serve | `python -m realtime_serve.main` | **8000** | 127.0.0.1（默认回环） | `D:\AI\EDTalk\runtime312\python.exe` | `D:\AI\start\start_edtalk.bat` |
-| fastrag server | `server.exe`（无参数） | **11420** | **0.0.0.0（硬编码，改不了）** | 无（Rust 静态二进制） | 无（需新建，见 §4.5） |
-| GPT-SoVITS | `api_v2.py` | 9880 | 本机 | runtime312 | `D:\AI\start\start_gptsovits.bat` |
+| 服务 | 进程/入口 | 端口 | 绑定 | 鉴权现状 | 解释器 | 启动脚本 |
+|---|---|---|---|---|---|---|
+| AI-Vtuber 中枢 | `main.py` / `webui.py` | 8086 (webui) | 本机 | 无（存量行为） | Miniconda3 py3.10 | `D:\AI\start\start_aivtuber.bat` |
+| realtime_serve | `python -m realtime_serve.main` | **8000** | 127.0.0.1（默认回环） | 无 token（可选 `--api-token` Bearer 层已存在） | `D:\AI\EDTalk\runtime312\python.exe` | `D:\AI\start\start_edtalk.bat` |
+| fastrag server | `server.exe`（无参数） | **11420** | **0.0.0.0（硬编码，改不了）** | **无，CORS 全开** | 无（Rust 静态二进制） | 无（需新建，见 §4.5） |
+| GPT-SoVITS | `api_v2.py` | 9880 | 本机 | 无（存量行为） | runtime312 | `D:\AI\start\start_gptsovits.bat` |
+
+> **已知接受风险（Eng S1）**：整合后 8000/11420 从"临时调试服务"变为"直播期间常驻监听"。realtime_serve 绑回环风险低；fastrag 绑 0.0.0.0 且无鉴权 = 局域网内任何人可查询/清缓存。缓解（按优先级）：① Windows 防火墙入站规则限 127.0.0.1 访问 11420；② 改 Rust 代码绑 127.0.0.1（一行改动，入 fastrag 仓库 TODO）；③ 接受（家庭可信局域网）。**当前默认 = ①+接受。**
+
+**环境前置检查（Eng E4，启动前必过）**：
+- 端口占用：`netstat -ano | findstr "8000 11420 9880"` 无 LISTEN 才可启动（占用时先杀残留进程）。
+- 虚拟摄像头：UnityCapture 滤镜已注册（`UnityCapture-master\Install\Install.bat` 管理员跑过一次）；OBS 摄像头源列表可见设备。
+- fastrag 索引存在：`fastrag\kbindex\chunk_index.bin` 存在（缺失时 server exit 1，需先跑 build-index.exe）。
 
 ### 2.3 资产边界速查表
 
@@ -90,6 +99,7 @@
 | 模型权重 | `ckpts/`、`ckpt_models/`、`realtime_serve/weights/`、`wy/checkpoint/` | .gitignore `*pt`/`*.pth` 排除 | 独立分发，不随 submodule |
 | wy/ 特征 npy（lip/pose 等） | `wy/**.npy` | **被 git 跟踪**（1071 变更噪音来源） | 待收敛（T4）：特征产物建议移出 git |
 | fastrag 代码+配置 | `D:\AI\EDTalk\fastrag` | **非 git 仓库**，被 EDTalk .gitignore:54 整体忽略 | submodule 前需 `git init`；`chekpoint/`(4.7GB)、`kbindex/`、`target/`、`*.log` 排除 |
+| fastrag 预编译 exe | `fastrag\server.exe` 等 3 个（2026-07-24 构建，~53MB） | 未跟踪 | **供应链指纹（Eng S3，待补）**：入库前记录 SHA-256（`Get-FileHash server.exe`）与构建来源（本机 cargo build --release）；后续重建 exe 时指纹比对防替换 |
 | fastrag 模型 | `fastrag/chekpoint/`（MiniCPM5-1B / ritrieve_zh_v1 / mxbai-rerank-base-v2） | 未跟踪 | 独立分发；`Qwen3.5-0.8B`(1.7GB) 配置未引用，**可删除** |
 | 知识库 | `fastrag/knowledgebase/`(17 md) + `kbindex/`(可重建) | 未跟踪 | 代码库收 md（内容资产），索引重建 |
 | AI-Vtuber 对接蓝图 | `D:\AI\AI-Vtuber\specs\integration\*.md` | AI-Vtuber 仓库 | 已存在，A1-A4 清单直接可用 |
@@ -149,6 +159,9 @@ Config 来源优先级：**CLI > dataclass 默认**，仅两层，无环境变�
 | 5 | `/status` 的 `pending_switch`/`prefetch` 为条件性字段（挂起时才出现） | 文档级 | 前端按缺省处理 |
 | 6 | `--cap-num` 不生效 | 实现缺陷 | 多摄像头场景暂不可选设备 |
 | 7 | `Config.face_repair_enabled` 与 mode 双轨，装配只看 mode（main.py:313） | 语义陷阱 | 进程内直调时只设 `face_repair_mode` |
+| 8 | **`/audio/push_full` 过载背压语义未定义**：并发/密集推送经 `_push_lock` 串行排队（render_loop.py:455），队列无界；EMBEDDING.md 只写 400/413，未写过载行为（丢弃？熔断？上限？） | **行为级（当前未定义）** | 弹幕高峰 + TTS 涌入场景下 AI-Vtuber 必须自行限流（如单飞行句 + 队列上限）；对接前按"无背压保护"设计，勿依赖服务端丢弃语义 |
+
+> **回写优先级**：差异 #1（/audio/push 死路径）与 #8（背压未定义）为 **P1 高危回写项**（与 §10 静默失败表同级），其余 6 项为 P2 文档级回写。整合实施者请勿按"文档级"降权处理 #1/#8。
 
 ### 3.4 音频数据面（对接方必读）
 
@@ -279,6 +292,7 @@ knowledgebase/ (*.md, *.txt, 递归, UTF-8)
   - **A（推荐，零改造）**：`Start-Process -WindowStyle Hidden` + stdout/stderr 重定向到文件（§4.1 命令）。窗口短暂创建后隐藏，可接受；日志由外部管理轮转。
   - B（改造）：加 `#![windows_subsystem = "windows"]` 彻底无窗口，**但 stdout 日志全丢**——必须同时补 tracing-appender 文件日志，属代码改动，入 TODOS。
 - 停机：server 无 ctrl_c 优雅停机处理，AI-Vtuber 停止时 `taskkill /F /T`（与现有 coordination_program 停止方式一致）。
+- **崩溃取证（Eng H3）**：无控制台/Hidden 窗口模式下崩溃无可见痕迹——stdout/stderr 重定向文件就是唯一取证面。检查顺序：① 重定向文件尾部的 panic 行（`thread 'main' panicked at src\...`）+ 退出码 101=模型/配置加载失败；② 退出码 1=索引缺失（先跑 build-index.exe）；③ 无输出但进程消失=系统级杀死（查 AI-Vtuber 侧 taskkill 记录）。日志无轮转，AI-Vtuber supervisor 按日期切文件。
 
 ### 4.6 模型目录与 git 现状
 
@@ -298,6 +312,8 @@ AI-Vtuber 指令体系 = `utils/handlers/comment_handler.py:240` `comment_handle
 | 外部 HTTP 指令入口 | `utils/web_server.py:77` `/send`（type=comment 分发） | 非弹幕来源（面板手动触发）走此口 | 无需新代码 |
 
 配置节：`config.fastrag`（照 metahuman_stream 节模式：`api_ip_port` 默认 `http://127.0.0.1:11420`、`enable`、指令前缀、超时、降级话术开关）+ `webui.show_card` 显隐 + migrate_config/split_config 迁移。
+
+> **信任边界（Eng S2）**：弹幕是**不可信输入**。挂载进 comment_handle 责任链后，观众消息将触达 fastrag 检索与 LLM 生成并直接进直播输出——指令前缀必须可配置且默认关闭，上线前先在"仅主播/面板触发"模式验证；知识库内容经由 LLM 的注入面为存量行为，指令链不扩大它，但**触发者 = 观众**这一点必须在配置评审时知情确认。
 
 ---
 
@@ -466,8 +482,21 @@ D:\AI\EDTalk\runtime312\python.exe train\train_audio2mouth.py --preload_features
 3. 两链路输出目录模式不同（`ckpt_models/<exp>/checkpoint/` vs `logs/<exp_path>/<exp>/<date>/checkpoint/`），编排器需分别做产物发现与定版挑选（A 侧 eval 门槛自动判，B 侧 best/epoch 指标）。
 4. 部署是"带键改名"而非整文件复制：文件名 `new.pt`/`audio2lip.pt` **固定不可改**（sequence_frame_pack.py:1162-1163 fail-fast）。
 5. 失败语义：A 崩溃自动紧急保存（退出码仍非 0，可续训）；B 紧急保存后 re-raise——编排以**进程退出码**判失败，勿以"有没有新文件"判断。
-6. **步骤级日志**：每段起止时间、退出码、产物路径、显存水位（`torch.cuda.memory_allocated`）落 JSONL，供断点续跑与排障（S8 缺口闭合点）。
+6. **步骤级日志**：每段起止时间、退出码、产物路径、显存水位（`torch.cuda.memory_allocated`）、**坏样本计数**落 JSONL，供断点续跑与排障（S8 缺口闭合点）。
 7. runtime312 自检脚本注意：`runtime312/test_audio2lip_direct.py`、`test_audio2lip_init.py` 引用 audio_encoder，属环境自检——清理 runtime 目录会使其失效（次要备注）。
+
+**每步失败恢复语义三态与完成判据（Eng E2/T3）**：
+
+| 步骤 | 失败后行为 | 完成判据（产物 + 最小规模） |
+|---|---|---|
+| 预处理 1-9 | 重跑安全（幂等跳过已处理）；2/3/4 重跑=全量重做（代价高但正确） | 各输出目录非空；`mel/` npy 数 = split_5s_audio 段数 |
+| 预处理 10 | **禁止盲续跑**：中断即删净该视频 orifra/count/metadata/facemark 重跑（行数不一致地雷 §10-8） | 每段 count 帧数 = metadata 行数 = facemark 行数 = orifra 帧数 |
+| 预处理 9（重提特征后） | **必须 `--force`**（否则旧特征混入 §10-4） | lmdb_features mtime 晚于全部特征 npy |
+| 链路A | 崩溃=紧急保存，`--resume_ckpt <紧急产物>` 续训 | eval_finetune 过门槛（RUNBOOK 211-216）；产物含 gen 键 |
+| 链路B | 崩溃=紧急保存后 re-raise，`--resume_ckpt <产物>` 续训（新格式不回灌 gen） | eval 曲线平台期 + best ckpt 含 audio2lip 键 |
+| 部署打包 | 重跑安全（copy 幂等） | §9.3 三重验证（文件名+键+大小）通过 |
+
+**坏输入路径可见性（Eng E3）**：预处理各步对损坏视频/检测失败帧/空 clip 的处理不一（步骤 1 有效帧不足删输出、步骤 7 只保留有检测帧、步骤 10 失败帧写 NaN 行）——编排器日志必须输出**每步的跳过/失败计数**，计数 >0 时醒目标红，防止"静默产出残缺数据集"。
 
 ### 8.3 重训场景的最短链（换配方不换数据）
 
@@ -486,6 +515,18 @@ D:\AI\EDTalk\runtime312\python.exe train\train_audio2mouth.py --preload_features
 > 微调配方与 checkpoint 的可复现性是本项目的护城河载体（口型质量差异化所在）。本节是配方变更的唯一登记处。
 
 ### 9.1 模型链耦合（核心约束，决定重训范围）
+
+**数值契约（Eng H1，任一项改动 = 需重跑预处理 + 重训 + 重部署）**：
+
+| 契约项 | 值 | 断裂现象 |
+|---|---|---|
+| 音频采样率 | 16kHz（训练数据链与推理 push_full 一致） | 唇形静默错位/开合错乱 |
+| mel 窗口 | 200ms（hop 200 → 80 mel帧/s；每视频帧取 16 列，起点=当前帧前 2 帧） | 训练/推理 mel 语义不一致 → audio2lip 输出失效 |
+| 训练 clip 长度 | T=5 帧（mel/lip/pose/bbox/target 同切 `r:r+5`） | dataset 构建 clip 起点集错误 → 训练数据残缺 |
+| lip feature 维度 | 20 维（dim 2/13/16=开合度） | audio2lip 与 Direction 接口断裂 |
+| pose feature 维度 | 6 维 | 同上 |
+| 图像域 | 256×256 crop，[-1,1] 归一化 | 贴回/渲染错位 |
+
 
 ```
 ckpts/EDTalk_lip_pose.pt['gen'] ──(步骤8 特征提取器)──► lip_feature 空间（20维）
@@ -515,12 +556,19 @@ ckpts/EDTalk_lip_pose.pt['gen'] ──(步骤8 特征提取器)──► lip_fea
 
 **部署契约（唯一硬性接口）**：`<character_dir>/checkpoint/` 下 `new.pt`（含 gen 键）+ `audio2lip.pt`（含 audio2lip 键）**同时存在、文件名固定**；加载端 `torch.load(..., weights_only=False)`（ckpt 内嵌 pickle args——只加载自产 ckpt，勿引入外部文件，RUNBOOK.md:222）。
 
-**手动部署步骤**（当前无自动脚本，TODOS 登记）：
+**手动部署步骤**（当前无自动脚本，TODOS 登记；**每步附产物验证，Eng H2**）：
 ```powershell
+# 1. 链路A 定版 → new.pt（部署前先验证产物存在且含 gen 键）
+python -c "import torch; ck=torch.load(r'ckpt_models\wy_runC\checkpoint\035000.pt',weights_only=False); print('gen' in ck, len(ck['gen']))"
 copy ckpt_models\wy_runC\checkpoint\035000.pt  wy\checkpoint\new.pt        # 链路A 定版
+# 2. 链路B 定版 → audio2lip.pt（E2 拐点）
+python -c "import torch; ck=torch.load(r'logs\Audio2Lip\wy\20260916_2123\checkpoint\epoch_001\066526.pt',weights_only=False); print('audio2lip' in ck)"
 copy logs\Audio2Lip\wy\20260916_2123\checkpoint\epoch_001\066526.pt  wy\checkpoint\audio2lip.pt  # 链路B 定版（E2）
-# 重启 realtime_serve 生效（模型只在启动时加载）
+# 3. 部署后验证（文件名+键+大小三重）：new.pt≈644MB / audio2lip.pt≈11MB
+Get-ChildItem wy\checkpoint | Select-Object Name, Length
+# 4. 重启 realtime_serve 生效（模型只在启动时加载）；/status 的 available_segments 复核
 ```
+> 工作区漂移防护（Eng A2）：部署源路径以"生成时的日志/记录"为准，勿凭记忆；copy 前的 python 键校验就是防"指向不存在或被覆盖产物"的最后一道闸。大规模重训时建议对定版 ckpt 记 SHA-256（`Get-FileHash`）入训练日志。
 
 ### 9.4 模块副本矩阵（编排/改码时勿混用）
 
@@ -537,16 +585,19 @@ copy logs\Audio2Lip\wy\20260916_2123\checkpoint\epoch_001\066526.pt  wy\checkpoi
 
 以下失败模式**无异常、无报错**，直接表现为"功能坏了"。整合排查从这张表开始：
 
-| # | 失败 | 触发 | 现象 | 排查路径 |
+| # | 失败 | 触发 | 现象 | 排查路径（可执行命令） |
 |---|---|---|---|---|
-| 1 | **`/audio/push` 死路径** | 按旧契约推流式分块音频 | 200 正常返回，但无口型；数据堆积内存 | 换 `/audio/push_full`（§3.3 差异#1）；PIPELINE_MAP §5 |
-| 2 | **PCM 规格不符** | 推送非 16kHz/非单声道/非 int16 | 口型错乱或无反应，无报错 | 先验 PCM 头：`ffprobe -show_streams`；服务端无校验 |
-| 3 | **渲染线程熔断停摆** | 连续 ~30s 单帧失败 | HTTP 200 正常、`/status.last_error` 有值、画面冻结 | GET /status 看 last_error；AI-Vtuber supervisor 应监控该字段并重启进程 |
-| 4 | **LMDB 旧特征混入** | 重提特征后未 `prepare_feature_lmdb --force` | 训练"成功"但学的是旧 lip_feature（评估不涨） | 重提特征后必跑步骤 9 加 `--force`（或删 lmdb_features/ 目录） |
-| 5 | fastrag 检索空结果 | Config.toml 路径相对目录错拿（CWD 有同名文件） | /query 200 但 answer 兜底话术、context 空 | 检查 FASTRAG_CONFIG 绝对路径；/health 的 chunks 数应=145（与知识库一致） |
-| 6 | fastrag 批量静默截断 | 用 /batch_query 传多条 | 只有第一条被回答，无任何提示 | 逐条 /query 或调大 max_batch_size |
-| 7 | UnityCapture 后端静默回退 | 未注册滤镜但装过 OBS 虚拟摄像头 | 画面出现在 OBS 摄像头而非 UnityCapture 设备 | 查启动日志 `_active_backend`；先跑 Install.bat |
-| 8 | 步骤 10 中断续跑行数不一致 | 预处理中断后续跑 | 训练 facemark fail-fast / 服务 ValueError: Data mismatch | 删净该视频 orifra/count/metadata/facemark 四处重跑 |
+| 1 | **`/audio/push` 死路径** | 按旧契约推流式分块音频 | 200 正常返回，但无口型；数据堆积内存 | 换 `/audio/push_full`。实测确认：`curl -X POST http://127.0.0.1:8000/audio/push -H "Content-Type: application/json" -d "{\"pcm_base64\":\"AAAA\",\"seq\":0}"` 返回 `{ok,...}` 但口型不动（对照 push_full 同 payload 有口型） |
+| 2 | **PCM 规格不符** | 推送非 16kHz/非单声道/非 int16 | 口型错乱或无反应，无报错 | `ffprobe -show_streams <tts输出.wav>` 核对 sample_rate=16000/channels=1/codec=pcm_s16le；不符先 `ffmpeg -i in.wav -ar 16000 -ac 1 -sample_fmt s16 out.wav` |
+| 3 | **渲染线程熔断停摆** | 连续 ~30s 单帧失败 | HTTP 200 正常、画面冻结 | `curl http://127.0.0.1:8000/status` 看 `last_error` 非空即熔断；supervisor 监控该字段并重启进程 |
+| 4 | **LMDB 旧特征混入** | 重提特征后未 `prepare_feature_lmdb --force` | 训练"成功"但学的是旧 lip_feature | 比对新鲜度：`ls -l --time-style=full-iso wy\lip_feature\1#1.npy wy\lmdb_features\data.mdb`——lmdb_features 的 mtime 必须晚于全部特征 npy；否则重跑步骤 9 加 `--force` |
+| 5 | fastrag 检索空结果 | Config.toml 路径相对目录错拿（CWD 有同名文件） | /query 200 但 answer 兜底话术、context 空 | `curl http://127.0.0.1:11420/health`——`chunks` 数应=知识库实际块数（当前 145）；不符即 Config 错拿，改用 `FASTRAG_CONFIG` 绝对路径重启 |
+| 6 | fastrag 批量静默截断 | 用 /batch_query 传多条 | 只有第一条被回答，无任何提示 | 逐条 /query（或临时 `$env:FASTRAG_SERVER__MAX_BATCH_SIZE="8"` 重启验证覆盖生效） |
+| 7 | UnityCapture 后端静默回退 | 未注册滤镜但装过 OBS 虚拟摄像头 | 画面出现在 OBS 摄像头而非 UnityCapture 设备 | 查服务启动日志 `_active_backend` 字样；先跑 `UnityCapture-master\Install\Install.bat`（管理员） |
+| 8 | 步骤 10 中断续跑行数不一致 | 预处理中断后续跑 | 训练 facemark fail-fast / 服务 ValueError: Data mismatch | `(Get-ChildItem wy\count\1).Count` vs `python -c "import numpy as np; print(len(np.load(r'wy\metadata\1.npy'), axis=None) if np.load(r'wy\metadata\1.npy').ndim>1 else len(np.load(r'wy\metadata\1.npy')))"` 不一致即删净该视频 orifra/count/metadata/facemark 四处重跑 |
+| 9 | **push_full 过载无背压**（Eng E1） | 弹幕高峰连续密集推送整句 | 推送 200 但口型越排越晚（延迟累积），无丢弃/熔断 | AI-Vtuber 侧单飞行句 + 队列上限（建议 ≤2）；观察 `/status.buffer_ms` 与 `preroll_state` 持续增长即过载 |
+
+**熔断恢复验证**（整合验收用）：手动 `taskkill /F /PID <realtime_serve pid>` 后 supervisor 应在 ≤30s 内重启并重新就绪（/status preroll_state==complete）。
 
 ---
 
@@ -570,7 +621,19 @@ copy logs\Audio2Lip\wy\20260916_2123\checkpoint\epoch_001\066526.pt  wy\checkpoi
 
 ## 12. 整合验收清单
 
-> 终态定义：每条含判定方法。全部通过 = 整合准备完成、可进入实施收尾。
+### 12.0 整合前冒烟清单（Eng T2——依赖关系本身的验证，先于一切对接代码）
+
+| # | 冒烟项 | 命令/操作 | 通过判据 |
+|---|---|---|---|
+| S1 | realtime_serve 裸跑 | `cd D:\AI\EDTalk && runtime312\python.exe -m realtime_serve.main --character-dir wy --segments auto` | 启动无异常；`curl 127.0.0.1:8000/status` 得 preroll_state==complete |
+| S2 | push_full 口型 | 用 §10-2 命令验 PCM 后推一句 16kHz wav 的 base64 | 虚拟摄像头可见口型，`/status.buffer_ms` 正常 |
+| S3 | fastrag exe 裸跑 | `FASTRAG_CONFIG=<绝对路径>` 下启动 server.exe | `/health` 200 且 chunks=145 |
+| S4 | fastrag 查询 | `curl -X POST 127.0.0.1:11420/query -d "{\"question\":\"测试\"}" -H "Content-Type: application/json"` | 200 且 answer 非兜底话术 |
+| S5 | 一键训练干跑 | `run_preprocess.py --base_dir wy --dry_run` | 11 步命令全部打印、无脚本缺失报错 |
+| S6 | 虚拟摄像头设备 | OBS 源列表出现 UnityCapture 设备 | 有（且 `_active_backend`=unitycapture） |
+| S7 | GPT-SoVITS 采样率 | `ffprobe` 任一 TTS 输出 wav | sample_rate=16000（对接纪要已确认，复验防 TTS 配置漂移） |
+
+### 12.1 终态验收（每条含判定方法）
 
 | # | 验收项 | 判定方法 |
 |---|---|---|
