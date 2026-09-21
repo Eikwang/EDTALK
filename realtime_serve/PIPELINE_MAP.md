@@ -109,34 +109,40 @@ GazeCorrector.correct(eye_source 256² GPU, canvas 256² GPU, facemark_256,
 ──────────────────────────────────────────────────────────────────────────
  门控/旁路（零成本路径，逐帧计数）:
    gaze_frame 存在（预处理 gaze_data/<段>.npy，首选路径）:
-     state=1 眨眼       → 整帧旁路 (blink_skips++)
-     state=2 检测失败   → 整帧旁路 (nan_skips++)   ⚠ 计划 E5 的
-                        "hold 上一帧中心继续修正"未实现——实现为旁路，
-                        未检出帧夹在修正帧中间会露出未纠正眼
+     state=1 眨眼       → 贴未修正原生眼（ori 模式）/ 整帧旁路（rendered 模式）
+     state=2 检测失败   → 不贴回（几何不可信）+ 清生成历史（ENG F3）
      state=0            → 眼中心/eye_size 全部来自预计算（离线时序，最稳）
+   bypass 不变式（ori 模式）：gaze on ⇒ 最终眼一律原生源——眨眼/门关帧
+   贴未修正原生眼，消除 Generator 眼/原生眼交替闪烁（GAZE_TIMING_PLAN）
    gaze_frame 为 None（该段无 gaze_data）→ 实时 facemark 回退路径（更噪）:
      facemark NaN       → 旁路 (nan_skips++)
      EMA 眼中心平滑（α=0.4，>20px 大位移降权 0.3）
      eye_size 首帧锁定（1.5×眼眶外接，clamp 16..128）
      EAR 眨眼状态机（CLOSE 0.12 / OPEN 0.16 / 确认 3 帧 / 上限 26 帧）
      → 眨眼中           → 旁路 (blink_skips++)
- 纠正执行（双眼一批，全 GPU）:
-   clone rendered（新 tensor，禁 in-place——防预载缓冲污染/回绕二次修正）
-   每眼: slice 方框(eye_size) → F.interpolate↑64² (antialias=True)
+ 纠正执行（两段式，ori 模式；rendered 模式仅第二段且逐位=旧行为）:
+   第一段（不受门控, ENG F2）: 原生眼贴回——eye_source 眼区 × 圆形mask
+     混入 canvas（眨眼/门关帧到此为止）
+   第二段（受 _gaze_allowed 门控）: clone canvas（新 tensor，禁 in-place）
+   每眼: 从 eye_source slice 方框(eye_size) → F.interpolate↑64² (antialias)
    → batch [2,3,64,64] → gaze Generator 前向
        CUDA Graph replay（_static_in/_static_angles/_static_out）或 eager 回退
        angles = [[-conv, 0, -1], [+conv, 0, 1]]   conv=convergence_h（热更）
        ⚠ 角度第 2 分量恒 0.0（无垂直/俯仰分量暴露）；±1 为左右眼方向位
    → 时序平滑: gen = 0.7×新帧 + 0.3×上帧（_temporal_alpha 写死，无热旋钮）
        连续跳过 >3 帧 → 清历史防鬼影；convergence 变更 >0.2 → 清历史
-   → 逐通道 μ/σ 颜色迁移（对齐 rendered 眼区均值/方差；T7 已验证与
-     skimage.match_histograms 肉眼不可分辨）→ clamp[-1,1]
+   → 逐通道 μ/σ 颜色迁移（参照=eye_source 眼区——眼须像"本人"的原眼；
+     rendered 模式下 source==canvas 故与旧行为逐位一致）→ clamp[-1,1]
    → F.interpolate↓回方框 → 圆形 mask(64² GPU 常量, resize 匹配) blend 写回
+ 错误兜底: 域守卫（形状/设备/[-1,1]）+ 任何异常 → 原样返回 canvas
+   (error_skips++，首次打栈，不杀渲染循环)；eye_source 校验在 owner 层（F9）
+ 热切: set_eye_source('ori'|'rendered')——拒绝式校验，切换清生成历史
  错误兜底: 任何异常 → 原样返回 (error_skips++，首次打栈，不杀渲染循环)
  状态: switch_segment → reset()（眼中心/eye_size/blink/平滑历史/计数全清）
  观测: /status → gaze_state(on|off|adaptive) + gaze_graph(captured|eager)
-       + gaze_frames{corrected, blink_skips, nan_skips, error_skips} + gaze_params
-       + 渲染 timing 直方图 gaze 键（p50/p95/p99）
+       + gaze_frames{corrected, blink_skips, nan_skips, error_skips,
+         pristine_fallback(预载未命中→就地降级计数)} + gaze_params{...,eye_source}
+       + 渲染 timing 直方图 gaze 键（p50/p95/p99，=上传+转换+correct+贴回全程）
 ```
 
 **与 mask 的耦合（关键）**：纠正后的眼睛能否出现在最终帧，取决于 compositor mask 是否
