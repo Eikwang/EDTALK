@@ -16,6 +16,7 @@ import time
 import threading
 from typing import Optional
 
+import cv2
 import numpy as np
 import torch
 
@@ -330,7 +331,8 @@ class RenderLoop:
 
     def queue_gaze_params(self, convergence: Optional[float] = None,
                           smooth_alpha: Optional[float] = None,
-                          mode: Optional[str] = None) -> None:
+                          mode: Optional[str] = None,
+                          eye_source: Optional[str] = None) -> None:
         """Stage gaze param changes; the render thread applies them at the
         next frame head (no cross-stream copy_/replay races). Values must be
         validated by the caller BEFORE queueing."""
@@ -341,6 +343,8 @@ class RenderLoop:
             params['smooth_alpha'] = smooth_alpha
         if mode is not None:
             params['mode'] = mode
+        if eye_source is not None:
+            params['eye_source'] = eye_source
         if params:
             self._pending_gaze_params = params
 
@@ -364,6 +368,8 @@ class RenderLoop:
                 gc.set_convergence(pending['convergence'])
             if 'smooth_alpha' in pending:
                 gc.smooth_alpha = pending['smooth_alpha']
+            if 'eye_source' in pending:
+                gc.set_eye_source(pending['eye_source'])
 
     def start(self):
         """Start the rendering loop in a separate thread."""
@@ -727,15 +733,20 @@ class RenderLoop:
             rendered = self.model_manager.infer_frame(cropped, alpha_D_lip, cropped)
             rendered_c = rendered.clamp(-1, 1)
 
-            # Gaze correction on the rendered output (Route C', GPU-inline).
-            # Must run AFTER the generator (it erases input-side corrections)
-            # and BEFORE the compositor (mask includes eye regions).
-            if self.gaze_corrector is not None and self._gaze_allowed():
+            # Gaze correction — eye_source 分流（GAZE_TIMING_PLAN ENG F1a）:
+            # 'rendered' = legacy Route C' call site BEFORE repair, gated as a
+            # whole and bitwise-identical to the pre-change pipeline (the D
+            # rollback semantics, U11 regression contract). 'ori' = Route B,
+            # applied AFTER repair further below (un-gated native paste +
+            # gated generation, ENG F2).
+            if (self.gaze_corrector is not None
+                    and self.gaze_corrector.eye_source_mode == 'rendered'
+                    and self._gaze_allowed()):
                 t_gaze_0 = time.perf_counter()
                 gaze_frame = character_data.get_gaze_frame(video_idx) \
                     if hasattr(character_data, 'get_gaze_frame') else None
                 rendered_c = self.gaze_corrector.correct(
-                    rendered_c[0], facemark, gaze_frame).unsqueeze(0)
+                    rendered_c[0], rendered_c[0], facemark, gaze_frame).unsqueeze(0)
                 timings['gaze'] = (time.perf_counter() - t_gaze_0) * 1000.0
 
             rendered_post = (rendered_c[0] * 127.5 + 127.5).to(torch.uint8)
@@ -744,6 +755,14 @@ class RenderLoop:
             timings['gaze'] = 0.0
         timings['gen'] = (time.perf_counter() - t_gen_0) * 1000.0
 
+        # Pristine 256 crop (GAZE_TIMING_PLAN T1/X1): the decode-time copy of
+        # the orifra crop region — blend base (fixes the loop-wrap mouth
+        # drift) AND the 'ori' eye source. None → blend uses prepare_crop's
+        # own crop and the ori-mode gaze skips this frame's paste.
+        pristine = None
+        if self.compositor is not None:
+            pristine = character_data.get_pristine_crop(video_idx, orifra, meta)
+
         # CPU prep: resolve mask and resize ori crop for blending.
         t_comp_0 = time.perf_counter()
         prepared_crop = None
@@ -751,6 +770,11 @@ class RenderLoop:
         if self.compositor is not None and facemark is not None:
             mask_256 = self._resolve_mask(facemark, pre_mask)
             prepared_crop = self.compositor.prepare_crop(orifra, meta)
+            if prepared_crop is not None and pristine is not None:
+                # X1: blend against the pristine 256 crop instead of the
+                # blend-mutated orifra buffer — the paste-back base no longer
+                # drifts across loop wraps.
+                prepared_crop = (pristine, prepared_crop[1])
         timings['comp'] = (time.perf_counter() - t_comp_0) * 1000.0
 
         # Face repair
@@ -760,6 +784,45 @@ class RenderLoop:
             # GPU-inline: tensor in, tensor out; no numpy round trip.
             rendered_gpu_chw = self.face_repair.repair_gpu(rendered_gpu_chw)
         timings['repair'] = (time.perf_counter() - t_repair_0) * 1000.0
+
+        # Route B gaze (GAZE_TIMING_PLAN §3, 'ori' mode): AFTER repair — GPEN
+        # never touches the final visible eye pixels. Full timing window per
+        # ENG F8 (upload + conversions + correct + paste-back), so the
+        # 40fps gate trigger cannot be systematically dodged.
+        if (self.gaze_corrector is not None
+                and self.gaze_corrector.eye_source_mode == 'ori'
+                and rendered_gpu_chw is not None):
+            t_gaze_0 = time.perf_counter()
+            try:
+                if pristine is None:
+                    raise ValueError("pristine ori crop unavailable")
+                gaze_frame = character_data.get_gaze_frame(video_idx) \
+                    if hasattr(character_data, 'get_gaze_frame') else None
+                # uint8 BGR HWC CPU → float32 RGB CHW [-1,1] GPU (~0.3ms H2D)
+                eye_source = torch.from_numpy(
+                    np.ascontiguousarray(
+                        cv2.cvtColor(pristine, cv2.COLOR_BGR2RGB)
+                        .astype(np.float32).transpose(2, 0, 1)
+                    ) / 127.5 - 1.0
+                ).to(self.model_manager.device)
+                # uint8 BGR CHW GPU → float32 RGB CHW [-1,1]
+                canvas = (rendered_gpu_chw.float() / 127.5 - 1.0).flip(0)
+                corrected = self.gaze_corrector.correct(
+                    eye_source, canvas, facemark, gaze_frame,
+                    generate=self._gaze_allowed())
+                rendered_gpu_chw = ((corrected.clamp(-1, 1) + 1.0) * 127.5) \
+                    .to(torch.uint8).flip(0).contiguous()
+            except Exception as e:
+                # 降级链（CEO 义务块）：该帧维持 repaired rendered 眼（现状
+                # 观感）；corrector 内部异常由其自计数，此处只计转换/上传侧。
+                if self.gaze_corrector is not None:
+                    self.gaze_corrector.error_skips += 1
+                    if self.gaze_corrector.error_skips == 1:
+                        import traceback
+                        print(f"[RenderLoop] ori-mode gaze failed ({e}); "
+                              f"frame keeps repaired eyes. Traceback (once):")
+                        traceback.print_exc()
+            timings['gaze'] = (time.perf_counter() - t_gaze_0) * 1000.0
 
         # Single GPU->CPU download of the (optionally repaired) render.
         rendered_np = None

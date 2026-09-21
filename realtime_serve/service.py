@@ -240,7 +240,8 @@ class RealtimeService:
 
     def set_gaze_params(self, convergence: Optional[float] = None,
                         mode: Optional[str] = None,
-                        smooth_alpha: Optional[float] = None) -> dict:
+                        smooth_alpha: Optional[float] = None,
+                        eye_source: Optional[str] = None) -> dict:
         """Hot-update gaze params (next-frame effective).
 
         REJECTIVE validation (never clamps). With the corrector constructed,
@@ -248,9 +249,14 @@ class RealtimeService:
         eye-mask epoch make on→off restore native eyes). Without it
         (startup --gaze-correction off) every call raises RuntimeError
         (HTTP 409); lazy off→on init is a registered TODO.
+        eye_source (GAZE_TIMING_PLAN DX 发现1): 'ori' | 'rendered' — the
+        runtime rollback selector; 'rendered' restores the legacy Route C'
+        behavior bitwise (D, U11 contract).
         """
-        if convergence is None and mode is None and smooth_alpha is None:
-            raise ValidationError("至少提供 convergence / mode / smooth_alpha 之一")
+        if (convergence is None and mode is None and smooth_alpha is None
+                and eye_source is None):
+            raise ValidationError("至少提供 convergence / mode / smooth_alpha / "
+                                  "eye_source 之一")
         if self.gaze_corrector is None:
             raise NotEnabledError(
                 "gaze 校正未构造——需以 --gaze-correction on|adaptive 启动"
@@ -271,9 +277,14 @@ class RealtimeService:
             raise ValidationError(
                 f"mode 必须为 {_VALID_GAZE_MODES} 之一，got '{mode}'"
                 f"（当前值 {self.render_loop.gaze_mode}）")
+        if eye_source is not None and eye_source not in ('ori', 'rendered'):
+            raise ValidationError(
+                f"eye_source 必须为 ('ori', 'rendered') 之一，got '{eye_source}'"
+                f"（当前值 {self.gaze_corrector.eye_source_mode}）")
         self.render_loop.queue_gaze_params(convergence=convergence,
                                            smooth_alpha=smooth_alpha,
-                                           mode=mode)
+                                           mode=mode,
+                                           eye_source=eye_source)
         return {'ok': True, 'effective': 'next_frame'}
 
     def set_repair_params(self, mode: str) -> dict:
@@ -373,11 +384,14 @@ class RealtimeService:
                 'blink_skips': gc.blink_skips,
                 'nan_skips': gc.nan_skips,
                 'error_skips': gc.error_skips,
+                'pristine_fallback': getattr(self.character_data,
+                                             'pristine_fallbacks', 0),
             }
             status['gaze_params'] = {
                 'convergence': gc.convergence_h,
                 'mode': rl.gaze_mode,
                 'smooth_alpha': gc.smooth_alpha,
+                'eye_source': gc.eye_source_mode,
             }
         else:
             status['gaze_state'] = 'off'

@@ -22,6 +22,7 @@ class Config:
     gaze_mode: str = 'off'  # 'off' | 'on' | 'adaptive' (gaze correction on rendered output)
     gaze_convergence: float = 0.05  # convergence angle [-1,1] space (dynamic via set_convergence)
     gaze_ckpt: str = 'realtime_serve/weights/current_model.ckpt'  # gaze model weights
+    gaze_eye_source: str = 'ori'  # 'ori' (原生眼源, repair 后贴回) | 'rendered' (legacy C', repair 前) — GAZE_TIMING_PLAN DX 发现1
     unitycapture_enabled: bool = True  # False = 无摄像头运行（原 --no-unitycapture）
     face_repair_weights: str = 'realtime_serve/weights/facefix256.onnx'
     api_token: Optional[str] = None  # 非空时 HTTP 面要求 Authorization: Bearer <token>
@@ -55,6 +56,10 @@ class Config:
         if self.gaze_mode not in ('off', 'on', 'adaptive'):
             raise ValueError(
                 f"gaze_mode must be 'off', 'on' or 'adaptive', got '{self.gaze_mode}'"
+            )
+        if self.gaze_eye_source not in ('ori', 'rendered'):
+            raise ValueError(
+                f"gaze_eye_source must be 'ori' or 'rendered', got '{self.gaze_eye_source}'"
             )
         if not (-1.0 <= self.gaze_convergence <= 1.0):
             raise ValueError(

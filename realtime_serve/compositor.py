@@ -199,9 +199,13 @@ class MouthCompositor:
 
         Returns:
             Composited 1080p frame (H, W, 3) BGR uint8.
-            NOTE: The crop region of orifra_frame is modified in-place.
-                  This is safe because the preloaded buffer is replaced
-                  before any frame is reused.
+            NOTE: The crop region of orifra_frame is modified in-place —
+                  that write IS the output frame. Loop wraps re-render the
+                  same preloaded buffer, which is why the paste-back BASE
+                  must come from the decode-time pristine crop
+                  (BatchPreloader.get_pristine / extract_pristine_crop, see
+                  GAZE_TIMING_PLAN T1/X1): blending against the mutated
+                  orifra itself used to drift across wraps.
 
         Raises:
             ValueError: If facemark is None

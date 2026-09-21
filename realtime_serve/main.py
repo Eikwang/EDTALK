@@ -141,6 +141,15 @@ def parse_args():
         help="Path to the gaze generator checkpoint"
     )
     parser.add_argument(
+        "--gaze-eye-source",
+        choices=["ori", "rendered"],
+        default="ori",
+        help="Gaze eye pixel source (GAZE_TIMING_PLAN). 'ori': correct the "
+             "pristine orifra eyes and paste AFTER face repair — eyes stay in "
+             "the native quality domain (default). 'rendered': legacy Route C' "
+             "behavior (pre-repair self-correction, bitwise rollback path D)."
+    )
+    parser.add_argument(
         "--segments",
         nargs="+",
         default=None,
@@ -325,9 +334,11 @@ def setup_service(config: Config, no_unitycapture: bool = False,
                 f"--gaze-correction {config.gaze_mode}. Check the path or run "
                 f"with the default --gaze-correction off.")
         print(f"[5b] Initializing gaze corrector (mode: {config.gaze_mode}, "
-              f"convergence: {config.gaze_convergence})...")
+              f"convergence: {config.gaze_convergence}, "
+              f"eye_source: {config.gaze_eye_source})...")
         gaze_corrector = GazeCorrector(config.gaze_ckpt,
-                                       convergence_h=config.gaze_convergence)
+                                       convergence_h=config.gaze_convergence,
+                                       eye_source=config.gaze_eye_source)
         captured = gaze_corrector.try_capture_graph()
         print(f"[5b] gaze CUDA graph: {'captured' if captured else 'eager fallback'}")
         character_data.set_eyes_enabled(True)
@@ -432,6 +443,7 @@ def main():
         gaze_mode=args.gaze_correction,
         gaze_convergence=args.gaze_convergence,
         gaze_ckpt=args.gaze_ckpt,
+        gaze_eye_source=args.gaze_eye_source,
         buffer_frames=args.buffer_frames,
         preroll_frames=args.preroll_frames,
         gen_fp16=args.gen_fp16,
@@ -487,7 +499,7 @@ def main():
     print(f"  POST /audio/push_full   - Push full audio segment (file-based)")
     print(f"  POST /segment/switch    - Switch segment (at=immediate|segment_end)")
     print(f"  POST /segment/schedule  - Replace playback schedule (align=false default)")
-    print(f"  POST /gaze/params       - Hot-update gaze convergence/mode/smooth_alpha")
+    print(f"  POST /gaze/params       - Hot-update gaze convergence/mode/smooth_alpha/eye_source")
     print(f"  POST /repair/params     - Hot-switch face repair mode")
     print(f"  GET  /status            - Get service status")
     print("\nPress Ctrl+C to stop.\n")

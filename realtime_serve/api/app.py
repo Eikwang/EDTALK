@@ -63,6 +63,10 @@ class GazeParamsRequest(BaseModel):
     mode: Optional[str] = Field(
         default=None, pattern=r"^(off|on|adaptive)$",
         description="gaze 门控；on→off 恢复原生眼（mask epoch 联动）")
+    eye_source: Optional[str] = Field(
+        default=None, pattern=r"^(ori|rendered)$",
+        description="眼像素源：ori=原生眼源(默认)/rendered=legacy 行为回滚 "
+                    "(GAZE_TIMING_PLAN DX 发现1)")
 
 
 class RepairParamsRequest(BaseModel):
@@ -177,11 +181,13 @@ def create_app(service: RealtimeService,
             return service.set_gaze_params(
                 convergence=request.convergence,
                 smooth_alpha=request.smooth_alpha,
-                mode=request.mode)
+                mode=request.mode,
+                eye_source=request.eye_source)
         except Exception as e:
             _map_control_errors(
                 e, "先读 GET /status 的 gaze_capable；convergence ∈ [-1,1]，"
-                   "smooth_alpha ∈ [0,1)，mode ∈ off|on|adaptive")
+                   "smooth_alpha ∈ [0,1)，mode ∈ off|on|adaptive，"
+                   "eye_source ∈ ori|rendered")
 
     @app.post("/repair/params")
     def set_repair_params(request: RepairParamsRequest):

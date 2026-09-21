@@ -44,6 +44,14 @@ MAX_BLINK_FRAMES = 26
 # (temporal_alpha=0.7 decays the previous frame at 0.3^n).
 CONVERGENCE_GHOST_DELTA = 0.2
 
+# Eye-source modes (GAZE_TIMING_PLAN DX 发现1 / ENG F1a):
+#   'ori'      — gaze generates from the pristine orifra crop's native eyes
+#                and pastes onto the repaired rendered crop AFTER face repair
+#                (two-phase: un-gated native paste + gated generation).
+#   'rendered' — legacy Route C' semantics, bitwise-identical to the pre-change
+#                pipeline (call site BEFORE face repair, self-corrected).
+_VALID_EYE_SOURCES = ('ori', 'rendered')
+
 
 class GazeCorrector:
     """GPU-inline gaze correction on the rendered 256 crop.
@@ -57,10 +65,14 @@ class GazeCorrector:
 
     def __init__(self, ckpt_path: str, device: str = 'cuda',
                  convergence_h: float = 0.05, smooth_alpha: float = 0.4,
-                 image_size: int = 64):
+                 image_size: int = 64, eye_source: str = 'ori'):
         self.device = torch.device(device)
         self.smooth_alpha = smooth_alpha
         self.image_size = image_size
+        if eye_source not in _VALID_EYE_SOURCES:
+            raise ValueError(
+                f"eye_source 必须为 {_VALID_EYE_SOURCES} 之一，got '{eye_source}'")
+        self._eye_source = eye_source
 
         self.generator = Generator(style_dim=3)
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
@@ -116,6 +128,28 @@ class GazeCorrector:
         """Public read-only echo for /status (H4: never read the _private)."""
         return self._convergence_h
 
+    @property
+    def eye_source_mode(self) -> str:
+        """'ori' | 'rendered' — read by the render loop to pick the call site
+        (GAZE_TIMING_PLAN ENG F1a)."""
+        return self._eye_source
+
+    def set_eye_source(self, mode: str) -> None:
+        """Hot-switch the eye-source mode (owner-layer rejective validation —
+        ENG F9, M17 pattern: the HTTP/CLI layer is only the first gate).
+
+        'ori' ↔ 'rendered' switches the semantic contract; the temporal
+        smoothing history is invalidated (the two modes paste onto different
+        domains — lerping across the switch would ghost).
+        """
+        if mode not in _VALID_EYE_SOURCES:
+            raise ValueError(
+                f"eye_source 必须为 {_VALID_EYE_SOURCES} 之一，got '{mode}'"
+                f"（当前值 {self._eye_source}）")
+        if mode != self._eye_source:
+            self._eye_source = mode
+            self._prev_gen = None
+
     def set_convergence(self, convergence_h: float) -> None:
         """Change the convergence angle at runtime (takes effect next frame).
 
@@ -156,63 +190,43 @@ class GazeCorrector:
         self.error_skips = 0
 
     @torch.inference_mode()
-    def correct(self, rendered: torch.Tensor, facemark_256: np.ndarray,
-                gaze_frame: Optional[dict] = None) -> torch.Tensor:
-        """Correct both eyes of a rendered 256 crop.
+    def correct(self, eye_source: torch.Tensor, canvas: torch.Tensor,
+                facemark_256: Optional[np.ndarray],
+                gaze_frame: Optional[dict] = None,
+                generate: bool = True) -> torch.Tensor:
+        """Correct both eyes using eye_source pixels pasted onto canvas.
+
+        Dual-tensor contract (GAZE_TIMING_PLAN T2 / DX D11 — the eye is read
+        from eye_source, pasted into canvas, a NEW tensor is returned):
 
         Args:
-            rendered: (3,256,256) RGB float [-1,1] on GPU — the Generator output.
+            eye_source: (3,256,256) RGB float [-1,1] on GPU — the eye pixel
+                donor. Pristine orifra crop ('ori' mode) or the rendered crop
+                itself ('rendered' legacy mode).
+            canvas: (3,256,256) RGB float [-1,1] on GPU — the paste target
+                (repaired rendered crop in 'ori' mode). NEVER mutated.
             facemark_256: (68,2) 256-space landmarks for this frame (numpy),
-                          possibly containing NaN for detection-failure frames.
-                          Only used when gaze_frame is None (legacy realtime path).
-            gaze_frame: optional per-frame dict from precomputed gaze_data
-                        (prepare_gaze_data.py step 11) with keys
-                        state/l_center/r_center/eye_size. When provided the
-                        blink decision and eye trajectory come from the
-                        offline time-series (far more stable than per-frame
-                        realtime landmarks) — the recommended path.
+                possibly NaN on detection-failure frames. Legacy geometry
+                path when gaze_frame is None.
+            gaze_frame: optional precomputed per-frame dict (state/l_center/
+                r_center/eye_size) — the recommended geometry path.
+            generate: gate the GPU forward ONLY (ENG F2 — the native-eye
+                paste is un-gated). The render loop passes _gaze_allowed()
+                here in 'ori' mode. Ignored in 'rendered' mode (the legacy
+                call site gates the whole call, bitwise-identical semantics).
 
         Returns:
-            New (3,256,256) tensor. Same device/domain. Never mutates the input.
+            NEW (3,256,256) tensor: canvas with its eye regions replaced by
+            (corrected) eye_source eyes. Neither input is ever mutated (G4).
         """
         try:
-            if gaze_frame is not None:
-                state = int(gaze_frame['state'])
-                if state == 1:
-                    self.blink_skips += 1
-                    self._note_skip()
-                    return rendered
-                if state == 2:
-                    self.nan_skips += 1
-                    self._note_skip()
-                    return rendered
-                eye_size = int(gaze_frame['eye_size'])
-                lx, ly = gaze_frame['l_center']
-                rx, ry = gaze_frame['r_center']
-                boxes = [(float(lx), float(ly), eye_size),
-                         (float(rx), float(ry), eye_size)]
-            else:
-                if facemark_256 is None or np.any(np.isnan(facemark_256)):
-                    self.nan_skips += 1
-                    self._note_skip()
-                    return rendered
-
-                l_info, r_info = self._eye_state(facemark_256)
-                if l_info is None:
-                    # Blink in progress: bypass entirely.
-                    self.blink_skips += 1
-                    self._note_skip()
-                    return rendered
-
-                boxes = []
-                for (cx, cy), eye_size in ((l_info, self._fixed_eye_size),
-                                           (r_info, self._fixed_eye_size)):
-                    boxes.append((cx, cy, eye_size))
-
-            out = self._correct_eyes(rendered, boxes)
-            self.corrected_frames += 1
-            self._skip_run = 0
-            return out
+            self._validate_input(eye_source, 'eye_source')
+            self._validate_input(canvas, 'canvas')
+            if self._eye_source == 'rendered':
+                return self._correct_rendered(eye_source, canvas,
+                                              facemark_256, gaze_frame)
+            return self._correct_ori(eye_source, canvas, facemark_256,
+                                     gaze_frame, generate)
         except Exception as e:
             self.error_skips += 1
             # Rate-limited: a silent bypass loop would hide programming
@@ -222,11 +236,191 @@ class GazeCorrector:
                 print(f"[GazeCorrector] correction failed ({e}); "
                       f"bypassing. Traceback (once):")
                 traceback.print_exc()
-            return rendered
+            return canvas
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _validate_input(self, t: torch.Tensor, name: str) -> None:
+        """Domain guard (DX 发现4/DX-T2): shape / device / [-1,1] domain.
+        Failure raises — the correct() wrapper degrades to the un-pasted
+        canvas and counts error_skips."""
+        if (not torch.is_tensor(t) or t.dim() != 3
+                or tuple(t.shape) != (3, 256, 256)):
+            raise ValueError(
+                f"{name} 形状非法: {tuple(t.shape) if torch.is_tensor(t) else type(t)}"
+                "（期望 (3, 256, 256)）")
+        if t.device != self.device:
+            raise ValueError(
+                f"{name} 设备不符: {t.device}（期望 {self.device}）")
+        if not bool(torch.isfinite(t).all()):
+            raise ValueError(f"{name} 含 NaN/inf")
+        m = float(t.abs().max())
+        if m > 1.001:
+            raise ValueError(f"{name} 数值域非法: |max|={m:.3f}（期望 [-1, 1]）")
+
+    def _invalidate_history(self) -> None:
+        """Drop the temporal-smoothing history (ENG F3): gate-off stretches
+        and mode switches must not lerp the next generated eye against a
+        stale pre-gap frame (visible ghost)."""
+        self._prev_gen = None
+        self._skip_run = 0
+
+    def _update_blink_state(self, min_ear: float) -> bool:
+        """Advance the EAR blink state machine (port of the legacy logic,
+        shared by both geometry paths — DRY). Returns True while a blink is
+        in progress (generation must bypass)."""
+        if min_ear < EAR_CLOSE:
+            self._low_ear_count += 1
+            self._open_confirm = 0
+        elif self._low_ear_count > 0:
+            if min_ear < EAR_OPEN:
+                self._open_confirm = 0
+            else:
+                self._open_confirm += 1
+                if self._open_confirm >= OPEN_CONFIRM_FRAMES:
+                    self._low_ear_count = 0
+                    self._open_confirm = 0
+        else:
+            self._open_confirm = 0
+        return 0 < self._low_ear_count <= MAX_BLINK_FRAMES
+
+    def _correct_rendered(self, eye_source: torch.Tensor,
+                          canvas: torch.Tensor,
+                          facemark_256: Optional[np.ndarray],
+                          gaze_frame: Optional[dict]) -> torch.Tensor:
+        """Legacy Route C' semantics — bitwise-identical port of the
+        pre-change correct() (U11 regression contract): bypass frames return
+        the canvas UNTOUCHED (no native paste), generation source == paste
+        base == the rendered crop itself."""
+        if gaze_frame is not None:
+            state = int(gaze_frame['state'])
+            if state == 1:
+                self.blink_skips += 1
+                self._note_skip()
+                return canvas
+            if state == 2:
+                self.nan_skips += 1
+                self._note_skip()
+                return canvas
+            eye_size = int(gaze_frame['eye_size'])
+            lx, ly = gaze_frame['l_center']
+            rx, ry = gaze_frame['r_center']
+            boxes = [(float(lx), float(ly), eye_size),
+                     (float(rx), float(ry), eye_size)]
+        else:
+            if facemark_256 is None or np.any(np.isnan(facemark_256)):
+                self.nan_skips += 1
+                self._note_skip()
+                return canvas
+            l_info, r_info = self._eye_state(facemark_256)
+            if l_info is None:
+                # Blink in progress: bypass entirely.
+                self.blink_skips += 1
+                self._note_skip()
+                return canvas
+            boxes = [(l_info[0], l_info[1], self._fixed_eye_size),
+                     (r_info[0], r_info[1], self._fixed_eye_size)]
+
+        out = canvas.clone()
+        out = self._paste_generated(out, eye_source, boxes)
+        self.corrected_frames += 1
+        self._skip_run = 0
+        return out
+
+    def _correct_ori(self, eye_source: torch.Tensor,
+                     canvas: torch.Tensor,
+                     facemark_256: Optional[np.ndarray],
+                     gaze_frame: Optional[dict],
+                     generate: bool) -> torch.Tensor:
+        """Route B (GAZE_TIMING_PLAN §3): two-phase, un-gated native paste
+        + gated generation. Bypass invariant: with gaze on, the final eye
+        pixels ALWAYS come from the pristine ori crop — blink and gate-off
+        frames paste the uncorrected native eyes (no Generator-eye flicker)."""
+        if gaze_frame is not None:
+            state = int(gaze_frame['state'])
+            if state == 2:
+                # 检测失败：该帧几何不可信。当前 gaze_data 格式无可回退历史
+                # 中心 → 不贴回（canvas 眼保留）并清历史（ENG F3/E5 语义）。
+                self.nan_skips += 1
+                self._note_skip()
+                self._invalidate_history()
+                return canvas
+            eye_size = int(gaze_frame['eye_size'])
+            lx, ly = gaze_frame['l_center']
+            rx, ry = gaze_frame['r_center']
+            boxes = [(float(lx), float(ly), eye_size),
+                     (float(rx), float(ry), eye_size)]
+            blinking = state == 1
+        else:
+            if facemark_256 is None or np.any(np.isnan(facemark_256)):
+                self.nan_skips += 1
+                self._note_skip()
+                self._invalidate_history()
+                return canvas
+            # Centers + eye_size advance even when generation is gated (F3:
+            # the state machine must stay fresh for gate reopening).
+            boxes = []
+            for ids, prev in ((self.L_EYE, self._prev_left),
+                              (self.R_EYE, self._prev_right)):
+                pts = facemark_256[ids]
+                x1, y1 = pts.min(axis=0)
+                x2, y2 = pts.max(axis=0)
+                cx = self._smooth((x1 + x2) / 2.0,
+                                  prev[0] if prev else None, self.smooth_alpha)
+                cy = self._smooth((y1 + y2) / 2.0,
+                                  prev[1] if prev else None, self.smooth_alpha)
+                if self._fixed_eye_size is None:
+                    size = int(1.5 * max(x2 - x1, y2 - y1))
+                    self._fixed_eye_size = max(16, min(size, 128))
+                boxes.append((cx, cy, self._fixed_eye_size))
+            self._prev_left, self._prev_right = boxes[0][:2], boxes[1][:2]
+            min_ear = min(self._ear(facemark_256[self.L_EYE]),
+                          self._ear(facemark_256[self.R_EYE]))
+            blinking = self._update_blink_state(min_ear)
+
+        out = canvas.clone()
+        if blinking:
+            # Blink: paste the native (closed) eyes from the SAME ori frame —
+            # the pristine crop already contains the true blink appearance.
+            self.blink_skips += 1
+            self._note_skip()
+            self._invalidate_history()
+            return self._paste_native(out, eye_source, boxes)
+        if not generate:
+            # Adaptive gate off (production headroom low): native paste only.
+            self._invalidate_history()
+            return self._paste_native(out, eye_source, boxes)
+
+        out = self._paste_native(out, eye_source, boxes)
+        out = self._paste_generated(out, eye_source, boxes)
+        self.corrected_frames += 1
+        self._skip_run = 0
+        return out
+
+    def _paste_native(self, out: torch.Tensor, eye_source: torch.Tensor,
+                      boxes) -> torch.Tensor:
+        """Phase 1 (un-gated): restore the native eye_source eyes onto `out`
+        with the circular mask. No generation, no color transfer — the ori
+        pixels ARE the target appearance (T0-validated domain). Mutates
+        `out` (the caller owns the clone)."""
+        for cx, cy, eye_size in boxes:
+            half = eye_size / 2.0
+            x1 = int(round(cx - half))
+            y1 = int(round(cy - half))
+            x1c, y1c = max(0, x1), max(0, y1)
+            x2c = min(256, x1 + eye_size)
+            y2c = min(256, y1 + eye_size)
+            if x2c - x1c < 8 or y2c - y1c < 8:
+                continue
+            native = eye_source[:, y1c:y2c, x1c:x2c]
+            mk = F.interpolate(self._mask64.permute(2, 0, 1).unsqueeze(0),
+                               size=(y2c - y1c, x2c - x1c),
+                               mode='bilinear', antialias=True)[0]
+            region = out[:, y1c:y2c, x1c:x2c]
+            out[:, y1c:y2c, x1c:x2c] = native * mk + region * (1.0 - mk)
+        return out
 
     def _note_skip(self) -> None:
         """Track consecutive skip frames; invalidate the temporal-smoothing
@@ -277,27 +471,20 @@ class GazeCorrector:
 
         # Blink state machine (detection failure keeps correcting via the
         # hold-above; only actual blinks gate).
-        if min_ear < EAR_CLOSE:
-            self._low_ear_count += 1
-            self._open_confirm = 0
-        elif self._low_ear_count > 0:
-            if min_ear < EAR_OPEN:
-                self._open_confirm = 0
-            else:
-                self._open_confirm += 1
-                if self._open_confirm >= OPEN_CONFIRM_FRAMES:
-                    self._low_ear_count = 0
-                    self._open_confirm = 0
-        else:
-            self._open_confirm = 0
-
-        if 0 < self._low_ear_count <= MAX_BLINK_FRAMES:
+        blinking = self._update_blink_state(min_ear)
+        if blinking:
             return None, None
         return infos[0], infos[1]
 
-    def _correct_eyes(self, rendered: torch.Tensor,
-                      boxes) -> torch.Tensor:
-        out = rendered.clone()
+    def _paste_generated(self, out: torch.Tensor,
+                         eye_source: torch.Tensor,
+                         boxes) -> torch.Tensor:
+        """Phase 2: generate corrected eyes from eye_source regions and blend
+        them into `out` (the caller owns the clone; may already carry the
+        phase-1 native paste). Color-transfer reference = the eye_source
+        region — the eye must look like the ORIGINAL person's eye (T0
+        semantics); in 'rendered' mode source==canvas so this is bitwise
+        identical to the legacy behavior."""
         tensors = []
         coords = []
         for cx, cy, eye_size in boxes:
@@ -309,14 +496,14 @@ class GazeCorrector:
             y2c = min(256, y1 + eye_size)
             if x2c - x1c < 8 or y2c - y1c < 8:
                 continue
-            region = rendered[:, y1c:y2c, x1c:x2c].unsqueeze(0)
+            region = eye_source[:, y1c:y2c, x1c:x2c].unsqueeze(0)
             t = F.interpolate(region, size=(self.image_size, self.image_size),
                               mode='bilinear', antialias=True)
             tensors.append(t)
             coords.append((x1c, y1c, x2c - x1c, y2c - y1c))
 
         if not tensors:
-            return rendered
+            return out
 
         batch = torch.cat(tensors, dim=0)  # [2,3,64,64]
         gen = self._forward(batch)
@@ -330,7 +517,7 @@ class GazeCorrector:
 
         for i, (x1c, y1c, w, h) in enumerate(coords):
             eye = gen[i]
-            target = rendered[:, y1c:y1c + h, x1c:x1c + w]
+            target = eye_source[:, y1c:y1c + h, x1c:x1c + w]
             for c in range(3):
                 s_mean = eye[c].mean(); s_std = eye[c].std() + 1e-6
                 d_mean = target[c].mean(); d_std = target[c].std() + 1e-6
