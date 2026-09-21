@@ -229,3 +229,17 @@ batch4 + 4080S：50k iter 计划约 5-6h；D 饱和后（~15-20k）进入平台�
 ## 回滚
 
 本阶段改动集中在 `realtime_serve/output_buffer.py` 和渲染管线。若需要回退，可用 git revert 最近一次提交。
+
+
+## 视线纠正眼源切换（GAZE_TIMING_PLAN，2026-09-21）
+
+- `--gaze-eye-source ori|rendered`（默认 ori）：ori=纠正工作在 orifra 原生眼上、
+  贴回在面部修复之后（GPEN 不触碰最终可见眼像素）；rendered=legacy Route C'
+  行为（repair 前自纠正）——即行为回滚路径 D，逐位复现旧管线。
+- 运行时热切：`POST /gaze/params {"eye_source": "rendered"}`（无需重启）。
+- bypass 不变式：gaze on（ori）时眨眼/门关帧贴未修正原生眼——最终眼永远原生源。
+- 观测：`GET /status` → `gaze_params.eye_source`、`gaze_frames.pristine_fallback`
+  （预载窗口未命中、眼源走就地降级的帧数；持续增长 = 预载追不上，检查磁盘/并发）。
+- 排查：ori 模式下眼色不对 → 先查 pristine 通道序（单测 U10）；接缝可见 →
+  `eye_source=rendered` 复测分流定位；均不达标 → 回退 D（rendered）或 off。
+- 质量验收协议：对比视频必须在生产混合域出片（T6），不得用离线 probe 域替代批准。

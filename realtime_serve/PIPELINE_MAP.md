@@ -76,17 +76,22 @@ RenderLoop._run() ─ 每迭代 ─▶ _check_segment_schedule() → _process_fr
                    facemark 68点(256空间) / 预计算 mask(嘴[+眼])
  ⑥ Generator     CUDA Graph replay: (cropped, lip20, cropped) → rendered 256² [-1,1]
                  [gen p50 8.9ms；CUDA graph 静态缓冲，输出须当帧消费]
- ⑦ ★视线纠正     if gaze≠off 且 _gaze_allowed()（adaptive: buffer深度≥6）:
-   Route C'         rendered ← GazeCorrector.correct(rendered[0], facemark,
-                                 gaze_frame=预计算 dict 或 None)
-                    位置不变式：Generator 之后（输入端修正会被重绘抹除，
-                    probe 实测 eye_diff 1.8x 噪声 vs 输出端 29x）、
-                    uint8 之前、compositor 之前（mask 需含眼区才贴得回去）
+ ⑦ ★视线纠正     按 eye_source 分流（GAZE_TIMING_PLAN，ENG F1a）:
+                    'rendered'(legacy C')：此处调用（repair 前），
+                      _gaze_allowed 整体门控，逐位复现旧行为（U11 回归）
+                    'ori'(路线 B, 默认)：⑩修复之后调用（见下）——
+                      correct(eye_source=pristine原生眼, canvas=repaired)
+                      原生贴回不受门控（ENG F2），生成段受 _gaze_allowed
+                    位置不变式：输入端修正会被 Generator 重绘抹除
+                    （probe 实测 1.1x 噪声 vs 输出端强信号，2026-09-21 复验）
  ⑧ 量化          [-1,1] → uint8 CHW BGR（GPU）
  ⑨ CPU 准备      mask 解析（预载 mask 优先 / compositor 回退生成）
                  + prepare_crop（ori 裁剪区域预缩放 256²，供混合）
  ⑩ 面部修复      if repair≠off 且 _repair_allowed()（adaptive: buffer≥6）:
    GPEN-256         ORT IOBinding GPU 内联，α=0.7 [repair p50 7.2ms]
+ ⑦' ori 视线纠正 gaze on(ori) 时在此执行（GPEN 不再触碰最终可见眼像素）：
+   Route B          uint8 BGR→float RGB → correct(pristine, repaired) →
+                    uint8；timing gaze 键=上传+转换+correct+贴回全程（F8）
  ⑪ 下载          唯一一次 GPU→CPU（256² 渲染结果）
  ⑫ 贴回合成      compositor.blend: rendered×mask + ori_crop×(1-mask) → 贴回全帧
                  mask = 嘴部 hull(α=1) → 下颌+鼻翼(α=0) 平滑过渡；
@@ -98,7 +103,9 @@ RenderLoop._run() ─ 每迭代 ─▶ _check_segment_schedule() → _process_fr
 ## 4. 视线纠正内部流程（Route C' 展开，本次优化目标）
 
 ```
-GazeCorrector.correct(rendered 256² GPU [-1,1], facemark_256, gaze_frame)
+GazeCorrector.correct(eye_source 256² GPU, canvas 256² GPU, facemark_256,
+                      gaze_frame, generate) —— 双 tensor 契约（眼从
+                      eye_source 读、贴进 canvas、返回新张量，均不修改）
 ──────────────────────────────────────────────────────────────────────────
  门控/旁路（零成本路径，逐帧计数）:
    gaze_frame 存在（预处理 gaze_data/<段>.npy，首选路径）:
@@ -225,7 +232,8 @@ GET  /status           facade 单一构建器: production_fps/output_fps/buffer/
    眼纹理先经 256 渲染再上采样贴回；ENG 审查有"贴片感/纹理失配"案底（最终帧眼区是
    256 round-trip 软化像素，生成眼偏锐）。画质类优化的主战场在眼区生成模型/分辨率。
 2. **角度自由度受限**：angles 第 2 分量恒 0.0（无垂直分量暴露），仅水平 `convergence_h`
-   单值热更（`/gaze/params`），无逐眼独立、无眼动时序序列。
+   单值热更（`/gaze/params`），无逐眼独立、无眼动时序序列。（2026-09-21 眼源切换
+   已落地：约束 1/5/9 由路线 B 处置——详见 GAZE_TIMING_PLAN.md）
 3. **时序平滑 α=0.7 写死**（`_temporal_alpha`），无热旋钮（`smooth_alpha` 热更的是眼中心
    EMA，不是生成结果平滑）；连续跳过 >3 帧即清历史（一次 6 帧的眨眼就足以清空）。
 4. **EAR 阈值 0.12/0.16 是离线 1080p 域参数**，256 空间未校准（TODOS 在案；G6 修正）。
