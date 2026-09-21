@@ -114,3 +114,10 @@
 - **Cons:** 新增判别器 = 新基础设施 + GAN 平衡重调；H 的 vgg/l1 加权可能已足够。
 - **Context:** /autoplan（2026-09-04）ENG 阶段拒绝项留档 — 先看 H 的效果再决定。
 - **Depends on:** H（嘴区加权）实验结果不足时再启动。
+
+## 视线纠正时机优化——延迟项（2026-09-21 /autoplan）
+- [F] Generator 眼部忠实度微调（根因层解法）：当前眼像素经贴回补丁获得；微调使 Generator 重绘本身眼部忠实后可撤贴回。依赖：微调管线（fine_tune/ 既有）。优先级 P2。Context: GAZE_TIMING_PLAN.md §4-F。
+- [X3] 全脸身份保真审计：逐区域 probe orifra vs 生产域输出，量化"不像原图"的非眼区域贡献。优先级 P2。Context: CEO 声部发现1。
+- [战略] 生成时视线/眼部条件化：商业级数字人竞品的结构性路线（无贴回接缝/闪烁类伪影）。优先级 P3。Context: CEO 声部发现5。
+- [perf] pristine ori_crop_256 GPU 批量预载：省每帧 0.3ms H2D。当前非瓶颈。优先级 P3。
+- [既有] EAR 阈值 256 域校准；gaze off→on 运行时懒初始化（/gaze/params 409 现状）。继承自 GAZE_CORRECTION_PLAN 遗留。
