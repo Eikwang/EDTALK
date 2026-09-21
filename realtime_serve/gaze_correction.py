@@ -67,6 +67,11 @@ class GazeCorrector:
                  convergence_h: float = 0.05, smooth_alpha: float = 0.4,
                  image_size: int = 64, eye_source: str = 'ori'):
         self.device = torch.device(device)
+        if self.device.type == 'cuda' and self.device.index is None:
+            # torch.device('cuda') != torch.device('cuda:0')（Python 相等比较
+            # 为 False）——不钉索引会让域守卫在生产域拒绝每一帧（data.log
+            # 实案；CPU 测试环境无索引差异故未拦截）。绑定当前设备。
+            self.device = torch.device('cuda', torch.cuda.current_device())
         self.smooth_alpha = smooth_alpha
         self.image_size = image_size
         if eye_source not in _VALID_EYE_SOURCES:

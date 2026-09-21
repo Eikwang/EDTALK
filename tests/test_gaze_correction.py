@@ -382,3 +382,18 @@ class TestEyeSourceModes:
         snapshot = pristine.copy()
         frame[1000:1256, 500:756] = 10   # 模拟 blend 原地写
         assert np.array_equal(pristine, snapshot)
+
+    def test_u8b_device_index_normalization(self):
+        """回归（data.log 实案）：torch.device('cuda') != torch.device('cuda:0')
+        ——corrector 构造时必须钉住设备索引，且 cuda:0 张量必须通过域守卫
+        （修复前每帧被拒、gaze 静默失效）。"""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA 不可用")
+        c = GazeCorrector(CKPT, device='cuda', eye_source='ori')
+        assert c.device == torch.device('cuda', torch.cuda.current_device())
+        assert c.device != torch.device('cuda') or c.device.index is not None
+        src = torch.randn(3, 256, 256).clamp(-1, 1).to('cuda')
+        out = c.correct(src, src.clone(), None, self._gf(state=1))
+        assert c.error_skips == 0          # 设备守卫放行（修复前每帧拒绝）
+        assert torch.isfinite(out).all()
+        del c
