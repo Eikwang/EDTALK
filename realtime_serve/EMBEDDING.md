@@ -110,3 +110,10 @@ gaze/repair off→on 懒初始化、CHANGELOG。详见仓库 `TODOS.md`。
   状态码注记。方法面与 v0 无破坏性变更（快照测试守护）。
 - v0.2（2026-09-03）：音频-口型同步重构——消费端帧锁定（音频跟随口型，
   领先 ≤~40ms 绝不滞后；推理未就绪时音频等待）。方法面无变更。
+- v0.3（2026-09-21，GAZE_TIMING_PLAN 最终门 A）：视线纠正眼源切换。
+  `set_gaze_params` 增补可选参数 `eye_source`（'ori' 默认 | 'rendered'
+  legacy 行为回滚——additive，快照测试已更新）；/status `gaze_params`
+  增 `eye_source`、`gaze_frames` 增 `pristine_fallback`（additive）。
+  HTTP 面新增 `/gaze/params` 的 `eye_source` 字段（422 校验）。语义变更：
+  gaze on（ori 模式）时最终帧眼睛一律源自 orifra 原生眼（bypass 帧贴未
+  修正原生眼）——blink 帧从"生成眼"变为"原生眼"，属产品行为变更。

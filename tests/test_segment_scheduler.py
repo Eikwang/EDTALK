@@ -73,7 +73,8 @@ class FakeCharacterData:
 
     @property
     def total_frames(self):
-        return self._frames[self.current_segment]
+        # .get 容错：测试可能扩展 segments（如 '44'）而未登记帧数
+        return self._frames.get(self.current_segment, 3)
 
     def switch_segment(self, seg, prefetched=None):
         if seg not in self.segments:

@@ -18,10 +18,15 @@ class FakeGaze:
         self.blink_skips = 0
         self.nan_skips = 0
         self.error_skips = 0
+        self._eye_source = 'ori'
 
     @property
     def convergence_h(self):
         return self._convergence_h
+
+    @property
+    def eye_source_mode(self):
+        return self._eye_source
 
 
 class FakePack:
@@ -95,7 +100,7 @@ class TestGazeParamsEndpoint:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "effective": "next_frame"}
         svc.render_loop.queue_gaze_params.assert_called_once_with(
-            convergence=0.08, smooth_alpha=None, mode=None)
+            convergence=0.08, smooth_alpha=None, mode=None, eye_source=None)
 
     def test_409_when_not_constructed(self):
         # 启动 off → corrector 未构造（M2/DX-10）
@@ -121,7 +126,7 @@ class TestGazeParamsEndpoint:
         resp = client.post("/gaze/params", json={"mode": "off"})
         assert resp.status_code == 200
         svc.render_loop.queue_gaze_params.assert_called_once_with(
-            convergence=None, smooth_alpha=None, mode="off")
+            convergence=None, smooth_alpha=None, mode="off", eye_source=None)
 
 
 class TestRepairParamsEndpoint:

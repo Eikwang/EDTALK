@@ -46,10 +46,15 @@ class FakeGaze:
         self.blink_skips = 0
         self.nan_skips = 0
         self.error_skips = 0
+        self._eye_source = 'ori'
 
     @property
     def convergence_h(self):
         return self._convergence_h
+
+    @property
+    def eye_source_mode(self):
+        return self._eye_source
 
 
 def _components(pack=None, gaze=None, face_repair=None):
@@ -176,7 +181,7 @@ class TestGazeParams:
         svc = _service(gaze=FakeGaze())
         resp = svc.set_gaze_params(convergence=0.08)
         svc.render_loop.queue_gaze_params.assert_called_once_with(
-            convergence=0.08, smooth_alpha=None, mode=None)
+            convergence=0.08, smooth_alpha=None, mode=None, eye_source=None)
         assert resp == {"ok": True, "effective": "next_frame"}
 
     def test_nan_and_out_of_range_rejected(self):
@@ -283,7 +288,7 @@ class TestContractSnapshot:
         'stop': ['timeout'],
         'switch_segment': ['segment', 'at'],
         'set_schedule': ['sequence', 'align'],
-        'set_gaze_params': ['convergence', 'mode', 'smooth_alpha'],
+        'set_gaze_params': ['convergence', 'mode', 'smooth_alpha', 'eye_source'],
         'set_repair_params': ['mode'],
         'push_audio': ['pcm_int16_bytes', 'seq'],
         'push_full_audio': ['pcm_int16_bytes'],

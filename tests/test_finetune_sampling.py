@@ -1,11 +1,10 @@
-"""T4/T5 单测：四路采样矩阵 + 嘴区权重图 + 加权损失不变量。
+"""微调数据集单测：跨视频采样不变量 + 嘴区权重图 + 加权损失不变量。
 
-覆盖 FINE_TUNE_FIX_PLAN 的测试要求：
-- held-out 索引永不出现在采样对（近邻/自对/远对全路径）
+覆盖：
+- held-out 索引永不出现在采样对（跨视频/单视频全路径）
+- 跨视频配对：source/target 恒来自不同视频（防单人数据集走捷径）
 - 单帧回退（旧版 random.sample(range(1),2) 崩溃点）
 - facemark 行数 fail-fast；NaN 行 → 全 1 权重回退
-- 近邻距离 ≤ near_window（clamp 后）
-- 自对/远对比率的分布验证（统计容差）
 - weighted_l1 不变量：权重全 1 时 == F.l1_loss（归一化保量纲）
 """
 import os
@@ -27,7 +26,8 @@ def _make_video(tmp_path, name, n_frames, start=0):
     d = tmp_path / 'count' / name
     d.mkdir(parents=True, exist_ok=True)
     for i in range(n_frames):
-        arr = np.full((8, 8, 3), (i * 7) % 255, dtype=np.uint8)
+        # start 参与颜色: 不同视频同帧号颜色不同 (跨视频相等性断言依赖此)
+        arr = np.full((8, 8, 3), ((i + start) * 7) % 255, dtype=np.uint8)
         Image.fromarray(arr).save(d / f'{start + i}.jpg')
     return d
 
@@ -71,7 +71,7 @@ def _build(tmp_path, n_frames=200, **kw):
 def test_heldout_excluded_from_all_paths(tmp_path, monkeypatch):
     """held-out 索引（末 10%）永不出现在任何采样对的 target 中。"""
     n, ratio = 200, 0.1
-    ds = _build(tmp_path, n_frames=n, held_out_ratio=ratio, near_window=8)
+    ds = _build(tmp_path, n_frames=n, held_out_ratio=ratio)
     hold_lo = n - max(1, int(n * ratio))          # 180
     assert ds.pools[0][-1] == hold_lo - 1
     assert ds.held_out_info[0] == (hold_lo, n)
@@ -84,33 +84,25 @@ def test_heldout_excluded_from_all_paths(tmp_path, monkeypatch):
         f'held-out 帧进入训练采样: {sorted(set(t for t in targets if t >= hold_lo))}'
 
 
-def test_near_distance_bounded(tmp_path, monkeypatch):
-    """近邻路径 |i-j| ≤ near_window（clamp 后）；兜底远对路单独计数。"""
-    n, win = 200, 16
-    ds = _build(tmp_path, n_frames=n, held_out_ratio=0.0, near_window=win,
-                near_ratio=0.9, self_ratio=0.1, far_ratio=0.0)
+def test_cross_video_pairing(tmp_path, monkeypatch):
+    """跨视频采样（取代旧 near/self/far 四路）: source 与 target 必来自不同视频。
+
+    统筹审查 E-R6 变量矩阵的采样前提：跨视频对防单人数据集走捷径。
+    """
+    # 3 个视频, 每视频 60 帧, 帧号全局不重叠 → 帧号差可判定是否跨视频
+    for k, name in enumerate(('v1', 'v2', 'v3')):
+        _make_video(tmp_path, name, 60, start=k * 1000)
+        _make_facemark(tmp_path, name, 60)
+    # 每样本固定 2 张图 (source + target) — v3 移除 temporal 后恒定
+    ds = Finetune256(str(tmp_path / 'count'), facemark_dir=str(tmp_path / 'facemark'),
+                     held_out_ratio=0.0)
     opened = _open_targets(monkeypatch)
     for _ in range(300):
         ds[0]
-    pairs = [(int(Path(a).stem), int(Path(b).stem))
+    pairs = [(Path(a).parent.name, Path(b).parent.name)
              for a, b in zip(opened[0::2], opened[1::2])]
-    dists = [abs(a - b) for a, b in pairs if a != b]
-    self_pairs = sum(1 for a, b in pairs if a == b)
-    assert all(d <= win for d in dists), f'近邻距离超窗: {max(dists)} > {win}'
-    assert self_pairs / len(pairs) < 0.25, '自对比例应接近设定值 0.1'
-
-
-def test_self_pair_ratio(tmp_path, monkeypatch):
-    """自对比率 ≈ self_ratio（统计容差）。"""
-    ds = _build(tmp_path, n_frames=200, held_out_ratio=0.0,
-                near_ratio=0.0, self_ratio=0.4, far_ratio=0.0)
-    opened = _open_targets(monkeypatch)
-    n_iter = 400
-    for _ in range(n_iter):
-        ds[0]
-    pairs = list(zip(opened[0::2], opened[1::2]))
-    rate = sum(1 for a, b in pairs if a == b) / len(pairs)
-    assert abs(rate - 0.4) < 0.1, f'自对比率 {rate:.2f} 偏离 0.4'
+    same = sum(1 for va, vb in pairs if va == vb)
+    assert same == 0, f'跨视频采样出现同视频对 {same}/{len(pairs)}'
 
 
 def test_single_frame_video_fallback(tmp_path):
@@ -122,10 +114,11 @@ def test_single_frame_video_fallback(tmp_path):
                     T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))])
     ds = Finetune256(str(tmp_path / 'count'), transform=tf,
                      facemark_dir=str(tmp_path / 'facemark'))
-    s, t, w = ds[0]
+    s, t, w, bbox = ds[0]
     assert s.shape == (3, 256, 256) and t.shape == s.shape
     assert torch.equal(s, t), '单帧回退应 source==target'
     assert float(w.max()) == 4.0, 'facemark 可用时权重图仍生效'
+    assert bbox.shape == (4,), 'bbox 应为 (4,) 归一化坐标'
 
 
 def test_facemark_count_mismatch_fails_fast(tmp_path):
