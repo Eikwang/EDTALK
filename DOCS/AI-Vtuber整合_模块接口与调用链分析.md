@@ -1,6 +1,6 @@
 # AI-Vtuber 整合 · 模块接口与调用链分析
 
-> **基线**：EDTalk commit `c013414`（main，2026-09-21）。本文档所有 file:line 与行为描述均以该基线为准；EDTalk 后续变更请在「§14 变更登记」补记，防止文档静默腐烂。
+> **基线**：tag `integrate-prep-20260921`（= commit `f220a6e`，main）。本文档所有 file:line 与行为描述均以该基线为准；EDTalk 后续变更请在「§14 变更登记」补记，防止文档静默腐烂。
 > **工作区漂移防护（Eng A2）**：基线 SHA 锚定的是已提交状态；整合实施时若工作区存在未提交变更（当前 fine_tune/、train/、data_preprocess/、realtime_serve 均有），**实施前先执行 T1（收尾提交 + 打 tag `integrate-prep-20260921`）**，以 tag 为实施起点。工作区漂移不构成契约变更——接口以 tag 时刻为准，变更走 §14 登记。
 > **契约单一来源声明（Eng A3）**：realtime_serve 方法面/HTTP 契约以 `realtime_serve/EMBEDDING.md`（v0.3，冻结）为单一事实来源；本文 §3 是整合视角的补充与差异登记（§3.3）。**两者冲突时：§3.3 已登记的差异以本文为准，其余一律以 EMBEDDING.md 为准**——禁止在第三处文档新增接口事实。
 > **fastrag 分析边界（Eng A4）**：fastrag 为已编译 Rust 二进制，本文只覆盖**进程边界**（HTTP/文件/环境变量/退出码）可分析面；内部行为（推理细节、异常返回格式）按黑盒对待，行为级差异发现时登记进 §14。
@@ -676,6 +676,7 @@ Get-ChildItem wy\checkpoint | Select-Object Name, Length
 | 日期 | 基线 | 变更 | 影响 |
 |---|---|---|---|
 | 2026-09-21 | c013414 | 初版（/autoplan 整合准备） | 全文 |
+| 2026-09-22 | tag integrate-prep-20260921 (f220a6e) | Eng 阶段修订落地 + T1 基线冻结 | §2.2/§3.3/§4.5/§8.2/§9.1/§9.3/§10/§12.0/文档头 |
 
 ---
 
