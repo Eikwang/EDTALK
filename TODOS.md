@@ -121,3 +121,50 @@
 - [战略] 生成时视线/眼部条件化：商业级数字人竞品的结构性路线（无贴回接缝/闪烁类伪影）。优先级 P3。Context: CEO 声部发现5。
 - [perf] pristine ori_crop_256 GPU 批量预载：省每帧 0.3ms H2D。当前非瓶颈。优先级 P3。
 - [既有] EAR 阈值 256 域校准；gaze off→on 运行时懒初始化（/gaze/params 409 现状）。继承自 GAZE_CORRECTION_PLAN 遗留。
+
+## AI-Vtuber 整合准备——延期项（2026-09-21 /autoplan CEO+Eng 汇总）
+
+### 可执行契约冒烟脚本（整合对接自动化断言）
+- **What:** 把 DOCS/AI-Vtuber整合文档 §10 静默失败排查路径 + §12.0 冒烟清单 S1-S7 固化为一个可重复执行的冒烟脚本（推 PCM/查 chunks/验熔断恢复）。
+- **Why:** 文档登记的失败模式靠人记忆排查会腐烂；脚本化后整合回归有断言网（CEO 0C-bis 方案 C 的残余价值）。
+- **Pros:** 整合实施与后续升级都有可执行验收；凌晨排障可直接跑。
+- **Cons:** 依赖整合实施启动；服务状态耦合（需服务在跑）。
+- **Context:** §10 表已含可粘贴命令，脚本即其串联；验收清单条目 1-10 是断言来源。产出位置建议 `tools/integration_smoke.py`。
+- **Effort:** M (human ~1天 / CC ~1h) **Priority:** P1（整合实施第一步）
+- **Depends on:** 整合实施启动（本文档批准后）。
+
+### checkpoint 自动部署脚本（训练产出→角色包 最后一公里）
+- **What:** 链路A/B 定版 → `<角色>/checkpoint/{new.pt,audio2lip.pt}` 的带键改名+键校验+大小验证+服务重启提示，脚本化。
+- **Why:** 手动部署四步（§9.3）易错文件名/漏键校验；编排化后一键训练管线才能闭环。
+- **Pros:** 消灭部署期"指向不存在产物"风险（Eng H2 的自动化形态）。
+- **Cons:** 小工具维护成本；需与训练编排（TODOS P2 一键角色适配）合并设计。
+- **Context:** §9.3 手动步骤是原型；`python -c "torch.load...print('gen' in ck)"` 即键校验核心。
+- **Effort:** S **Priority:** P2
+- **Depends on:** 一键训练编排实施。
+
+### fastrag 无窗口运行 + 文件日志改造（Rust 代码）
+- **What:** server.exe 加 `#![windows_subsystem = "windows"]` + tracing-appender rolling file appender。
+- **Why:** 当前 Hidden 窗口方案仍短暂闪窗，且 stdout 重定向是唯一取证面（Eng H3）；无文件日志在崩溃时取证链断裂。
+- **Pros:** 真·无控制台；崩溃有持久取证。
+- **Cons:** 需 Rust 工具链重编译（build_with_msvc.bat 既有）；exe 指纹更新（S3 登记项联动）。
+- **Context:** §4.5 方案 B 的完整形态；cargo 工程在 fastrag/src/。
+- **Effort:** S **Priority:** P3
+- **Depends on:** 无（独立小改造）。
+
+### fastrag server 绑定改 127.0.0.1（Rust 一行改动）
+- **What:** server.rs:199 `0.0.0.0` → `bind 127.0.0.1`（或经 Config 暴露 bind_addr，默认回环）。
+- **Why:** 整合后端口常驻化，0.0.0.0+无鉴权=局域网可查询/清缓存（Eng S1）；绑定地址当前硬编码改不了。
+- **Pros:** 消除唯一的高危监听面；防火墙规则不再是唯一防线。
+- **Cons:** 需重编译+exe 指纹更新；跨机部署场景需同时加 Config 化绑定。
+- **Context:** §2.2 已知接受风险缓解②； Config [server] 加 bind_addr 是顺路最优解。
+- **Effort:** S **Priority:** P2
+- **Depends on:** 无。
+
+### EMBEDDING.md 契约回写（含 P1 高危项）
+- **What:** §3.3 七处差异 + 背压未定义（#8）回写 EMBEDDING.md；/audio/push 死路径与背压两条为 P1 高危（必须带警示语义，不得仅补字段）。
+- **Why:** 契约是单一事实来源，行为级差异不回写=下一个对接方再踩一遍。
+- **Pros:** 契约恢复可信；快照测试同步更新。
+- **Cons:** 无（纯文档+测试）。
+- **Context:** 差异清单已实证（realtime_serve 分析报告 §14）；快照测试在 tests/。
+- **Effort:** S **Priority:** **P1**（原 T3 提级，Eng A1）
+- **Depends on:** 无。
