@@ -8,7 +8,7 @@ from pathlib import Path
 
 # ===== 路径配置 =====
 BASE_DIR = Path(__file__).parent
-# 模型在父目录的 chekpoint 中
+# 模型在 fastrag 目录下的 chekpoint 中
 MODEL_DIR = BASE_DIR / "chekpoint"
 
 # 模型路径（chekpoint 下可测试的组合：
@@ -47,15 +47,17 @@ KB_FALLBACK_ANSWER = "这个资料里没有提到，我不太清楚呢。"
 CHAT_FALLBACK_ANSWER = "哎呀，这个我一时说不上来，咱们换个话题聊聊吧！"
 
 # ===== 多轮对话 =====
-HISTORY_MAX_MESSAGES = 2    # 注入生成 prompt 的历史消息上限（user+assistant 合计）
+# HISTORY_MAX_MESSAGES 名义上是消息数，裁剪实际按完整轮次（问题+答案成对）执行：
+# 保留 ceil(此值/2) 轮完整对话。设 1 或 2 效果相同（各保留 1 轮），建议 2~4
+HISTORY_MAX_MESSAGES = 1    # 注入生成 prompt 的历史消息上限（成对裁剪）
 RETRIEVAL_HISTORY_TURNS = 1  # 拼接进检索 query 的最近用户发言轮数（指代消解：
                              # "是啥牌子的"单独检索会命中错误产品，需拼接上文）
 
 # ===== 量化配置（显存优化）=====
-# Embedder 运行设备："cpu"=CPU推理, "cuda-fp16"=GPU FP16推理, "cuda"=GPU FP32推理
-# CPU: 显存最低(~1.8GB)，但CPU被其他任务占用时会变慢
-# cuda-fp16: 显存适中(~2.4GB)，GPU加速8-20倍，推荐生产环境使用
-# cuda: 显存较高(~3.2GB)，不推荐
+# Embedder 运行设备："cpu"=CPU推理（占用内存非显存）, "cuda-fp16"=GPU FP16推理, "cuda"=GPU FP32推理
+# CPU: 显存零占用（占内存），但CPU被其他任务占用时会变慢
+# cuda-fp16: 显存适中，GPU加速8-20倍，推荐生产环境使用
+# cuda: 显存较高，不推荐
 EMBEDDER_DEVICE = "cuda-fp16"
 # LLM 量化：4=INT4（省约 1.0GB），8=INT8（省约 0.5GB），16=BF16 无量化
 LLM_QUANT_BITS = 16
@@ -79,8 +81,8 @@ SYSTEM_RULES = """
 2.使用中文自然语句进行口语化回答、不能包含任何特殊字符或类似表格、列表等书面格式。
 3.严禁使用任何AI或机器人的套话！不要复述用户的问题，不要输出开场白和问候语。
 4.直接给出答案；内容要简洁，尽量不超过{max_answer_length}字。
-5.如果提供了`参考资料`,必须完全基于参考资料的内容进行回答，`参考资料`中的信息永远优先于你自己的知识.
-6,在存在`参考资料`时，不要在回答中包含'根据参考资料'、'资料显示'等声明。
+5.如果提供了`参考资料`，必须完全基于参考资料的内容进行回答，`参考资料`中的信息永远优先于你自己的知识。
+6.在存在`参考资料`时，不要在回答中包含'根据参考资料'、'资料显示'等声明。
 7.如果没有提供`参考资料`,可以根据`对话历史`中的`来源`信息，并结合你自己的知识自然回答。
 8.当问题涉及时间、日期，直接使用`时间信息`里的信息回答。
 """

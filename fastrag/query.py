@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import INDEX_DIR, HISTORY_MAX_MESSAGES
-from fastrag_native import fastragNative, pick_best_reference
+from fastrag_native import fastragNative, pick_best_reference, trim_history_rounds
 
 
 async def main():
@@ -70,7 +70,9 @@ async def main():
             "content": result["answer"],
             "references": pick_best_reference(result.get("context", [])),
         })
-        history = history[-HISTORY_MAX_MESSAGES:]
+        # 按完整轮次裁剪（问题+答案成对保留）——按消息数硬切会切掉配对，
+        # 导致 prompt 缺"问题"行、检索拼接失去上文，追问机制失效
+        history = trim_history_rounds(history, HISTORY_MAX_MESSAGES)
         # print("\n相关文档片段:")
         # for i, src in enumerate(result["context"], 1):
         #     print(f"\n[{i}] (score: {src['score']:.3f})")

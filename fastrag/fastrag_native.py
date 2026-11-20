@@ -49,6 +49,31 @@ def pick_best_reference(context: List[Dict]) -> List[str]:
     return [content] if content else []
 
 
+def trim_history_rounds(history: List[Dict], max_messages: int) -> List[Dict]:
+    """按完整轮次裁剪历史：保留最近 ceil(max_messages/2) 轮完整的 问题+答案 配对。
+
+    历史以 (user, assistant) 成对追加。若直接按消息数切片（如 max=1 只留 assistant），
+    会切掉配对的另一半：prompt 缺"问题"行、检索拼接失去上文，追问机制整体失效。
+    """
+    if not history:
+        return []
+    rounds = max(1, (max_messages + 1) // 2)
+    pairs = []
+    i = len(history) - 1
+    while i >= 0 and len(pairs) < rounds:
+        m = history[i]
+        role = m.get("role") or "user"
+        if role == "assistant":
+            user_m = (history[i - 1]
+                      if i > 0 and (history[i - 1].get("role") or "user") == "user"
+                      else None)
+            pairs.append([user_m, m] if user_m else [m])
+            i -= 2 if user_m else 1
+        else:
+            i -= 1  # 孤立 user（配对的 assistant 更早被裁掉），跳过
+    return [m for pair in reversed(pairs) for m in pair if m]
+
+
 def chunking_by_markdown_headers(content: str, source: str = "") -> List[Dict]:
     """按 Markdown 标题分块，每个块包含完整的层级路径（面包屑）
 
@@ -399,7 +424,7 @@ class fastragNative:
             else:
                 self.reranker_model = AutoModelForCausalLM.from_pretrained(
                     str(RERANKER_MODEL_PATH),
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     trust_remote_code=True,
                     local_files_only=True,
                 )
@@ -638,7 +663,8 @@ class fastragNative:
         if not history:
             return ""
         blocks = []
-        for m in history[-HISTORY_MAX_MESSAGES:]:
+        # 按完整轮次裁剪：防止客户端按消息数硬切导致"问题/答案"配对断裂
+        for m in trim_history_rounds(history, HISTORY_MAX_MESSAGES):
             content = (m.get("content") or "").strip()
             if not content:
                 continue
